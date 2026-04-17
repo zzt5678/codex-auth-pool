@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "${SOURCE}" ]]; do
+  DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
+  SOURCE="$(readlink "${SOURCE}")"
+  [[ "${SOURCE}" != /* ]] && SOURCE="${DIR}/${SOURCE}"
+done
+PROJECT_DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
+VENV_BIN="${PROJECT_DIR}/.venv/bin"
+
+if [[ -x "${VENV_BIN}/codex-auth-pool" ]]; then
+  exec "${VENV_BIN}/codex-auth-pool" "$@"
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 -m codex_auth_pool "$@"
+fi
+
+echo "codex-auth-pool is not installed yet."
+echo "Run: ./install.sh"
+exit 1
