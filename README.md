@@ -1,163 +1,176 @@
 # Codex Auth Pool
 
-`codex-auth-pool` is a standalone CLI for managing multiple Codex/ChatGPT
-login sessions on one machine.
+Multi-account rotation for Codex Desktop without giving up official ChatGPT login or `computer use`.
 
-The source folder can live anywhere. This project is currently checked into a
-workspace only because we built it here. The real runtime state is global and
-lives under your home directory, mainly:
+[中文说明](./README_CN.md)
 
-- `~/.codex/` for Codex's own auth, plugin, and session state
-- `~/.codex-auth-pool/` for this tool's config, vault, snapshots, and logs
-- `~/.cli-proxy-api/` if you also import `cliproxyapi` auth files
+## What It Solves
 
-It supports two account sources:
+If you use Codex through the official ChatGPT login flow, you usually hit two problems:
 
-- `cliproxyapi` auth files from `~/.cli-proxy-api`
-- a managed vault of official `codex login` snapshots under `~/.codex-auth-pool/profiles`
+- one account is not enough
+- switching accounts manually is annoying and error-prone
 
-Managed-vault profiles are stored as native Codex `auth.json` files, with
-sidecar metadata in matching `.meta.json` files. That means you can manually
-copy a vault profile into `~/.codex/cache/auth.json` if you ever need an
-emergency manual switch.
+`codex-auth-pool` turns that into a local account pool:
 
-It can:
+- keep multiple official `codex login` sessions
+- import `cliproxyapi` auth files if you already have them
+- store managed profiles as native Codex `auth.json` files
+- query ChatGPT directly for real 5-hour and weekly reset windows
+- rotate to the next account automatically
+- keep Codex Desktop compatible with `computer use`
 
-- preserve multiple official `codex login` sessions so later logins do not overwrite them
-- import existing `cliproxyapi` auth files
-- query ChatGPT directly for each account's real 5-hour and weekly reset windows
-- rotate accounts automatically based on Codex's 5-hour and weekly limit signals
-- sync the selected auth into Codex Desktop's live auth files
-- optionally restart Codex Desktop automatically after switching
-- snapshot and restore local plugin, connector, and Codex config state
-- run as a background `launchd` agent on macOS
+## Who This Is For
+
+- Codex Desktop users on macOS
+- people running more than one ChatGPT/Codex account
+- users who want automatic rotation instead of copying auth files by hand
+- users who want to preserve local Codex plugin and connector state across account switches
+
+## How It Works
+
+The tool manages global runtime state under your home directory:
+
+- `~/.codex/` for Codex auth, plugins, and sessions
+- `~/.codex-auth-pool/` for this tool's vault, state, logs, and snapshots
+- `~/.cli-proxy-api/` as an optional import source
+
+Managed profiles are stored as native Codex auth files, so you can still copy one manually into:
+
+- `~/.codex/cache/auth.json`
+- `~/.codex/auth.json`
+
+when you need an emergency manual switch.
+
+## Features
+
+- Preserve multiple official `codex login` sessions so later logins do not overwrite earlier ones.
+- Import existing `cliproxyapi` accounts into the same pool.
+- Query `https://chatgpt.com/backend-api/wham/usage` per account to get real reset windows.
+- Rank accounts using observed reset data instead of only trusting local metadata.
+- Auto-cool down exhausted accounts and switch to the next available one.
+- Restart Codex Desktop automatically after switching.
+- Snapshot and restore local Codex plugin, config, and connector cache state.
+- Run as a background `launchd` agent on macOS.
 
 ## Install
 
-### Easiest
+### Fastest
 
 ```bash
-cd tools/codex-auth-pool
+git clone https://github.com/just2023zzt/codex-auth-pool.git
+cd codex-auth-pool
 ./install.sh
 ```
 
 ### Manual
 
-If you want to install it yourself with `pipx`:
-
 ```bash
-cd tools/codex-auth-pool
+git clone https://github.com/just2023zzt/codex-auth-pool.git
+cd codex-auth-pool
 pipx install .
-```
-
-### Export As A Standalone Repo
-
-If you want to move this project out of the current workspace into its own repo:
-
-```bash
-cd tools/codex-auth-pool
-./export-standalone.sh /absolute/path/to/codex-auth-pool
 ```
 
 ## Quick Start
 
-### 1. Detect local paths
+### 1. Check your machine
 
 ```bash
 codex-auth-pool check
 codex-auth-pool doctor
 ```
 
-### 2. First-run onboarding
+### 2. Run first-time setup
 
 ```bash
 codex-auth-pool init --install-launchd --restart-after-switch
 ```
 
-This default init flow will:
+This will:
 
-- write `config.json`
-- capture a baseline local environment snapshot as `baseline`
-- save the current official Codex login as `official-current` if one exists
-- migrate any older non-Codex managed profiles into native Codex auth files
-- sync `cliproxyapi` source accounts into the managed Codex-format vault
-- optionally install the background launchd rotator when `--install-launchd` is present
+- write a starter config
+- snapshot your current local Codex environment
+- save your current official login
+- migrate old managed profiles if needed
+- import `cliproxyapi` accounts if found
+- install the background rotator
 
-### 3. Save your current official Codex login
+### 3. Open the dashboard
 
 ```bash
-codex-auth-pool save-current --name my-official-1
+codex-auth-pool dashboard
 ```
 
-### 4. Check the account pool
+This is the main command most people will care about. It shows:
+
+- current account
+- current 5h and weekly usage
+- next account in line
+- whether the reset time is `observed` or just local metadata
+- launchd daemon health
+
+### 4. Refresh real usage windows
 
 ```bash
-codex-auth-pool status
-codex-auth-pool pick
 codex-auth-pool refresh-usage --force
 ```
 
-### 5. Manual setup path
+This queries ChatGPT directly for each account and updates the cached reset data.
+
+## Most Useful Commands
 
 ```bash
-codex-auth-pool config-init
-codex-auth-pool snapshot-env --name baseline
+codex-auth-pool dashboard
+codex-auth-pool status
+codex-auth-pool refresh-usage --force
 codex-auth-pool save-current --name my-official-1
-codex-auth-pool setup --install-launchd --restart-after-switch
+codex-auth-pool sync-cliproxy
+codex-auth-pool apply-best --restart-after-switch
+codex-auth-pool launchd-status
 ```
 
-## Normal Commands
+## Rotation Logic
+
+The rotator prefers accounts that are:
+
+1. not disabled
+2. not expired
+3. not in cooldown
+4. not currently blocked by an observed remote limit window
+5. earliest observed weekly reset time
+6. otherwise earliest profile `weekly_reset_at`
+7. then most recent usable auth metadata
+
+`refresh-usage` writes direct observations into each profile's `.meta.json`.
+
+When the UI says:
+
+- `reset_source: observed`
+
+it means the value came from ChatGPT directly, not just a local guess.
+
+## Commands
 
 ```bash
 codex-auth-pool list
+codex-auth-pool dashboard
 codex-auth-pool status
 codex-auth-pool pick
-codex-auth-pool info
 codex-auth-pool check
 codex-auth-pool doctor
-codex-auth-pool migrate-managed
-codex-auth-pool sync-cliproxy
-codex-auth-pool init --install-launchd --restart-after-switch
-codex-auth-pool env-status
-codex-auth-pool config-init
-codex-auth-pool snapshot-env --name baseline
-codex-auth-pool restore-env baseline --restart-codex
-codex-auth-pool events --limit 20
 codex-auth-pool save-current --name my-official-1
 codex-auth-pool import-auth-file ~/.codex/auth.json --name imported-official
+codex-auth-pool sync-cliproxy
 codex-auth-pool refresh-usage --force
-codex-auth-pool rate-limits
 codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool tick
-codex-auth-pool daemon --interval-seconds 60 --restart-after-switch
-codex-auth-pool launchd-status
 codex-auth-pool launchd-install --interval-seconds 60 --restart-after-switch
+codex-auth-pool launchd-status
+codex-auth-pool snapshot-env --name baseline
+codex-auth-pool restore-env baseline --restart-codex
 ```
 
-If you want to suppress desktop notifications for a specific command, both forms work:
-
-```bash
-codex-auth-pool --no-notify snapshot-env --name baseline
-codex-auth-pool snapshot-env --name baseline --no-notify
-```
-
-## How It Chooses Accounts
-
-- `list` shows the raw inventory and may include more than one source for the same account
-- `status`, `pick`, and `apply-best` dedupe by `account_id`
-- available accounts are ranked by:
-  1. not disabled
-  2. not expired
-  3. not on cooldown
-  4. earlier directly observed weekly reset time from ChatGPT when available
-  5. otherwise earlier profile `weekly_reset_at`
-  6. then `last_refresh`
-
-`refresh-usage` writes direct observations into each profile's `.meta.json`.
-The dashboard and status output show `reset_source=observed` when the value came
-from the ChatGPT usage endpoint rather than local synthesized metadata.
-
-## Path Resolution
+## Paths
 
 Priority order:
 
@@ -166,19 +179,7 @@ Priority order:
 3. `~/.codex-auth-pool/config.json`
 4. built-in defaults
 
-Supported environment variables:
-
-- `CODEX_AUTH_POOL_SOURCE_DIR`
-- `CODEX_AUTH_POOL_MANAGED_DIR`
-- `CODEX_AUTH_POOL_STATE_PATH`
-- `CODEX_AUTH_POOL_CONFIG_PATH`
-- `CODEX_AUTH_POOL_EVENTS_PATH`
-- `CODEX_AUTH_POOL_ENV_SNAPSHOTS_DIR`
-- `CODEX_AUTH_POOL_TARGET`
-- `CODEX_AUTH_POOL_SESSIONS_DIR`
-- `CODEX_AUTH_POOL_APP_PATH`
-
-## Files
+Important paths:
 
 - Config: `~/.codex-auth-pool/config.json`
 - Managed profiles: `~/.codex-auth-pool/profiles/`
@@ -191,11 +192,12 @@ Supported environment variables:
 
 ## Notes
 
-- This tool is designed for macOS and Codex Desktop first.
-- The checkout location of this repo does not decide which Codex account is active.
-- It updates both `~/.codex/cache/auth.json` and `~/.codex/auth.json`.
-- It reads rate-limit snapshots from `~/.codex/sessions/`.
-- It can also query `https://chatgpt.com/backend-api/wham/usage` with each profile's access token to get real per-account reset windows.
-- Background auto-rotation now uses preemptive defaults of `95%` for the 5-hour window and `98%` for the weekly window, so it can switch before hard exhaustion.
-- Background auto-rotation refreshes per-account observed usage windows before ranking unless you disable it with `--no-refresh-usage`.
-- Environment snapshots currently restore saved items conservatively: saved plugin/config/cache state is copied back, and missing items are not deleted automatically.
+- macOS-first right now
+- designed around Codex Desktop
+- updates both `~/.codex/cache/auth.json` and `~/.codex/auth.json`
+- keeps local plugin and connector state out of the auth rotation path
+- background rotation defaults to preemptive thresholds of `95%` for the 5-hour window and `98%` for the weekly window
+
+## License
+
+MIT
