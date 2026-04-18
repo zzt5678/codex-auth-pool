@@ -1030,6 +1030,39 @@ def observed_allowed_for_profile(path: Path) -> bool | None:
     return None
 
 
+def observed_block_until_for_profile(path: Path, *, now: datetime | None = None) -> tuple[datetime | None, str | None]:
+    now = now or now_local()
+    observed_secondary_used = observed_secondary_used_percent_for_profile(path)
+    observed_secondary_reset = observed_secondary_reset_at_for_profile(path)
+    if (
+        observed_secondary_used is not None
+        and observed_secondary_used >= 100
+        and observed_secondary_reset is not None
+        and observed_secondary_reset > now
+    ):
+        return observed_secondary_reset, "weekly_limit_unreset"
+
+    observed_primary_used = observed_primary_used_percent_for_profile(path)
+    observed_primary_reset = observed_primary_reset_at_for_profile(path)
+    if (
+        observed_primary_used is not None
+        and observed_primary_used >= 100
+        and observed_primary_reset is not None
+        and observed_primary_reset > now
+    ):
+        return observed_primary_reset, "primary_5h_unreset"
+
+    observed_limit_reached = observed_limit_reached_for_profile(path)
+    observed_allowed = observed_allowed_for_profile(path)
+    if observed_limit_reached is True or observed_allowed is False:
+        if observed_secondary_reset is not None and observed_secondary_reset > now:
+            return observed_secondary_reset, "weekly_limit_flagged"
+        if observed_primary_reset is not None and observed_primary_reset > now:
+            return observed_primary_reset, "primary_5h_flagged"
+
+    return None, None
+
+
 def effective_reset_at_for_profile(path: Path, summary: ProfileSummary) -> datetime:
     observed = observed_secondary_reset_at_for_profile(path)
     if observed is not None:
@@ -1262,20 +1295,9 @@ def rank_profiles(
         summary = summarize_profile(path)
         cd_until = cooldown_until(state, summary.account_id)
         limit_reset = limit_reset_at_for_profile(path)
-        observed_secondary_reset = observed_secondary_reset_at_for_profile(path)
-        observed_primary_reset = observed_primary_reset_at_for_profile(path)
-        observed_limit_reached = observed_limit_reached_for_profile(path)
-        observed_allowed = observed_allowed_for_profile(path)
-        observed_secondary_used = observed_secondary_used_percent_for_profile(path)
-        observed_primary_used = observed_primary_used_percent_for_profile(path)
         expired = parse_dt(summary.expired)
         weekly = effective_reset_at_for_profile(path, summary)
-        remote_block_until = None
-        if observed_limit_reached is True or observed_allowed is False:
-            if observed_secondary_used is not None and observed_secondary_used >= 100 and observed_secondary_reset is not None:
-                remote_block_until = observed_secondary_reset
-            elif observed_primary_used is not None and observed_primary_used >= 100 and observed_primary_reset is not None:
-                remote_block_until = observed_primary_reset
+        remote_block_until, remote_block_reason = observed_block_until_for_profile(path, now=now)
         available = (
             not summary.disabled
             and (expired is None or expired > now)
@@ -1292,6 +1314,7 @@ def rank_profiles(
             "limit_reset_at": limit_reset,
             "limit_reason": limit_reason_for_profile(path),
             "remote_block_until": remote_block_until,
+            "remote_block_reason": remote_block_reason,
             "is_current": summary.account_id == current_account,
             "is_preferred_next": summary.account_id == preferred_next,
             "weekly_sort": weekly,
@@ -1434,6 +1457,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             flags.append(f"known_limit_reset={item['limit_reset_at'].isoformat()}")
         if item["remote_block_until"] is not None and item["remote_block_until"] > now_local():
             flags.append(f"remote_block_until={item['remote_block_until'].isoformat()}")
+        if item.get("remote_block_reason"):
+            flags.append(f"remote_reason={item['remote_block_reason']}")
         weekly, weekly_source = effective_reset_label_for_profile(summary.path, summary)
         print(f"  {index:02d}. {summary.email or summary.path.name}")
         print(f"      file: {summary.path.name}")
