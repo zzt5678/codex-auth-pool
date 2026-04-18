@@ -141,7 +141,9 @@ codex-auth-pool launchd-status
 6. 如果没有真实观测值，再看本地 `weekly_reset_at`
 7. 最后再参考 auth 元数据的新鲜度
 
-`refresh-usage` 会把真实查询结果写入每个账号的 `.meta.json`。
+`refresh-usage` 会把真实查询结果写入账号对应的元数据 sidecar。
+对于 managed vault 里的账号，sidecar 会保存在账号文件旁边的 `.meta.json`。
+对于从 `cliproxyapi` 导入的源账号，元数据会写到 `~/.codex-auth-pool/source-meta/`，不会污染原始的 `~/.cli-proxy-api/` 目录。
 
 当你在界面里看到：
 

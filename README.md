@@ -141,7 +141,9 @@ The rotator prefers accounts that are:
 6. otherwise earliest profile `weekly_reset_at`
 7. then most recent usable auth metadata
 
-`refresh-usage` writes direct observations into each profile's `.meta.json`.
+`refresh-usage` writes direct observations into profile metadata sidecars.
+For managed vault profiles, the sidecar lives next to the profile as `.meta.json`.
+For imported `cliproxyapi` source profiles, metadata is stored under `~/.codex-auth-pool/source-meta/` so the original `~/.cli-proxy-api/` directory stays untouched.
 
 When the UI says:
 

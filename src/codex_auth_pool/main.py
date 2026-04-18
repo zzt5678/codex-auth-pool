@@ -37,6 +37,7 @@ DEFAULT_CODEX_ROOT_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DEFAULT_EXPORT_DIR = Path.home() / ".codex-auth-pool" / "exports"
 DEFAULT_MANAGED_DIR = Path.home() / ".codex-auth-pool" / "profiles"
+DEFAULT_SOURCE_META_DIR = Path.home() / ".codex-auth-pool" / "source-meta"
 DEFAULT_STATE_PATH = Path.home() / ".codex-auth-pool" / "state.json"
 DEFAULT_CONFIG_PATH = Path.home() / ".codex-auth-pool" / "config.json"
 DEFAULT_EVENTS_PATH = Path.home() / ".codex-auth-pool" / "events.jsonl"
@@ -263,6 +264,17 @@ def snapshot_manifest(snapshot_dir: Path) -> Path:
 
 
 def meta_path_for_profile(path: Path) -> Path:
+    try:
+        resolved = path.expanduser().resolve()
+        source_root = DEFAULT_CLIPROXY_DIR.expanduser().resolve()
+        if resolved.is_relative_to(source_root):
+            return DEFAULT_SOURCE_META_DIR / f"{path.stem}.meta.json"
+    except FileNotFoundError:
+        pass
+    return path.with_suffix(".meta.json")
+
+
+def legacy_meta_path_for_profile(path: Path) -> Path:
     return path.with_suffix(".meta.json")
 
 
@@ -509,6 +521,9 @@ def _jwt_payload(token: str | None) -> dict[str, Any]:
 def read_profile_metadata(path: Path) -> dict[str, Any]:
     meta_path = meta_path_for_profile(path)
     if not meta_path.exists():
+        legacy = legacy_meta_path_for_profile(path)
+        if legacy != meta_path and legacy.exists():
+            return read_json(legacy)
         return {}
     return read_json(meta_path)
 
