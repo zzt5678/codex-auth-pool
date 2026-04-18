@@ -58,7 +58,7 @@
 ### 最简单
 
 ```bash
-git clone https://github.com/just2023zzt/codex-auth-pool.git
+git clone https://github.com/zzt5678/codex-auth-pool.git
 cd codex-auth-pool
 ./install.sh
 ```
@@ -66,7 +66,7 @@ cd codex-auth-pool
 ### 手动安装
 
 ```bash
-git clone https://github.com/just2023zzt/codex-auth-pool.git
+git clone https://github.com/zzt5678/codex-auth-pool.git
 cd codex-auth-pool
 pipx install .
 ```

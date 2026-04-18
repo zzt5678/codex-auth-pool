@@ -58,7 +58,7 @@ when you need an emergency manual switch.
 ### Fastest
 
 ```bash
-git clone https://github.com/just2023zzt/codex-auth-pool.git
+git clone https://github.com/zzt5678/codex-auth-pool.git
 cd codex-auth-pool
 ./install.sh
 ```
@@ -66,7 +66,7 @@ cd codex-auth-pool
 ### Manual
 
 ```bash
-git clone https://github.com/just2023zzt/codex-auth-pool.git
+git clone https://github.com/zzt5678/codex-auth-pool.git
 cd codex-auth-pool
 pipx install .
 ```
