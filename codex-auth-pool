@@ -9,12 +9,14 @@ while [[ -L "${SOURCE}" ]]; do
 done
 PROJECT_DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
 VENV_BIN="${PROJECT_DIR}/.venv/bin"
+SRC_DIR="${PROJECT_DIR}/src"
 
 if [[ -x "${VENV_BIN}/codex-auth-pool" ]]; then
   exec "${VENV_BIN}/codex-auth-pool" "$@"
 fi
 
 if command -v python3 >/dev/null 2>&1; then
+  export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
   exec python3 -m codex_auth_pool "$@"
 fi
 

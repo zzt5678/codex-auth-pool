@@ -6,7 +6,31 @@ VENV_DIR="${PROJECT_DIR}/.venv"
 LOCAL_BIN_DIR="${HOME}/.local/bin"
 PROJECT_LAUNCHER="${PROJECT_DIR}/codex-auth-pool"
 
+find_python() {
+  local candidate
+  for candidate in python3.12 python3.11 python3.10 python3; do
+    if ! command -v "${candidate}" >/dev/null 2>&1; then
+      continue
+    fi
+    if "${candidate}" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+    then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 chmod +x "${PROJECT_LAUNCHER}"
+
+if ! PYTHON_BIN="$(find_python)"; then
+  echo "[codex-auth-pool] Python 3.10+ is required."
+  echo "Install Python 3.10 or newer, then rerun ./install.sh"
+  exit 1
+fi
 
 if command -v pipx >/dev/null 2>&1; then
   echo "[codex-auth-pool] Installing with pipx..."
@@ -25,7 +49,8 @@ if command -v pipx >/dev/null 2>&1; then
 fi
 
 echo "[codex-auth-pool] pipx not found, installing into local virtualenv..."
-python3 -m venv "${VENV_DIR}"
+echo "[codex-auth-pool] Using ${PYTHON_BIN}..."
+"${PYTHON_BIN}" -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip
 pip install -e "${PROJECT_DIR}"

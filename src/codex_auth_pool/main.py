@@ -1899,7 +1899,8 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     snapshot = latest_rate_limit_snapshot(args.sessions_dir)
     current_summary = current_account_summary(Path(args.target), args.source_dir, args.managed_dir)
-    next_profile = choose_best_profile(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
+    ranked = rank_profiles(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
+    next_profile = next((item for item in ranked if item["available"] and not item["is_current"]), None)
     recent_event = read_recent_event(args.events_path)
     preferred_next = preferred_next_account_id(load_state(args.state_path))
 
