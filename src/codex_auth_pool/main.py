@@ -998,6 +998,12 @@ def observed_primary_reset_at_for_profile(path: Path) -> datetime | None:
     return parse_dt(meta.get("observed_primary_reset_at"))
 
 
+def observed_account_id_for_profile(path: Path) -> str | None:
+    meta = read_profile_metadata(path)
+    value = meta.get("observed_account_id")
+    return str(value) if value else None
+
+
 def observed_secondary_used_percent_for_profile(path: Path) -> float | None:
     meta = read_profile_metadata(path)
     return _safe_float(meta.get("observed_secondary_used_percent"))
@@ -1055,6 +1061,67 @@ def usage_is_stale(path: Path, max_age_minutes: int) -> bool:
         return True
     age = now_local() - checked_at
     return age > timedelta(minutes=max_age_minutes)
+
+
+def current_profile_usage_snapshot(
+    source_dir: Path,
+    managed_dir: Path,
+    target_path: Path,
+    *,
+    max_age_minutes: int,
+) -> tuple[RemoteUsageSnapshot | None, str | None]:
+    current_account = current_auth_account_id(target_path)
+    if current_account is None:
+        return None, "current profile not found in pool"
+
+    matches = [
+        summarize_profile(path)
+        for path in discover_all_profiles(source_dir, managed_dir)
+        if summarize_profile(path).account_id == current_account
+    ]
+    if not matches:
+        return None, "current profile not found in pool"
+
+    matches.sort(
+        key=lambda summary: (
+            0 if not usage_is_stale(summary.path, max_age_minutes) else 1,
+            -(usage_checked_at_for_profile(summary.path).timestamp() if usage_checked_at_for_profile(summary.path) else 0),
+            source_rank(summary.source_kind),
+            str(summary.path),
+        )
+    )
+    current_summary = matches[0]
+    path = current_summary.path
+
+    observed_account_id = observed_account_id_for_profile(path)
+    observed_email = str(read_profile_metadata(path).get("observed_email") or "") or None
+    if observed_email and current_summary.email and observed_email != current_summary.email:
+        return None, "current profile usage snapshot belongs to a different email"
+
+    checked_at = usage_checked_at_for_profile(path)
+    if checked_at is None:
+        return None, "current profile usage snapshot is missing"
+    if usage_is_stale(path, max_age_minutes):
+        return None, "current profile usage snapshot is stale"
+
+    return (
+        RemoteUsageSnapshot(
+            account_id=observed_account_id,
+            email=observed_email or current_summary.email,
+            plan_type=str(read_profile_metadata(path).get("observed_plan_type") or "") or None,
+            allowed=observed_allowed_for_profile(path),
+            limit_reached=observed_limit_reached_for_profile(path),
+            primary_used_percent=observed_primary_used_percent_for_profile(path),
+            primary_reset_at=observed_primary_reset_at_for_profile(path),
+            primary_window_seconds=_safe_int(read_profile_metadata(path).get("observed_primary_window_seconds")),
+            secondary_used_percent=observed_secondary_used_percent_for_profile(path),
+            secondary_reset_at=observed_secondary_reset_at_for_profile(path),
+            secondary_window_seconds=_safe_int(read_profile_metadata(path).get("observed_secondary_window_seconds")),
+            fetched_at=checked_at or now_local(),
+            source=str(read_profile_metadata(path).get("usage_source") or "profile_meta"),
+        ),
+        None,
+    )
 
 
 def fetch_remote_usage_for_payload(payload: dict[str, Any]) -> RemoteUsageSnapshot:
@@ -2280,27 +2347,53 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
     state = load_state(args.state_path)
     snapshot = latest_rate_limit_snapshot(args.sessions_dir)
-    if snapshot is None:
-        print("no recent rate limit snapshot found; nothing to do")
+    current_usage, usage_note = current_profile_usage_snapshot(
+        args.source_dir,
+        args.managed_dir,
+        Path(args.target),
+        max_age_minutes=args.usage_max_age_minutes,
+    )
+
+    trigger_primary_used = None
+    trigger_primary_reset = None
+    trigger_secondary_used = None
+    trigger_secondary_reset = None
+    trigger_source = None
+
+    if current_usage is not None:
+        trigger_primary_used = current_usage.primary_used_percent
+        trigger_primary_reset = current_usage.primary_reset_at
+        trigger_secondary_used = current_usage.secondary_used_percent
+        trigger_secondary_reset = current_usage.secondary_reset_at
+        trigger_source = f"profile_usage:{current_usage.source}"
+    elif snapshot is not None and not getattr(args, "refresh_usage", False):
+        trigger_primary_used = snapshot.primary_used_percent
+        trigger_primary_reset = snapshot.primary_resets_at
+        trigger_secondary_used = snapshot.secondary_used_percent
+        trigger_secondary_reset = snapshot.secondary_resets_at
+        trigger_source = f"session_snapshot:{snapshot.source_file.name}"
+    else:
+        note = usage_note or "no current-account usage snapshot available"
+        print(f"no safe rotation signal; skipping auto-rotation ({note})")
         return 0
 
     triggered_reason = None
     triggered_until = None
 
     if (
-        snapshot.secondary_used_percent is not None
-        and snapshot.secondary_used_percent >= args.secondary_threshold
-        and snapshot.secondary_resets_at is not None
+        trigger_secondary_used is not None
+        and trigger_secondary_used >= args.secondary_threshold
+        and trigger_secondary_reset is not None
     ):
         triggered_reason = "weekly_limit"
-        triggered_until = snapshot.secondary_resets_at
+        triggered_until = trigger_secondary_reset
     elif (
-        snapshot.primary_used_percent is not None
-        and snapshot.primary_used_percent >= args.primary_threshold
-        and snapshot.primary_resets_at is not None
+        trigger_primary_used is not None
+        and trigger_primary_used >= args.primary_threshold
+        and trigger_primary_reset is not None
     ):
         triggered_reason = "primary_5h_limit"
-        triggered_until = snapshot.primary_resets_at
+        triggered_until = trigger_primary_reset
 
     if triggered_reason and triggered_until:
         set_cooldown_by_account_id(args.state_path, current_account, triggered_until, triggered_reason)
@@ -2310,12 +2403,13 @@ def cmd_tick(args: argparse.Namespace) -> int:
             account_id=current_account,
             cooldown_until=triggered_until.isoformat(),
             reason=triggered_reason,
-            primary_used_percent=snapshot.primary_used_percent,
-            secondary_used_percent=snapshot.secondary_used_percent,
+            primary_used_percent=trigger_primary_used,
+            secondary_used_percent=trigger_secondary_used,
+            trigger_source=trigger_source,
         )
         print(
             f"marked current account {current_account} on cooldown until "
-            f"{triggered_until.isoformat()} ({triggered_reason})"
+            f"{triggered_until.isoformat()} ({triggered_reason}, source={trigger_source})"
         )
         if not args.no_apply_best:
             picked = choose_best_profile(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
@@ -2332,7 +2426,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 print("no alternate available profile to switch to")
         return 0
 
-    print("no rotation trigger; current account remains active")
+    print(f"no rotation trigger; current account remains active (source={trigger_source})")
     return 0
 
 
