@@ -1423,12 +1423,22 @@ def latest_rate_limit_snapshot(sessions_dir: Path) -> RateLimitSnapshot | None:
                 event = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(event, dict):
+                continue
             payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
             if payload.get("type") != "token_count":
                 continue
             rate_limits = payload.get("rate_limits", {})
+            if not isinstance(rate_limits, dict):
+                continue
             primary = rate_limits.get("primary", {})
             secondary = rate_limits.get("secondary", {})
+            if not isinstance(primary, dict):
+                primary = {}
+            if not isinstance(secondary, dict):
+                secondary = {}
             return RateLimitSnapshot(
                 primary_used_percent=_safe_float(primary.get("used_percent")),
                 primary_resets_at=parse_unix_ts(primary.get("resets_at")),
@@ -1731,6 +1741,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
         email=normalized.get("email"),
         account_id=normalized.get("account_id"),
         restart_after_switch=bool(getattr(args, "restart_after_switch", False)),
+        apply_source=getattr(args, "apply_source", "manual"),
+        rotation_reason=getattr(args, "rotation_reason", None),
+        rotation_trigger_source=getattr(args, "rotation_trigger_source", None),
     )
     send_notification(
         "Codex Auth Pool",
@@ -2637,6 +2650,9 @@ def cmd_tick(args: argparse.Namespace) -> int:
             picked = choose_best_profile(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
             if picked and picked["summary"].account_id != current_account:
                 args.profile = str(picked["path"])
+                args.apply_source = "auto_rotation"
+                args.rotation_reason = triggered_reason
+                args.rotation_trigger_source = trigger_source
                 cmd_apply(args)
             else:
                 append_event(
