@@ -47,6 +47,8 @@
 
 - 保存多个官方 `codex login` 登录态，避免后一次登录覆盖前一次。
 - 导入现有的 `cliproxyapi` 账号。
+- 在查看状态、打开看板、刷新额度、选择账号和后台轮换时自动发现新加入的 `cliproxyapi` Codex 账号。
+- 自动把新 `cliproxyapi` 账号吸收到 managed vault，并补齐第一次真实额度观测。
 - 直接查询 `https://chatgpt.com/backend-api/wham/usage`，获取每个账号真实的额度窗口和重置时间。
 - 排序时优先使用真实观测值，而不是只依赖本地元数据。
 - 账号额度触顶后自动冷却，并切换到下一个可用账号。
@@ -121,7 +123,11 @@ codex-auth-pool dashboard
 - 当前 5 小时额度和周额度使用情况
 - 下一个准备切换的账号
 - 这个重置时间是不是 `observed`
+- 是否自动导入并观测到了新的 `cliproxyapi` 账号
 - 后台守护是否正常运行
+
+新加入的 `cliproxyapi` Codex 账号不需要手动执行 `sync-cliproxy`。
+运行 `dashboard`、`status`、`pick`、`apply-best`、`refresh-usage`，或者后台守护执行 `tick` 时，工具都会自动吸收新账号并补齐初始额度观测。
 
 ### 4. 主动刷新真实额度
 

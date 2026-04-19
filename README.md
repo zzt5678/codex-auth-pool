@@ -47,6 +47,8 @@ when you need an emergency manual switch.
 
 - Preserve multiple official `codex login` sessions so later logins do not overwrite earlier ones.
 - Import existing `cliproxyapi` accounts into the same pool.
+- Auto-detect newly added `cliproxyapi` Codex accounts during status checks, dashboard views, usage refreshes, picks, and rotations.
+- Automatically import new `cliproxyapi` accounts into the managed vault and fetch their first real usage snapshot.
 - Query `https://chatgpt.com/backend-api/wham/usage` per account to get real reset windows.
 - Rank accounts using observed reset data instead of only trusting local metadata.
 - Auto-cool down exhausted accounts and switch to the next available one.
@@ -121,7 +123,11 @@ This is the main command most people will care about. It shows:
 - current 5h and weekly usage
 - next account in line
 - whether the reset time is `observed` or just local metadata
+- whether new `cliproxyapi` accounts were auto-imported and observed
 - launchd daemon health
+
+New `cliproxyapi` Codex accounts do not require a manual `sync-cliproxy`.
+The tool auto-imports and observes new accounts when you run `dashboard`, `status`, `pick`, `apply-best`, `refresh-usage`, or when the background daemon runs `tick`.
 
 ### 4. Refresh real usage windows
 

@@ -92,7 +92,9 @@ REQUIRED_SOURCE_KEYS = (
 )
 DEFAULT_PRIMARY_THRESHOLD = 95.0
 DEFAULT_SECONDARY_THRESHOLD = 98.0
+DEFAULT_USAGE_MAX_AGE_MINUTES = 30
 MIN_AUTO_RESTART_INTERVAL_SECONDS = 120
+AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
 
 
 @dataclass
@@ -1341,6 +1343,92 @@ def usage_is_stale(path: Path, max_age_minutes: int) -> bool:
     return age > timedelta(minutes=max_age_minutes)
 
 
+def usage_error_checked_at_for_profile(path: Path) -> datetime | None:
+    return parse_dt(read_profile_metadata(path).get("usage_error_checked_at"))
+
+
+def initial_usage_refresh_due(path: Path, max_age_minutes: int) -> bool:
+    if usage_checked_at_for_profile(path) is not None:
+        return False
+    failed_at = usage_error_checked_at_for_profile(path)
+    if failed_at is None:
+        return True
+    return now_local() - failed_at > timedelta(minutes=max_age_minutes)
+
+
+def best_usage_profile_paths(source_dir: Path, managed_dir: Path) -> list[Path]:
+    deduped: dict[str, Path] = {}
+    for path in discover_all_profiles(source_dir, managed_dir):
+        summary = summarize_profile(path)
+        existing = deduped.get(summary.account_id)
+        if existing is None:
+            deduped[summary.account_id] = path
+            continue
+        existing_summary = summarize_profile(existing)
+        better = (
+            source_rank(summary.source_kind),
+            parse_dt(summary.last_refresh) or datetime(1, 1, 1, tzinfo=timezone.utc),
+            str(path),
+        ) < (
+            source_rank(existing_summary.source_kind),
+            parse_dt(existing_summary.last_refresh) or datetime(1, 1, 1, tzinfo=timezone.utc),
+            str(existing),
+        )
+        if better:
+            deduped[summary.account_id] = path
+    return list(deduped.values())
+
+
+def auto_discover_new_profiles(
+    source_dir: Path,
+    managed_dir: Path,
+    events_path: Path,
+    *,
+    refresh_missing_usage: bool,
+    max_age_minutes: int,
+    max_initial_usage_refreshes: int = AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES,
+) -> dict[str, Any]:
+    synced = sync_cliproxy_into_managed(source_dir, managed_dir)
+    refreshed: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    if refresh_missing_usage:
+        candidates = [
+            path
+            for path in best_usage_profile_paths(source_dir, managed_dir)
+            if initial_usage_refresh_due(path, max_age_minutes)
+        ]
+        for path in candidates[:max_initial_usage_refreshes]:
+            try:
+                refresh_profile_usage(path)
+                refreshed.append(str(path))
+            except SystemExit as exc:
+                failed.append({"profile": str(path), "error": str(exc)[:300]})
+                update_profile_metadata(
+                    path,
+                    usage_error_checked_at=now_local().isoformat(),
+                    usage_error=str(exc)[:300],
+                )
+
+    if synced or refreshed or failed:
+        append_event(
+            events_path,
+            "auto_discovery",
+            synced_count=len(synced),
+            refreshed_count=len(refreshed),
+            failed_count=len(failed),
+            synced_profiles=[str(path) for path in synced],
+            refreshed_profiles=refreshed,
+            failed_profiles=failed,
+        )
+
+    return {
+        "synced": synced,
+        "refreshed": refreshed,
+        "failed": failed,
+    }
+
+
 def current_profile_usage_snapshot(
     source_dir: Path,
     managed_dir: Path,
@@ -1465,6 +1553,8 @@ def refresh_profile_usage(path: Path) -> dict[str, Any]:
         "observed_secondary_window_seconds": snapshot.secondary_window_seconds,
         "usage_checked_at": snapshot.fetched_at.isoformat(),
         "usage_source": snapshot.source,
+        "usage_error_checked_at": None,
+        "usage_error": None,
     }
     return update_profile_metadata(path, **updates)
 
@@ -1646,6 +1736,13 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    discovery = auto_discover_new_profiles(
+        args.source_dir,
+        args.managed_dir,
+        args.events_path,
+        refresh_missing_usage=True,
+        max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+    )
     state = load_state(args.state_path)
     ranked = rank_profiles(args.source_dir, args.managed_dir, state, Path(args.target))
     if not ranked:
@@ -1689,6 +1786,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  profile: {summary.path.name}")
         print(f"  reset_at: {reset_label}")
         print(f"  reset_source: {reset_source}")
+    if discovery["synced"] or discovery["refreshed"] or discovery["failed"]:
+        print("")
+        print("Auto Discovery")
+        print(f"  imported new cliproxy accounts: {len(discovery['synced'])}")
+        print(f"  refreshed new usage snapshots: {len(discovery['refreshed'])}")
+        print(f"  failed new usage refreshes: {len(discovery['failed'])}")
     print("")
     print("Last Switch")
     last_apply = state.get("last_apply") if isinstance(state.get("last_apply"), dict) else None
@@ -1742,6 +1845,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_pick(args: argparse.Namespace) -> int:
+    auto_discover_new_profiles(
+        args.source_dir,
+        args.managed_dir,
+        args.events_path,
+        refresh_missing_usage=True,
+        max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+    )
     state = load_state(args.state_path)
     picked = choose_best_profile(args.source_dir, args.managed_dir, state, Path(args.target))
     if picked is None:
@@ -1883,6 +1993,13 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
 
 
 def cmd_apply_best(args: argparse.Namespace) -> int:
+    auto_discover_new_profiles(
+        args.source_dir,
+        args.managed_dir,
+        args.events_path,
+        refresh_missing_usage=True,
+        max_age_minutes=getattr(args, "usage_max_age_minutes", DEFAULT_USAGE_MAX_AGE_MINUTES),
+    )
     state = load_state(args.state_path)
     picked = choose_best_profile(args.source_dir, args.managed_dir, state, Path(args.target))
     if picked is None:
@@ -2132,20 +2249,17 @@ def cmd_prefer_next(args: argparse.Namespace) -> int:
 
 
 def cmd_refresh_usage(args: argparse.Namespace) -> int:
+    auto_discover_new_profiles(
+        args.source_dir,
+        args.managed_dir,
+        args.events_path,
+        refresh_missing_usage=False,
+        max_age_minutes=args.max_age_minutes,
+    )
     if getattr(args, "profile", None):
         profiles = [pick_profile(args.source_dir, args.managed_dir, args.profile)]
     else:
-        deduped: dict[str, Path] = {}
-        for path in discover_all_profiles(args.source_dir, args.managed_dir):
-            summary = summarize_profile(path)
-            existing = deduped.get(summary.account_id)
-            if existing is None:
-                deduped[summary.account_id] = path
-                continue
-            existing_summary = summarize_profile(existing)
-            if source_rank(summary.source_kind) < source_rank(existing_summary.source_kind):
-                deduped[summary.account_id] = path
-        profiles = list(deduped.values())
+        profiles = best_usage_profile_paths(args.source_dir, args.managed_dir)
     if not profiles:
         print(f"no auth profiles found in {args.source_dir} or {args.managed_dir}")
         return 0
@@ -2364,6 +2478,13 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
+    discovery = auto_discover_new_profiles(
+        args.source_dir,
+        args.managed_dir,
+        args.events_path,
+        refresh_missing_usage=True,
+        max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+    )
     state = load_state(args.state_path)
     target_path = Path(args.target)
     current_summary = current_account_summary(target_path, args.source_dir, args.managed_dir)
@@ -2405,6 +2526,14 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         print(f"  next reset: {reset_label}")
         print(f"  next reset source: {reset_source}")
         print(f"  next preferred: {'yes' if next_item['is_preferred_next'] else 'no'}")
+    print("")
+    print("Auto Discovery")
+    if discovery["synced"] or discovery["refreshed"] or discovery["failed"]:
+        print(f"  imported new cliproxy accounts: {len(discovery['synced'])}")
+        print(f"  refreshed new usage snapshots: {len(discovery['refreshed'])}")
+        print(f"  failed new usage refreshes: {len(discovery['failed'])}")
+    else:
+        print("  no new accounts found")
     print("")
     print("Last Switch")
     last_apply = state.get("last_apply") if isinstance(state.get("last_apply"), dict) else None
@@ -2630,6 +2759,9 @@ def cmd_events(args: argparse.Namespace) -> int:
             "reason",
             "cooldown_until",
             "retry_after_seconds",
+            "synced_count",
+            "refreshed_count",
+            "failed_count",
         ):
             value = event.get(key)
             if value not in (None, ""):
@@ -2751,6 +2883,13 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
 
 def cmd_tick_locked(args: argparse.Namespace) -> int:
+    auto_discover_new_profiles(
+        args.source_dir,
+        args.managed_dir,
+        args.events_path,
+        refresh_missing_usage=False,
+        max_age_minutes=args.usage_max_age_minutes,
+    )
     if getattr(args, "refresh_usage", False):
         refresh_args = argparse.Namespace(
             source_dir=args.source_dir,
@@ -3241,7 +3380,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     init_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     init_parser.add_argument("--restart-after-switch", action="store_true")
-    init_parser.add_argument("--usage-max-age-minutes", type=int, default=30)
+    init_parser.add_argument("--usage-max-age-minutes", type=int, default=DEFAULT_USAGE_MAX_AGE_MINUTES)
     init_parser.add_argument(
         "--refresh-usage",
         action="store_true",
@@ -3335,7 +3474,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_usage_parser.add_argument(
         "--max-age-minutes",
         type=int,
-        default=30,
+        default=DEFAULT_USAGE_MAX_AGE_MINUTES,
         help="skip profiles whose usage observation is newer than this many minutes unless --force is set",
     )
     refresh_usage_parser.set_defaults(func=cmd_refresh_usage)
@@ -3350,7 +3489,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     setup_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     setup_parser.add_argument("--restart-after-switch", action="store_true")
-    setup_parser.add_argument("--usage-max-age-minutes", type=int, default=30)
+    setup_parser.add_argument("--usage-max-age-minutes", type=int, default=DEFAULT_USAGE_MAX_AGE_MINUTES)
     setup_parser.add_argument(
         "--refresh-usage",
         action="store_true",
@@ -3447,6 +3586,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use AppleScript quit instead of hard process kill before reopening",
     )
+    apply_best_parser.add_argument(
+        "--usage-max-age-minutes",
+        type=int,
+        default=DEFAULT_USAGE_MAX_AGE_MINUTES,
+        help="avoid retrying failed initial usage observations newer than this many minutes",
+    )
     apply_best_parser.set_defaults(func=cmd_apply_best)
 
     cooldown_parser = subparsers.add_parser(
@@ -3510,7 +3655,7 @@ def build_parser() -> argparse.ArgumentParser:
     tick_parser.add_argument(
         "--usage-max-age-minutes",
         type=int,
-        default=30,
+        default=DEFAULT_USAGE_MAX_AGE_MINUTES,
         help="consider cached per-account usage observations stale after this many minutes",
     )
     tick_parser.set_defaults(func=cmd_tick)
@@ -3562,7 +3707,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument(
         "--usage-max-age-minutes",
         type=int,
-        default=30,
+        default=DEFAULT_USAGE_MAX_AGE_MINUTES,
         help="consider cached per-account usage observations stale after this many minutes",
     )
     daemon_parser.set_defaults(func=cmd_daemon)
@@ -3598,7 +3743,7 @@ def build_parser() -> argparse.ArgumentParser:
     launchd_install_parser.add_argument(
         "--usage-max-age-minutes",
         type=int,
-        default=30,
+        default=DEFAULT_USAGE_MAX_AGE_MINUTES,
         help="consider cached per-account usage observations stale after this many minutes",
     )
     launchd_install_parser.add_argument(
@@ -3656,7 +3801,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="refresh_usage",
         help="skip direct per-account usage refreshes in the daemon",
     )
-    systemd_install_parser.add_argument("--usage-max-age-minutes", type=int, default=30)
+    systemd_install_parser.add_argument("--usage-max-age-minutes", type=int, default=DEFAULT_USAGE_MAX_AGE_MINUTES)
     systemd_install_parser.add_argument(
         "--restart-after-switch",
         action="store_true",
