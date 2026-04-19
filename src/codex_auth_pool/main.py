@@ -172,7 +172,8 @@ def parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
+        return datetime.fromisoformat(normalized)
     except ValueError:
         return None
 
@@ -482,6 +483,26 @@ def recent_resumed_sessions_summary(events_path: Path, limit: int = 3) -> dict[s
         "session_count": int(event.get("session_count") or len(sessions)),
         "titles": titles,
         "snapshot_path": event.get("snapshot_path"),
+    }
+
+
+def recent_interrupted_capture_summary(events_path: Path) -> dict[str, Any] | None:
+    event = read_recent_event_of_type(events_path, "interrupted_sessions_captured")
+    if event is None:
+        return None
+    return {
+        "timestamp": event.get("timestamp"),
+        "session_count": int(event.get("session_count") or 0),
+        "recent_candidates": (
+            int(event.get("recent_candidates"))
+            if "recent_candidates" in event and event.get("recent_candidates") is not None
+            else None
+        ),
+        "filtered_terminal_sessions": (
+            int(event.get("filtered_terminal_sessions"))
+            if "filtered_terminal_sessions" in event and event.get("filtered_terminal_sessions") is not None
+            else None
+        ),
     }
 
 
@@ -1059,6 +1080,46 @@ def read_recent_desktop_sessions(
     return sessions
 
 
+def _session_event_kind(event: dict[str, Any]) -> str | None:
+    event_type = event.get("type")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    payload_type = payload.get("type")
+    if event_type == "event_msg" and payload_type == "task_complete":
+        return "task_complete"
+    if event_type == "response_item" and payload_type in {"function_call", "function_call_output", "reasoning"}:
+        return "active"
+    if event_type == "event_msg" and payload_type in {"exec_command_end", "exec_command_start"}:
+        return "active"
+    return None
+
+
+def session_was_in_progress_at(session: InterruptedSession, captured_at: datetime) -> bool:
+    rollout_path = Path(session.rollout_path)
+    if not rollout_path.exists() or not rollout_path.is_file():
+        return False
+    try:
+        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return False
+
+    for raw_line in reversed(lines):
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_at = parse_dt(str(event.get("timestamp") or ""))
+        if event_at is not None and event_at > captured_at:
+            continue
+        kind = _session_event_kind(event)
+        if kind == "task_complete":
+            return False
+        if kind == "active":
+            return True
+    return False
+
+
 def interrupted_session_snapshot_path(session_recovery_dir: Path) -> Path:
     ts = datetime.now().strftime(BACKUP_TIMESTAMP_FMT)
     return session_recovery_dir / f"interrupted-sessions-{ts}.json"
@@ -1073,18 +1134,26 @@ def capture_interrupted_sessions(
     max_count: int,
     events_path: Path | None,
 ) -> dict[str, Any]:
-    sessions = read_recent_desktop_sessions(
+    captured_at = now_local()
+    recent_sessions = read_recent_desktop_sessions(
         codex_state_db=codex_state_db,
         codex_logs_db=codex_logs_db,
         max_age_seconds=max_age_seconds,
         max_count=max_count,
     )
+    sessions = [
+        session
+        for session in recent_sessions
+        if session_was_in_progress_at(session, captured_at)
+    ]
     snapshot = {
-        "captured_at": now_local().isoformat(),
+        "captured_at": captured_at.isoformat(),
         "state_db": str(codex_state_db),
         "logs_db": str(codex_logs_db),
         "max_age_seconds": max_age_seconds,
         "max_count": max_count,
+        "recent_candidates": len(recent_sessions),
+        "filtered_terminal_sessions": max(0, len(recent_sessions) - len(sessions)),
         "sessions": [session.__dict__ for session in sessions],
     }
     path = interrupted_session_snapshot_path(session_recovery_dir)
@@ -1096,6 +1165,8 @@ def capture_interrupted_sessions(
             "interrupted_sessions_captured",
             snapshot_path=str(path),
             session_count=len(sessions),
+            recent_candidates=len(recent_sessions),
+            filtered_terminal_sessions=max(0, len(recent_sessions) - len(sessions)),
             session_ids=[session.id for session in sessions],
         )
     return snapshot
@@ -2184,13 +2255,20 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  restarted: {'yes' if restarted else 'no'}")
     print("")
     print("Session Recovery")
+    capture = recent_interrupted_capture_summary(args.events_path)
     recovery = recent_resumed_sessions_summary(args.events_path)
-    if recovery is None:
+    if capture is None and recovery is None:
         print("  none")
     else:
-        print(f"  time: {recovery['timestamp'] or '-'}")
-        print(f"  resumed sessions: {recovery['session_count']}")
-        print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
+        if capture is not None:
+            print(f"  captured at: {capture['timestamp'] or '-'}")
+            print(f"  recent candidates: {capture['recent_candidates'] if capture['recent_candidates'] is not None else '-'}")
+            print(f"  filtered completed: {capture['filtered_terminal_sessions'] if capture['filtered_terminal_sessions'] is not None else '-'}")
+            print(f"  queued for resume: {capture['session_count']}")
+        if recovery is not None:
+            print(f"  resumed at: {recovery['timestamp'] or '-'}")
+            print(f"  resumed sessions: {recovery['session_count']}")
+            print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
     print("")
     print("Pool")
     for index, item in enumerate(ranked[: min(len(ranked), 8)], start=1):
@@ -2943,13 +3021,20 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         print(f"  restarted: {'yes' if restarted else 'no'}")
     print("")
     print("Session Recovery")
+    capture = recent_interrupted_capture_summary(args.events_path)
     recovery = recent_resumed_sessions_summary(args.events_path)
-    if recovery is None:
+    if capture is None and recovery is None:
         print("  none")
     else:
-        print(f"  time: {recovery['timestamp'] or '-'}")
-        print(f"  resumed sessions: {recovery['session_count']}")
-        print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
+        if capture is not None:
+            print(f"  captured at: {capture['timestamp'] or '-'}")
+            print(f"  recent candidates: {capture['recent_candidates'] if capture['recent_candidates'] is not None else '-'}")
+            print(f"  filtered completed: {capture['filtered_terminal_sessions'] if capture['filtered_terminal_sessions'] is not None else '-'}")
+            print(f"  queued for resume: {capture['session_count']}")
+        if recovery is not None:
+            print(f"  resumed at: {recovery['timestamp'] or '-'}")
+            print(f"  resumed sessions: {recovery['session_count']}")
+            print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
     print("")
     print("Daemon")
     print(f"  kind: {background['kind']}")
@@ -3162,6 +3247,8 @@ def cmd_events(args: argparse.Namespace) -> int:
             "refreshed_count",
             "failed_count",
             "session_count",
+            "recent_candidates",
+            "filtered_terminal_sessions",
         ):
             value = event.get(key)
             if value not in (None, ""):
