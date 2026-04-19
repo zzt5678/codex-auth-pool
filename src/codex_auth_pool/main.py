@@ -156,11 +156,14 @@ def iso_or_none(value: datetime | None) -> str | None:
 
 def read_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except FileNotFoundError:
         raise SystemExit(f"file not found: {path}") from None
     except json.JSONDecodeError as exc:
         raise SystemExit(f"invalid json in {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"expected JSON object in {path}, got {type(data).__name__}")
+    return data
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
