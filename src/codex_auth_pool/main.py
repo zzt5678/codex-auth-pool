@@ -251,6 +251,40 @@ def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
+def codex_process_running() -> bool:
+    checks = [
+        ["pgrep", "-x", "Codex"],
+        ["pgrep", "-f", "/Applications/Codex.app/Contents/Frameworks/Codex Helper"],
+        ["pgrep", "-f", "SkyComputerUseClient"],
+    ]
+    return any(run_command(command).returncode == 0 for command in checks)
+
+
+def wait_for_codex_state(*, running: bool, timeout_seconds: float, poll_seconds: float = 0.25) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if codex_process_running() is running:
+            return True
+        time.sleep(poll_seconds)
+    return codex_process_running() is running
+
+
+def stop_codex_app(*, graceful_first: bool, wait_seconds: float) -> None:
+    if graceful_first:
+        run_command(["osascript", "-e", 'tell application "Codex" to quit'])
+        if wait_for_codex_state(running=False, timeout_seconds=max(wait_seconds, 8.0)):
+            return
+
+    for signal_flag in ([], ["-9"]):
+        run_command(["pkill", *signal_flag, "-x", "Codex"])
+        run_command(["pkill", *signal_flag, "-f", "/Applications/Codex.app/Contents/Frameworks/Codex Helper"])
+        run_command(["pkill", *signal_flag, "-f", "SkyComputerUseClient"])
+        if wait_for_codex_state(running=False, timeout_seconds=max(wait_seconds, 5.0)):
+            return
+
+    raise SystemExit("failed to stop Codex cleanly before restart")
+
+
 def is_macos() -> bool:
     return platform.system() == "Darwin"
 
@@ -900,18 +934,14 @@ def restart_codex_app(app_path: Path, hard: bool = True, wait_seconds: float = 2
             file=sys.stderr,
         )
         return False
-    if hard:
-        run_command(["pkill", "-x", "Codex"])
-        run_command(["pkill", "-f", "/Applications/Codex.app/Contents/Frameworks/Codex Helper"])
-        run_command(["pkill", "-f", "SkyComputerUseClient"])
-        time.sleep(wait_seconds)
-    else:
-        run_command(["osascript", "-e", 'tell application "Codex" to quit'])
-        time.sleep(wait_seconds)
+
+    stop_codex_app(graceful_first=not hard, wait_seconds=wait_seconds)
 
     completed = run_command(["open", "-a", str(app_path)])
     if completed.returncode != 0:
         raise SystemExit(f"failed to open Codex app:\n{completed.stderr or completed.stdout}")
+    if not wait_for_codex_state(running=True, timeout_seconds=10.0):
+        raise SystemExit("Codex relaunch was requested, but the app did not come back up in time")
     return True
 
 
