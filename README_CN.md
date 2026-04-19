@@ -65,6 +65,8 @@ cd codex-auth-pool
 ./install.sh
 ```
 
+如果你已经装过后台轮换器，现在重新执行 `./install.sh` 也会自动重载已存在的 `launchd` 或 `systemd --user` 服务，让它立即切到新代码。
+
 ### 手动安装
 
 ```bash
@@ -242,6 +244,16 @@ codex-auth-pool dashboard
 ```bash
 codex-auth-pool daemon --interval-seconds 60
 ```
+
+## 升级
+
+拉取新代码后，重新执行：
+
+```bash
+./install.sh
+```
+
+现在它会重新安装包，并尝试自动重载已经存在的后台服务，避免“命令已经是新代码，但守护还在跑旧代码”的情况。
 
 ## 许可证
 

@@ -65,6 +65,8 @@ cd codex-auth-pool
 ./install.sh
 ```
 
+If you already have the background rotator installed, rerunning `./install.sh` now also reloads the existing `launchd` or `systemd --user` service so it picks up the new code immediately.
+
 ### Manual
 
 ```bash
@@ -240,6 +242,16 @@ If `systemctl --user` is not available in your Ubuntu environment, run the daemo
 ```bash
 codex-auth-pool daemon --interval-seconds 60
 ```
+
+## Upgrading
+
+After pulling new code, rerun:
+
+```bash
+./install.sh
+```
+
+This now reinstalls the package and attempts to reload any existing background service automatically.
 
 ## License
 

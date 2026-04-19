@@ -17,6 +17,35 @@ next_command() {
   fi
 }
 
+restart_background_service_if_present() {
+  if [[ "${OS_NAME}" == "Darwin" ]]; then
+    local plist="${HOME}/Library/LaunchAgents/ai.codex.auth.pool.plist"
+    if [[ -f "${plist}" ]] && command -v launchctl >/dev/null 2>&1; then
+      if launchctl kickstart -k "gui/$(id -u)/ai.codex.auth.pool" >/dev/null 2>&1; then
+        echo "[codex-auth-pool] Reloaded existing launchd agent: ai.codex.auth.pool"
+      elif launchctl bootout "gui/$(id -u)/ai.codex.auth.pool" >/dev/null 2>&1 || true; launchctl bootstrap "gui/$(id -u)" "${plist}" >/dev/null 2>&1; then
+        echo "[codex-auth-pool] Reloaded existing launchd agent: ai.codex.auth.pool"
+      else
+        echo "[codex-auth-pool] Warning: failed to reload existing launchd agent automatically."
+        echo "[codex-auth-pool] Run: codex-auth-pool launchd-install --restart-after-switch"
+      fi
+    fi
+    return
+  fi
+
+  if [[ "${OS_NAME}" == "Linux" ]]; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user cat codex-auth-pool.service >/dev/null 2>&1; then
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      if systemctl --user restart codex-auth-pool.service >/dev/null 2>&1; then
+        echo "[codex-auth-pool] Reloaded existing systemd user service: codex-auth-pool.service"
+      else
+        echo "[codex-auth-pool] Warning: failed to reload existing systemd user service automatically."
+        echo "[codex-auth-pool] Run: codex-auth-pool systemd-install --interval-seconds 60"
+      fi
+    fi
+  fi
+}
+
 find_python() {
   local candidate
   for candidate in python3.12 python3.11 python3.10 python3; do
@@ -48,6 +77,7 @@ if command -v pipx >/dev/null 2>&1; then
   pipx install "${PROJECT_DIR}" --force
   mkdir -p "${LOCAL_BIN_DIR}"
   ln -sf "${PROJECT_LAUNCHER}" "${LOCAL_BIN_DIR}/codex-auth-pool-local"
+  restart_background_service_if_present
   echo
   echo "Installed command: codex-auth-pool"
   echo "Runtime state lives under: ~/.codex-auth-pool and ~/.codex"
@@ -67,6 +97,7 @@ pip install --upgrade pip
 pip install -e "${PROJECT_DIR}"
 mkdir -p "${LOCAL_BIN_DIR}"
 ln -sf "${PROJECT_LAUNCHER}" "${LOCAL_BIN_DIR}/codex-auth-pool"
+restart_background_service_if_present
 
 cat <<EOF
 
