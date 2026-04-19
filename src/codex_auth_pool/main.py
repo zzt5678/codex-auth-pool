@@ -1463,6 +1463,58 @@ def auto_discover_new_profiles(
     }
 
 
+def profile_path_for_account_usage(source_dir: Path, managed_dir: Path, account_id: str) -> Path | None:
+    matches: list[ProfileSummary] = []
+    for path in discover_all_profiles(source_dir, managed_dir):
+        summary = summarize_profile(path)
+        if summary.account_id == account_id:
+            matches.append(summary)
+    if not matches:
+        return None
+    matches.sort(
+        key=lambda summary: (
+            source_rank(summary.source_kind),
+            parse_dt(summary.last_refresh) or datetime(1, 1, 1, tzinfo=timezone.utc),
+            str(summary.path),
+        )
+    )
+    return matches[0].path
+
+
+def refresh_current_account_usage(args: argparse.Namespace, current_account: str) -> bool:
+    path = profile_path_for_account_usage(args.source_dir, args.managed_dir, current_account)
+    if path is None:
+        return False
+    try:
+        refresh_profile_usage(path)
+        append_event(
+            args.events_path,
+            "refresh_current_usage",
+            profile=str(path),
+            account_id=current_account,
+            forced=True,
+        )
+        if not getattr(args, "daemon_quiet", False):
+            print(f"refreshed current account usage: {path.name}")
+        return True
+    except SystemExit as exc:
+        update_profile_metadata(
+            path,
+            usage_error_checked_at=now_local().isoformat(),
+            usage_error=str(exc)[:300],
+        )
+        append_event(
+            args.events_path,
+            "refresh_current_usage_failed",
+            profile=str(path),
+            account_id=current_account,
+            error=str(exc)[:300],
+        )
+        if not getattr(args, "daemon_quiet", False):
+            print(f"current account usage refresh failed: {exc}")
+        return False
+
+
 def current_profile_usage_snapshot(
     source_dir: Path,
     managed_dir: Path,
@@ -2924,6 +2976,14 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         refresh_missing_usage=False,
         max_age_minutes=args.usage_max_age_minutes,
     )
+    current_account = current_auth_account_id(Path(args.target))
+    if current_account is None:
+        print("no current Codex auth account detected")
+        return 1
+
+    if getattr(args, "refresh_usage", False):
+        refresh_current_account_usage(args, current_account)
+
     if getattr(args, "refresh_usage", False):
         refresh_args = argparse.Namespace(
             source_dir=args.source_dir,
@@ -2935,11 +2995,6 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             quiet=getattr(args, "daemon_quiet", False),
         )
         cmd_refresh_usage(refresh_args)
-
-    current_account = current_auth_account_id(Path(args.target))
-    if current_account is None:
-        print("no current Codex auth account detected")
-        return 1
 
     state = load_state(args.state_path)
     snapshot = latest_rate_limit_snapshot(args.sessions_dir)
