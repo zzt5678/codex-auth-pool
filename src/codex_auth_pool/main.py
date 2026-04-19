@@ -105,8 +105,8 @@ DEFAULT_SECONDARY_THRESHOLD = 98.0
 DEFAULT_USAGE_MAX_AGE_MINUTES = 30
 MIN_AUTO_RESTART_INTERVAL_SECONDS = 120
 AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
-DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 600
-DEFAULT_INTERRUPTED_SESSION_MAX_COUNT = 12
+DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 24 * 60 * 60
+DEFAULT_INTERRUPTED_SESSION_MAX_COUNT = 30
 DEFAULT_INTERRUPTED_SESSION_PROMPT = "继续"
 
 
@@ -1014,53 +1014,27 @@ def read_recent_desktop_sessions(
     try:
         with _connect_sqlite_readonly(codex_state_db) as conn:
             conn.row_factory = sqlite3.Row
-            if codex_logs_db.exists():
-                conn.execute("ATTACH DATABASE ? AS logs_db", (str(codex_logs_db),))
-                rows = conn.execute(
-                    """
-                    SELECT
-                        t.id,
-                        t.title,
-                        t.cwd,
-                        t.source,
-                        t.rollout_path,
-                        t.updated_at,
-                        MAX(l.ts) AS last_log_at,
-                        COUNT(l.id) AS recent_log_count
-                    FROM threads t
-                    JOIN logs_db.logs l ON l.thread_id = t.id
-                    WHERE
-                        t.archived = 0
-                        AND t.source IN ('vscode', 'desktop', 'app')
-                        AND l.ts >= ?
-                    GROUP BY t.id
-                    ORDER BY MAX(l.ts) DESC, t.updated_at DESC
-                    LIMIT ?
-                    """,
-                    (cutoff, max_count),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT
-                        id,
-                        title,
-                        cwd,
-                        source,
-                        rollout_path,
-                        updated_at,
-                        NULL AS last_log_at,
-                        0 AS recent_log_count
-                    FROM threads
-                    WHERE
-                        archived = 0
-                        AND source IN ('vscode', 'desktop', 'app')
-                        AND updated_at >= ?
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                    """,
-                    (cutoff, max_count),
-                ).fetchall()
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    title,
+                    cwd,
+                    source,
+                    rollout_path,
+                    updated_at,
+                    NULL AS last_log_at,
+                    0 AS recent_log_count
+                FROM threads
+                WHERE
+                    archived = 0
+                    AND source IN ('vscode', 'desktop', 'app')
+                    AND updated_at >= ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (cutoff, max_count),
+            ).fetchall()
     except sqlite3.Error:
         return []
 
