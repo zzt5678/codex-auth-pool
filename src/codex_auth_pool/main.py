@@ -937,11 +937,15 @@ def restart_codex_app(app_path: Path, hard: bool = True, wait_seconds: float = 2
 
     stop_codex_app(graceful_first=not hard, wait_seconds=wait_seconds)
 
-    completed = run_command(["open", "-a", str(app_path)])
+    # Force a fresh app instance after we have confirmed the old one is gone.
+    completed = run_command(["open", "-n", "-a", str(app_path)])
     if completed.returncode != 0:
         raise SystemExit(f"failed to open Codex app:\n{completed.stderr or completed.stdout}")
-    if not wait_for_codex_state(running=True, timeout_seconds=10.0):
+    if not wait_for_codex_state(running=True, timeout_seconds=15.0):
         raise SystemExit("Codex relaunch was requested, but the app did not come back up in time")
+    time.sleep(1.5)
+    if not codex_process_running():
+        raise SystemExit("Codex briefly launched and then exited during restart verification")
     return True
 
 
