@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import platform
@@ -32,6 +33,11 @@ from typing import Any
 import time
 import plistlib
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
 
 DEFAULT_CLIPROXY_DIR = Path.home() / ".cli-proxy-api"
 DEFAULT_CODEX_AUTH_PATH = Path.home() / ".codex" / "cache" / "auth.json"
@@ -44,6 +50,8 @@ DEFAULT_STATE_PATH = Path.home() / ".codex-auth-pool" / "state.json"
 DEFAULT_CONFIG_PATH = Path.home() / ".codex-auth-pool" / "config.json"
 DEFAULT_EVENTS_PATH = Path.home() / ".codex-auth-pool" / "events.jsonl"
 DEFAULT_ENV_SNAPSHOTS_DIR = Path.home() / ".codex-auth-pool" / "env-snapshots"
+DEFAULT_TICK_LOCK_PATH = Path.home() / ".codex-auth-pool" / "run" / "tick.lock"
+DEFAULT_APPLY_LOCK_PATH = Path.home() / ".codex-auth-pool" / "run" / "apply.lock"
 DEFAULT_CODEX_APP = Path("/Applications/Codex.app") if platform.system() == "Darwin" else Path("")
 DEFAULT_LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 DEFAULT_LAUNCHD_LABEL = "ai.codex.auth.pool"
@@ -84,6 +92,7 @@ REQUIRED_SOURCE_KEYS = (
 )
 DEFAULT_PRIMARY_THRESHOLD = 95.0
 DEFAULT_SECONDARY_THRESHOLD = 98.0
+MIN_AUTO_RESTART_INTERVAL_SECONDS = 120
 
 
 @dataclass
@@ -376,6 +385,22 @@ def read_recent_event(events_path: Path) -> dict[str, Any] | None:
     return None
 
 
+def read_recent_event_of_type(events_path: Path, event_type: str) -> dict[str, Any] | None:
+    if not events_path.exists():
+        return None
+    lines = events_path.read_text(encoding="utf-8").splitlines()
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event_type") == event_type:
+            return event
+    return None
+
+
 def read_recent_log_line(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -391,6 +416,46 @@ def file_mtime(path: Path) -> datetime | None:
     if not path.exists():
         return None
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).astimezone()
+
+
+@contextlib.contextmanager
+def exclusive_lock(path: Path, *, blocking: bool = False):
+    if fcntl is None:
+        yield True
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle.fileno(), flags)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def restart_recently_blocked(state: dict[str, Any], *, now: datetime) -> tuple[bool, int | None]:
+    last_restart = parse_dt(state.get("last_restart_at"))
+    if last_restart is None:
+        return False, None
+    elapsed = int((now - last_restart).total_seconds())
+    if elapsed < MIN_AUTO_RESTART_INTERVAL_SECONDS:
+        return True, max(0, MIN_AUTO_RESTART_INTERVAL_SECONDS - elapsed)
+    return False, None
+
+
+def auto_rotation_recently_blocked(state: dict[str, Any], *, now: datetime) -> tuple[bool, int | None]:
+    last_rotation = parse_dt(state.get("last_auto_rotation_at"))
+    if last_rotation is None:
+        return False, None
+    elapsed = int((now - last_rotation).total_seconds())
+    if elapsed < MIN_AUTO_RESTART_INTERVAL_SECONDS:
+        return True, max(0, MIN_AUTO_RESTART_INTERVAL_SECONDS - elapsed)
+    return False, None
 
 
 def current_account_summary(target_path: Path, source_dir: Path, managed_dir: Path) -> ProfileSummary | None:
@@ -1625,6 +1690,23 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  reset_at: {reset_label}")
         print(f"  reset_source: {reset_source}")
     print("")
+    print("Last Switch")
+    last_apply = state.get("last_apply") if isinstance(state.get("last_apply"), dict) else None
+    if last_apply is None:
+        last_apply = read_recent_event_of_type(args.events_path, "apply_profile")
+    if last_apply is None:
+        print("  none")
+    else:
+        print(f"  account: {last_apply.get('email') or last_apply.get('account_id') or '-'}")
+        print(f"  time: {last_apply.get('timestamp') or '-'}")
+        print(f"  source: {last_apply.get('apply_source') or 'legacy/manual'}")
+        print(f"  reason: {last_apply.get('rotation_reason') or '-'}")
+        print(f"  trigger: {last_apply.get('rotation_trigger_source') or '-'}")
+        restarted = last_apply.get("restart_performed")
+        if restarted is None:
+            restarted = last_apply.get("restart_after_switch")
+        print(f"  restarted: {'yes' if restarted else 'no'}")
+    print("")
     print("Pool")
     for index, item in enumerate(ranked[: min(len(ranked), 8)], start=1):
         summary: ProfileSummary = item["summary"]
@@ -1637,9 +1719,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             flags.append("current")
         if summary.disabled:
             flags.append("source-disabled")
-        if item["cooldown_until"] is not None and item["cooldown_until"] > now_local():
+        active_cooldown = item["cooldown_until"] is not None and item["cooldown_until"] > now_local()
+        if active_cooldown:
             flags.append(f"cooldown_until={item['cooldown_until'].isoformat()}")
-        if item["cooldown_reason"]:
+        if active_cooldown and item["cooldown_reason"]:
             flags.append(f"reason={item['cooldown_reason']}")
         if item["is_preferred_next"]:
             flags.append("preferred-next")
@@ -1708,6 +1791,20 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
+    with exclusive_lock(DEFAULT_APPLY_LOCK_PATH, blocking=True) as acquired:
+        if not acquired:
+            print("another auth apply is running; skipping")
+            return 0
+        return cmd_apply_locked(args)
+
+
+def cmd_apply_locked(args: argparse.Namespace) -> int:
+    apply_source = getattr(args, "apply_source", "manual")
+    rotation_reason = getattr(args, "rotation_reason", None)
+    rotation_trigger_source = getattr(args, "rotation_trigger_source", None)
+    if apply_source == "auto_rotation" and (not rotation_reason or not rotation_trigger_source):
+        raise SystemExit("refusing automatic apply without an explicit quota rotation trigger")
+
     profile_path = pick_profile(args.source_dir, args.managed_dir, args.profile)
     normalized = normalize_source_payload(profile_path, read_json(profile_path))
     payload = convert_profile(normalized)
@@ -1721,18 +1818,46 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
     write_json(target_path, payload)
     synced_targets = sync_secondary_auth_files(payload, target_path)
+    state = load_state(args.state_path) if getattr(args, "state_path", None) else {}
     if getattr(args, "state_path", None):
-        state = load_state(args.state_path)
         state["current_profile"] = str(profile_path)
         if state.get("preferred_next_account_id") == normalized.get("account_id"):
             state.pop("preferred_next_account_id", None)
-        save_state(args.state_path, state)
     print(f"applied profile {profile_path.name} to {target_path}")
     for synced in synced_targets:
         print(f"synced secondary auth file {synced}")
-    if getattr(args, "restart_after_switch", False):
-        if restart_codex_app(Path(args.app_path), hard=not getattr(args, "graceful_restart", False)):
+
+    restart_requested = bool(getattr(args, "restart_after_switch", False))
+    restart_performed = False
+    restart_skipped_reason = None
+    if restart_requested:
+        restart_now = now_local()
+        recently_blocked, retry_after_seconds = restart_recently_blocked(state, now=restart_now)
+        if apply_source == "auto_rotation" and recently_blocked:
+            restart_skipped_reason = f"recent_restart_retry_after_{retry_after_seconds}s"
+            print(f"restart skipped: recent automatic restart, retry after {retry_after_seconds}s")
+        elif restart_codex_app(Path(args.app_path), hard=not getattr(args, "graceful_restart", False)):
+            restart_performed = True
+            state["last_restart_at"] = restart_now.isoformat()
             print(f"restarted Codex app {args.app_path}")
+
+    apply_time = now_local()
+    if getattr(args, "state_path", None):
+        state["last_apply"] = {
+            "timestamp": apply_time.isoformat(),
+            "profile": str(profile_path),
+            "email": normalized.get("email"),
+            "account_id": normalized.get("account_id"),
+            "apply_source": apply_source,
+            "rotation_reason": rotation_reason,
+            "rotation_trigger_source": rotation_trigger_source,
+            "restart_requested": restart_requested,
+            "restart_performed": restart_performed,
+            "restart_skipped_reason": restart_skipped_reason,
+        }
+        if apply_source == "auto_rotation":
+            state["last_auto_rotation_at"] = apply_time.isoformat()
+        save_state(args.state_path, state)
     append_event(
         args.events_path,
         "apply_profile",
@@ -1740,10 +1865,12 @@ def cmd_apply(args: argparse.Namespace) -> int:
         source_kind=normalized.get("source_kind"),
         email=normalized.get("email"),
         account_id=normalized.get("account_id"),
-        restart_after_switch=bool(getattr(args, "restart_after_switch", False)),
-        apply_source=getattr(args, "apply_source", "manual"),
-        rotation_reason=getattr(args, "rotation_reason", None),
-        rotation_trigger_source=getattr(args, "rotation_trigger_source", None),
+        restart_after_switch=restart_requested,
+        restart_performed=restart_performed,
+        restart_skipped_reason=restart_skipped_reason,
+        apply_source=apply_source,
+        rotation_reason=rotation_reason,
+        rotation_trigger_source=rotation_trigger_source,
     )
     send_notification(
         "Codex Auth Pool",
@@ -2025,22 +2152,27 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
 
     refreshed = 0
     failed = 0
-    print("Usage Refresh")
+    quiet = bool(getattr(args, "quiet", False))
+    if not quiet:
+        print("Usage Refresh")
     for path in profiles:
         if not getattr(args, "force", False) and usage_is_stale(path, args.max_age_minutes) is False:
             checked_at = usage_checked_at_for_profile(path)
-            print(f"  - {path.name}: skipped (fresh until {checked_at.isoformat() if checked_at else '-'})")
+            if not quiet:
+                print(f"  - {path.name}: skipped (fresh until {checked_at.isoformat() if checked_at else '-'})")
             continue
         try:
             meta = refresh_profile_usage(path)
             refreshed += 1
-            print(
-                f"  - {path.name}: weekly={meta.get('observed_secondary_used_percent', '-')}% "
-                f"reset={meta.get('observed_secondary_reset_at', '-')}"
-            )
+            if not quiet:
+                print(
+                    f"  - {path.name}: weekly={meta.get('observed_secondary_used_percent', '-')}% "
+                    f"reset={meta.get('observed_secondary_reset_at', '-')}"
+                )
         except SystemExit as exc:
             failed += 1
-            print(f"  - {path.name}: failed ({exc})")
+            if not quiet:
+                print(f"  - {path.name}: failed ({exc})")
 
     append_event(
         args.events_path,
@@ -2050,8 +2182,11 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
         profile=getattr(args, "profile", None),
         force=bool(getattr(args, "force", False)),
     )
-    print("")
-    print(f"summary: refreshed={refreshed} failed={failed}")
+    if quiet:
+        print(f"usage refresh: refreshed={refreshed} failed={failed}")
+    else:
+        print("")
+        print(f"summary: refreshed={refreshed} failed={failed}")
     return 0 if failed == 0 else 1
 
 
@@ -2271,6 +2406,23 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         print(f"  next reset source: {reset_source}")
         print(f"  next preferred: {'yes' if next_item['is_preferred_next'] else 'no'}")
     print("")
+    print("Last Switch")
+    last_apply = state.get("last_apply") if isinstance(state.get("last_apply"), dict) else None
+    if last_apply is None:
+        last_apply = read_recent_event_of_type(args.events_path, "apply_profile")
+    if last_apply is None:
+        print("  none")
+    else:
+        print(f"  account: {last_apply.get('email') or last_apply.get('account_id') or '-'}")
+        print(f"  time: {last_apply.get('timestamp') or '-'}")
+        print(f"  source: {last_apply.get('apply_source') or 'legacy/manual'}")
+        print(f"  reason: {last_apply.get('rotation_reason') or '-'}")
+        print(f"  trigger: {last_apply.get('rotation_trigger_source') or '-'}")
+        restarted = last_apply.get("restart_performed")
+        if restarted is None:
+            restarted = last_apply.get("restart_after_switch")
+        print(f"  restarted: {'yes' if restarted else 'no'}")
+    print("")
     print("Daemon")
     print(f"  kind: {background['kind']}")
     print(f"  installed: {'yes' if background['installed'] else 'no'}")
@@ -2456,7 +2608,34 @@ def cmd_events(args: argparse.Namespace) -> int:
     lines = args.events_path.read_text(encoding="utf-8").splitlines()
     tail = lines[-args.limit :] if args.limit > 0 else lines
     for line in tail:
-        print(line)
+        if getattr(args, "raw", False):
+            print(line)
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            print(line)
+            continue
+        event_type = event.get("event_type", "-")
+        timestamp = event.get("timestamp", "-")
+        subject = event.get("email") or event.get("account_id") or event.get("profile") or "-"
+        details = []
+        for key in (
+            "apply_source",
+            "rotation_reason",
+            "rotation_trigger_source",
+            "restart_after_switch",
+            "restart_performed",
+            "restart_skipped_reason",
+            "reason",
+            "cooldown_until",
+            "retry_after_seconds",
+        ):
+            value = event.get(key)
+            if value not in (None, ""):
+                details.append(f"{key}={value}")
+        detail = f" ({', '.join(details)})" if details else ""
+        print(f"{timestamp}  {event_type}  {subject}{detail}")
     return 0
 
 
@@ -2564,6 +2743,14 @@ def set_cooldown_by_account_id(
 
 
 def cmd_tick(args: argparse.Namespace) -> int:
+    with exclusive_lock(DEFAULT_TICK_LOCK_PATH, blocking=False) as acquired:
+        if not acquired:
+            print("another daemon tick is still running; skipping this tick")
+            return 0
+        return cmd_tick_locked(args)
+
+
+def cmd_tick_locked(args: argparse.Namespace) -> int:
     if getattr(args, "refresh_usage", False):
         refresh_args = argparse.Namespace(
             source_dir=args.source_dir,
@@ -2572,6 +2759,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
             force=False,
             max_age_minutes=args.usage_max_age_minutes,
             events_path=args.events_path,
+            quiet=getattr(args, "daemon_quiet", False),
         )
         cmd_refresh_usage(refresh_args)
 
@@ -2631,6 +2819,24 @@ def cmd_tick(args: argparse.Namespace) -> int:
         triggered_until = trigger_primary_reset
 
     if triggered_reason and triggered_until:
+        if getattr(args, "dry_run", False):
+            print(
+                f"dry run: would mark current account {current_account} on cooldown until "
+                f"{triggered_until.isoformat()} ({triggered_reason}, source={trigger_source})"
+            )
+            return 0
+        recent_rotation, retry_after_seconds = auto_rotation_recently_blocked(state, now=now_local())
+        if recent_rotation:
+            append_event(
+                args.events_path,
+                "rotation_skipped_recent",
+                account_id=current_account,
+                reason=triggered_reason,
+                retry_after_seconds=retry_after_seconds,
+                trigger_source=trigger_source,
+            )
+            print(f"rotation skipped: recent automatic rotation, retry after {retry_after_seconds}s")
+            return 0
         set_cooldown_by_account_id(args.state_path, current_account, triggered_until, triggered_reason)
         append_event(
             args.events_path,
@@ -2669,6 +2875,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
 
 def cmd_daemon(args: argparse.Namespace) -> int:
+    args.daemon_quiet = True
     while True:
         try:
             cmd_tick(args)
@@ -3167,6 +3374,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="show recent save/import/cooldown/switch events from the auth-pool event log",
     )
     events_parser.add_argument("--limit", type=int, default=20)
+    events_parser.add_argument("--raw", action="store_true", help="print raw JSONL events")
     events_parser.set_defaults(func=cmd_events)
 
     save_current_parser = subparsers.add_parser(
@@ -3271,6 +3479,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-apply-best",
         action="store_true",
         help="only mark cooldown; do not switch to another account",
+    )
+    tick_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show whether rotation would trigger without changing state or switching accounts",
     )
     tick_parser.add_argument(
         "--restart-after-switch",

@@ -51,6 +51,8 @@ when you need an emergency manual switch.
 - Rank accounts using observed reset data instead of only trusting local metadata.
 - Auto-cool down exhausted accounts and switch to the next available one.
 - Restart Codex Desktop automatically after switching on macOS.
+- Background rotation switches and restarts only after a real quota threshold trigger; normal polling does not interrupt your work.
+- Built-in locks and a short automatic-rotation throttle prevent repeated ticks from causing restart loops.
 - Snapshot and restore local Codex plugin, config, and connector cache state.
 - Run as a background `launchd` agent on macOS.
 - Run as a background `systemd --user` service on Ubuntu/Linux.
@@ -129,6 +131,16 @@ codex-auth-pool refresh-usage --force
 
 This queries ChatGPT directly for each account and updates the cached reset data.
 
+### 5. Check rotation safely
+
+```bash
+codex-auth-pool tick --dry-run
+codex-auth-pool events --limit 10
+```
+
+`tick --dry-run` reports whether a rotation would trigger without writing cooldowns, switching accounts, or restarting Codex.
+`events` prints a readable summary by default; use `codex-auth-pool events --raw` for raw JSONL.
+
 ## Most Useful Commands
 
 ```bash
@@ -137,7 +149,8 @@ codex-auth-pool status
 codex-auth-pool refresh-usage --force
 codex-auth-pool save-current --name my-official-1
 codex-auth-pool sync-cliproxy
-codex-auth-pool apply-best --restart-after-switch
+codex-auth-pool tick --dry-run
+codex-auth-pool events --limit 10
 codex-auth-pool launchd-status
 codex-auth-pool systemd-status
 ```
@@ -177,6 +190,8 @@ codex-auth-pool save-current --name my-official-1
 codex-auth-pool import-auth-file ~/.codex/auth.json --name imported-official
 codex-auth-pool sync-cliproxy
 codex-auth-pool refresh-usage --force
+codex-auth-pool tick --dry-run
+codex-auth-pool events --limit 10
 codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool tick
 codex-auth-pool launchd-install --interval-seconds 60 --restart-after-switch
@@ -216,6 +231,7 @@ Important paths:
 - Ubuntu/Linux supports auth rotation and `systemd --user`; automatic Codex Desktop restart is a no-op there
 - updates both `~/.codex/cache/auth.json` and `~/.codex/auth.json`
 - keeps local plugin and connector state out of the auth rotation path
+- `apply-best --restart-after-switch` is an immediate manual switch command; use `init --install-launchd --restart-after-switch` or `launchd-install --restart-after-switch` for background auto-rotation
 - background rotation defaults to preemptive thresholds of `95%` for the 5-hour window and `98%` for the weekly window
 
 ## Ubuntu Deployment

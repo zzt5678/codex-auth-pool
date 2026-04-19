@@ -51,6 +51,8 @@
 - 排序时优先使用真实观测值，而不是只依赖本地元数据。
 - 账号额度触顶后自动冷却，并切换到下一个可用账号。
 - macOS 上切换后可自动重启 Codex Desktop。
+- 后台守护只有在真实额度触发阈值时才会切换和重启；普通轮询不会打断当前工作。
+- 内置防重入锁和短时间自动轮换节流，避免重复 tick 导致连续切号/重启。
 - 支持快照和恢复本地插件、配置、连接器缓存状态。
 - 支持 macOS `launchd` 后台常驻。
 - 支持 Ubuntu/Linux `systemd --user` 后台常驻。
@@ -129,6 +131,16 @@ codex-auth-pool refresh-usage --force
 
 这条命令会逐个账号向 ChatGPT 查询真实额度窗口，并更新缓存的重置时间。
 
+### 5. 无破坏性检查是否会触发轮换
+
+```bash
+codex-auth-pool tick --dry-run
+codex-auth-pool events --limit 10
+```
+
+`tick --dry-run` 只报告是否会触发轮换，不会写入冷却、不切号、不重启。
+`events` 默认输出易读摘要；如果需要原始 JSONL，可以使用 `codex-auth-pool events --raw`。
+
 ## 最常用命令
 
 ```bash
@@ -137,7 +149,8 @@ codex-auth-pool status
 codex-auth-pool refresh-usage --force
 codex-auth-pool save-current --name my-official-1
 codex-auth-pool sync-cliproxy
-codex-auth-pool apply-best --restart-after-switch
+codex-auth-pool tick --dry-run
+codex-auth-pool events --limit 10
 codex-auth-pool launchd-status
 codex-auth-pool systemd-status
 ```
@@ -177,6 +190,8 @@ codex-auth-pool save-current --name my-official-1
 codex-auth-pool import-auth-file ~/.codex/auth.json --name imported-official
 codex-auth-pool sync-cliproxy
 codex-auth-pool refresh-usage --force
+codex-auth-pool tick --dry-run
+codex-auth-pool events --limit 10
 codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool tick
 codex-auth-pool launchd-install --interval-seconds 60 --restart-after-switch
@@ -216,6 +231,7 @@ codex-auth-pool restore-env baseline --restart-codex
 - Ubuntu/Linux 支持账号轮换和 `systemd --user`，但自动重启 Codex Desktop 会自动降级为 no-op
 - 会同时更新 `~/.codex/cache/auth.json` 和 `~/.codex/auth.json`
 - 插件和连接器状态尽量与 auth 轮换解耦
+- `apply-best --restart-after-switch` 是人工立即切换命令；后台自动切换请使用 `init --install-launchd --restart-after-switch` 或 `launchd-install --restart-after-switch`
 - 后台轮换默认是提前切换：
   - 5 小时窗口默认阈值 `95%`
   - 周窗口默认阈值 `98%`
