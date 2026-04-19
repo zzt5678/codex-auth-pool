@@ -465,6 +465,26 @@ def read_recent_event_of_type(events_path: Path, event_type: str) -> dict[str, A
     return None
 
 
+def recent_resumed_sessions_summary(events_path: Path, limit: int = 3) -> dict[str, Any] | None:
+    event = read_recent_event_of_type(events_path, "interrupted_sessions_resume_started")
+    if event is None:
+        return None
+    sessions = event.get("sessions")
+    if not isinstance(sessions, list):
+        sessions = []
+    titles = [
+        str(session.get("title") or session.get("session_id") or "-")
+        for session in sessions[:limit]
+        if isinstance(session, dict)
+    ]
+    return {
+        "timestamp": event.get("timestamp"),
+        "session_count": int(event.get("session_count") or len(sessions)),
+        "titles": titles,
+        "snapshot_path": event.get("snapshot_path"),
+    }
+
+
 def read_recent_log_line(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -2163,6 +2183,15 @@ def cmd_status(args: argparse.Namespace) -> int:
             restarted = last_apply.get("restart_after_switch")
         print(f"  restarted: {'yes' if restarted else 'no'}")
     print("")
+    print("Session Recovery")
+    recovery = recent_resumed_sessions_summary(args.events_path)
+    if recovery is None:
+        print("  none")
+    else:
+        print(f"  time: {recovery['timestamp'] or '-'}")
+        print(f"  resumed sessions: {recovery['session_count']}")
+        print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
+    print("")
     print("Pool")
     for index, item in enumerate(ranked[: min(len(ranked), 8)], start=1):
         summary: ProfileSummary = item["summary"]
@@ -2913,6 +2942,15 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             restarted = last_apply.get("restart_after_switch")
         print(f"  restarted: {'yes' if restarted else 'no'}")
     print("")
+    print("Session Recovery")
+    recovery = recent_resumed_sessions_summary(args.events_path)
+    if recovery is None:
+        print("  none")
+    else:
+        print(f"  time: {recovery['timestamp'] or '-'}")
+        print(f"  resumed sessions: {recovery['session_count']}")
+        print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
+    print("")
     print("Daemon")
     print(f"  kind: {background['kind']}")
     print(f"  installed: {'yes' if background['installed'] else 'no'}")
@@ -3123,6 +3161,7 @@ def cmd_events(args: argparse.Namespace) -> int:
             "synced_count",
             "refreshed_count",
             "failed_count",
+            "session_count",
         ):
             value = event.get(key)
             if value not in (None, ""):
