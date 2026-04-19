@@ -23,6 +23,7 @@
 ## 适合谁用
 
 - 使用 Codex Desktop 的 macOS 用户
+- 使用 Codex CLI 的 Ubuntu/Linux 用户，需要账号轮换但不依赖 Desktop 专属能力
 - 有多个 ChatGPT / Codex 账号的人
 - 不想再手动复制 `auth.json` 来回切换的人
 - 希望切号时尽量保留本地插件、连接器和环境状态的人
@@ -49,9 +50,10 @@
 - 直接查询 `https://chatgpt.com/backend-api/wham/usage`，获取每个账号真实的额度窗口和重置时间。
 - 排序时优先使用真实观测值，而不是只依赖本地元数据。
 - 账号额度触顶后自动冷却，并切换到下一个可用账号。
-- 切换后可自动重启 Codex Desktop。
+- macOS 上切换后可自动重启 Codex Desktop。
 - 支持快照和恢复本地插件、配置、连接器缓存状态。
 - 支持 macOS `launchd` 后台常驻。
+- 支持 Ubuntu/Linux `systemd --user` 后台常驻。
 
 ## 安装
 
@@ -82,8 +84,16 @@ codex-auth-pool doctor
 
 ### 2. 执行首次初始化
 
+macOS：
+
 ```bash
 codex-auth-pool init --install-launchd --restart-after-switch
+```
+
+Ubuntu/Linux：
+
+```bash
+codex-auth-pool init --install-systemd
 ```
 
 这一步会自动完成：
@@ -93,7 +103,7 @@ codex-auth-pool init --install-launchd --restart-after-switch
 - 保存当前官方登录
 - 迁移旧格式 managed profile
 - 导入 `cliproxyapi` 账号
-- 安装后台自动轮换
+- 按需安装后台自动轮换
 
 ### 3. 打开看板
 
@@ -127,6 +137,7 @@ codex-auth-pool save-current --name my-official-1
 codex-auth-pool sync-cliproxy
 codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool launchd-status
+codex-auth-pool systemd-status
 ```
 
 ## 排序和轮换规则
@@ -168,6 +179,8 @@ codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool tick
 codex-auth-pool launchd-install --interval-seconds 60 --restart-after-switch
 codex-auth-pool launchd-status
+codex-auth-pool systemd-install --interval-seconds 60
+codex-auth-pool systemd-status
 codex-auth-pool snapshot-env --name baseline
 codex-auth-pool restore-env baseline --restart-codex
 ```
@@ -191,16 +204,44 @@ codex-auth-pool restore-env baseline --restart-codex
 - launchd 日志：
   - `~/.codex-auth-pool/logs/launchd.stdout.log`
   - `~/.codex-auth-pool/logs/launchd.stderr.log`
+- systemd 日志：
+  - `~/.codex-auth-pool/logs/systemd.stdout.log`
+  - `~/.codex-auth-pool/logs/systemd.stderr.log`
 
 ## 备注
 
-- 当前优先支持 macOS
-- 主要围绕 Codex Desktop 使用场景设计
+- macOS 支持切换后自动重启 Codex Desktop
+- Ubuntu/Linux 支持账号轮换和 `systemd --user`，但自动重启 Codex Desktop 会自动降级为 no-op
 - 会同时更新 `~/.codex/cache/auth.json` 和 `~/.codex/auth.json`
 - 插件和连接器状态尽量与 auth 轮换解耦
 - 后台轮换默认是提前切换：
   - 5 小时窗口默认阈值 `95%`
   - 周窗口默认阈值 `98%`
+
+## Ubuntu 部署
+
+前置条件：
+
+- Python 3.10+
+- `git`
+- 如果需要后台常驻，需要可用的 `systemd --user`
+- 已经存在 `~/.codex/` 官方登录态，或者有可导入的 `~/.cli-proxy-api/` auth 文件
+
+推荐安装方式：
+
+```bash
+git clone https://github.com/zzt5678/codex-auth-pool.git
+cd codex-auth-pool
+./install.sh
+codex-auth-pool init --install-systemd
+codex-auth-pool dashboard
+```
+
+如果你的 Ubuntu 环境没有 `systemctl --user`，可以手动跑守护：
+
+```bash
+codex-auth-pool daemon --interval-seconds 60
+```
 
 ## 许可证
 

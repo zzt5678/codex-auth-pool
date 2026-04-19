@@ -5,6 +5,17 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 LOCAL_BIN_DIR="${HOME}/.local/bin"
 PROJECT_LAUNCHER="${PROJECT_DIR}/codex-auth-pool"
+OS_NAME="$(uname -s)"
+
+next_command() {
+  if [[ "${OS_NAME}" == "Darwin" ]]; then
+    echo "codex-auth-pool init --install-launchd --restart-after-switch"
+  elif [[ "${OS_NAME}" == "Linux" ]]; then
+    echo "codex-auth-pool init --install-systemd"
+  else
+    echo "codex-auth-pool init"
+  fi
+}
 
 find_python() {
   local candidate
@@ -41,7 +52,7 @@ if command -v pipx >/dev/null 2>&1; then
   echo "Installed command: codex-auth-pool"
   echo "Runtime state lives under: ~/.codex-auth-pool and ~/.codex"
   echo "Next:"
-  echo "  codex-auth-pool init --install-launchd --restart-after-switch"
+  echo "  $(next_command)"
   echo
   echo "Also available inside the project directory:"
   echo "  ./codex-auth-pool status"
@@ -67,7 +78,7 @@ Runtime state still lives under:
   ~/.codex
 
 Use from anywhere:
-  codex-auth-pool init --install-launchd --restart-after-switch
+  $(next_command)
 
 Use inside this project directory:
   ./codex-auth-pool status

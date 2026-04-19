@@ -23,6 +23,7 @@ If you use Codex through the official ChatGPT login flow, you usually hit two pr
 ## Who This Is For
 
 - Codex Desktop users on macOS
+- Codex CLI users on Ubuntu/Linux who want auth rotation without Desktop-specific features
 - people running more than one ChatGPT/Codex account
 - users who want automatic rotation instead of copying auth files by hand
 - users who want to preserve local Codex plugin and connector state across account switches
@@ -49,9 +50,10 @@ when you need an emergency manual switch.
 - Query `https://chatgpt.com/backend-api/wham/usage` per account to get real reset windows.
 - Rank accounts using observed reset data instead of only trusting local metadata.
 - Auto-cool down exhausted accounts and switch to the next available one.
-- Restart Codex Desktop automatically after switching.
+- Restart Codex Desktop automatically after switching on macOS.
 - Snapshot and restore local Codex plugin, config, and connector cache state.
 - Run as a background `launchd` agent on macOS.
+- Run as a background `systemd --user` service on Ubuntu/Linux.
 
 ## Install
 
@@ -82,8 +84,16 @@ codex-auth-pool doctor
 
 ### 2. Run first-time setup
 
+macOS:
+
 ```bash
 codex-auth-pool init --install-launchd --restart-after-switch
+```
+
+Ubuntu/Linux:
+
+```bash
+codex-auth-pool init --install-systemd
 ```
 
 This will:
@@ -93,7 +103,7 @@ This will:
 - save your current official login
 - migrate old managed profiles if needed
 - import `cliproxyapi` accounts if found
-- install the background rotator
+- install the background rotator if requested
 
 ### 3. Open the dashboard
 
@@ -127,6 +137,7 @@ codex-auth-pool save-current --name my-official-1
 codex-auth-pool sync-cliproxy
 codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool launchd-status
+codex-auth-pool systemd-status
 ```
 
 ## Rotation Logic
@@ -168,6 +179,8 @@ codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool tick
 codex-auth-pool launchd-install --interval-seconds 60 --restart-after-switch
 codex-auth-pool launchd-status
+codex-auth-pool systemd-install --interval-seconds 60
+codex-auth-pool systemd-status
 codex-auth-pool snapshot-env --name baseline
 codex-auth-pool restore-env baseline --restart-codex
 ```
@@ -191,14 +204,42 @@ Important paths:
 - launchd logs:
   - `~/.codex-auth-pool/logs/launchd.stdout.log`
   - `~/.codex-auth-pool/logs/launchd.stderr.log`
+- systemd logs:
+  - `~/.codex-auth-pool/logs/systemd.stdout.log`
+  - `~/.codex-auth-pool/logs/systemd.stderr.log`
 
 ## Notes
 
-- macOS-first right now
-- designed around Codex Desktop
+- macOS supports Codex Desktop restart after switching
+- Ubuntu/Linux supports auth rotation and `systemd --user`; automatic Codex Desktop restart is a no-op there
 - updates both `~/.codex/cache/auth.json` and `~/.codex/auth.json`
 - keeps local plugin and connector state out of the auth rotation path
 - background rotation defaults to preemptive thresholds of `95%` for the 5-hour window and `98%` for the weekly window
+
+## Ubuntu Deployment
+
+Prerequisites:
+
+- Python 3.10+
+- `git`
+- `systemd --user` if you want the background service
+- existing Codex auth under `~/.codex/`, or auth files to import from `~/.cli-proxy-api/`
+
+Recommended install:
+
+```bash
+git clone https://github.com/zzt5678/codex-auth-pool.git
+cd codex-auth-pool
+./install.sh
+codex-auth-pool init --install-systemd
+codex-auth-pool dashboard
+```
+
+If `systemctl --user` is not available in your Ubuntu environment, run the daemon manually:
+
+```bash
+codex-auth-pool daemon --interval-seconds 60
+```
 
 ## License
 

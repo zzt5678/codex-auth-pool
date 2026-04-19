@@ -17,6 +17,8 @@ import argparse
 import base64
 import json
 import os
+import platform
+import shlex
 import shutil as shutil_lib
 import shutil
 import subprocess
@@ -42,11 +44,15 @@ DEFAULT_STATE_PATH = Path.home() / ".codex-auth-pool" / "state.json"
 DEFAULT_CONFIG_PATH = Path.home() / ".codex-auth-pool" / "config.json"
 DEFAULT_EVENTS_PATH = Path.home() / ".codex-auth-pool" / "events.jsonl"
 DEFAULT_ENV_SNAPSHOTS_DIR = Path.home() / ".codex-auth-pool" / "env-snapshots"
-DEFAULT_CODEX_APP = Path("/Applications/Codex.app")
+DEFAULT_CODEX_APP = Path("/Applications/Codex.app") if platform.system() == "Darwin" else Path("")
 DEFAULT_LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 DEFAULT_LAUNCHD_LABEL = "ai.codex.auth.pool"
 DEFAULT_LAUNCHD_STDOUT = Path.home() / ".codex-auth-pool" / "logs" / "launchd.stdout.log"
 DEFAULT_LAUNCHD_STDERR = Path.home() / ".codex-auth-pool" / "logs" / "launchd.stderr.log"
+DEFAULT_SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
+DEFAULT_SYSTEMD_SERVICE = "codex-auth-pool.service"
+DEFAULT_SYSTEMD_STDOUT = Path.home() / ".codex-auth-pool" / "logs" / "systemd.stdout.log"
+DEFAULT_SYSTEMD_STDERR = Path.home() / ".codex-auth-pool" / "logs" / "systemd.stderr.log"
 BACKUP_TIMESTAMP_FMT = "%Y%m%d-%H%M%S"
 ENV_VAR_MAP = {
     "source_dir": "CODEX_AUTH_POOL_SOURCE_DIR",
@@ -231,6 +237,14 @@ def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
+def is_macos() -> bool:
+    return platform.system() == "Darwin"
+
+
+def is_linux() -> bool:
+    return platform.system() == "Linux"
+
+
 def append_event(events_path: Path, event_type: str, **fields: Any) -> None:
     events_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -245,8 +259,12 @@ def append_event(events_path: Path, event_type: str, **fields: Any) -> None:
 def send_notification(title: str, message: str, enabled: bool = True) -> None:
     if not enabled:
         return
-    script = f'display notification "{message.replace(chr(34), chr(39))}" with title "{title.replace(chr(34), chr(39))}"'
-    run_command(["osascript", "-e", script])
+    if is_macos() and shutil_lib.which("osascript"):
+        script = f'display notification "{message.replace(chr(34), chr(39))}" with title "{title.replace(chr(34), chr(39))}"'
+        run_command(["osascript", "-e", script])
+        return
+    if is_linux() and shutil_lib.which("notify-send"):
+        run_command(["notify-send", title, message])
 
 
 def env_snapshot_items() -> list[tuple[str, Path]]:
@@ -804,7 +822,14 @@ def sync_secondary_auth_files(primary_payload: dict[str, Any], primary_target: P
     return synced
 
 
-def restart_codex_app(app_path: Path, hard: bool = True, wait_seconds: float = 2.0) -> None:
+def restart_codex_app(app_path: Path, hard: bool = True, wait_seconds: float = 2.0) -> bool:
+    if not is_macos():
+        print(
+            "restart-after-switch requested, but automatic Codex app restart is only supported on macOS; "
+            "restart Codex manually on this platform.",
+            file=sys.stderr,
+        )
+        return False
     if hard:
         run_command(["pkill", "-x", "Codex"])
         run_command(["pkill", "-f", "/Applications/Codex.app/Contents/Frameworks/Codex Helper"])
@@ -817,6 +842,7 @@ def restart_codex_app(app_path: Path, hard: bool = True, wait_seconds: float = 2
     completed = run_command(["open", "-a", str(app_path)])
     if completed.returncode != 0:
         raise SystemExit(f"failed to open Codex app:\n{completed.stderr or completed.stdout}")
+    return True
 
 
 def launchd_plist_path(label: str) -> Path:
@@ -904,16 +930,22 @@ def write_launchd_plist(
 
 
 def launchctl_bootout(label: str) -> None:
+    if not is_macos():
+        raise SystemExit("launchd is only available on macOS; use systemd-install on Linux")
     run_command(["launchctl", "bootout", launchctl_target(label)])
 
 
 def launchctl_bootstrap(label: str, plist_path: Path) -> None:
+    if not is_macos():
+        raise SystemExit("launchd is only available on macOS; use systemd-install on Linux")
     completed = run_command(["launchctl", "bootstrap", launchctl_domain(), str(plist_path)])
     if completed.returncode != 0:
         raise SystemExit(f"failed to bootstrap {label}:\n{completed.stderr or completed.stdout}")
 
 
 def launchctl_kickstart(label: str) -> None:
+    if not is_macos():
+        raise SystemExit("launchd is only available on macOS; use systemd-install on Linux")
     completed = run_command(["launchctl", "kickstart", "-k", launchctl_target(label)])
     if completed.returncode != 0:
         raise SystemExit(f"failed to kickstart {label}:\n{completed.stderr or completed.stdout}")
@@ -929,6 +961,8 @@ def launchctl_status(label: str) -> dict[str, Any]:
         "state": None,
         "pid": None,
     }
+    if not is_macos():
+        return status
     completed = run_command(["launchctl", "print", launchctl_target(label)])
     if completed.returncode != 0:
         return status
@@ -940,6 +974,149 @@ def launchctl_status(label: str) -> dict[str, Any]:
         elif line.startswith("pid ="):
             status["pid"] = line.split("=", 1)[1].strip()
     return status
+
+
+def systemd_service_path(service_name: str) -> Path:
+    return DEFAULT_SYSTEMD_DIR / service_name
+
+
+def systemd_unit_name(service_name: str) -> str:
+    return service_name if service_name.endswith(".service") else f"{service_name}.service"
+
+
+def systemctl_user(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return run_command(["systemctl", "--user", *args])
+
+
+def write_systemd_service(
+    *,
+    service_name: str,
+    command_path: str,
+    interval_seconds: int,
+    state_path: Path,
+    target: str,
+    sessions_dir: Path,
+    source_dir: Path,
+    managed_dir: Path,
+    events_path: Path,
+    primary_threshold: float,
+    secondary_threshold: float,
+    restart_after_switch: bool,
+    app_path: Path,
+    refresh_usage: bool,
+    usage_max_age_minutes: int,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> Path:
+    unit = systemd_unit_name(service_name)
+    service_path = systemd_service_path(unit)
+    service_path.parent.mkdir(parents=True, exist_ok=True)
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        command_path,
+        "--state-path",
+        str(state_path),
+        "--target",
+        str(target),
+        "--events-path",
+        str(events_path),
+        "--sessions-dir",
+        str(sessions_dir),
+        "--source-dir",
+        str(source_dir),
+        "--managed-dir",
+        str(managed_dir),
+        "--app-path",
+        str(app_path),
+        "daemon",
+        "--interval-seconds",
+        str(interval_seconds),
+        "--primary-threshold",
+        str(primary_threshold),
+        "--secondary-threshold",
+        str(secondary_threshold),
+        "--usage-max-age-minutes",
+        str(usage_max_age_minutes),
+    ]
+    if restart_after_switch:
+        command.append("--restart-after-switch")
+    if refresh_usage:
+        command.append("--refresh-usage")
+
+    service_path.write_text(
+        "\n".join(
+            [
+                "[Unit]",
+                "Description=Codex Auth Pool account rotation daemon",
+                "After=network-online.target",
+                "",
+                "[Service]",
+                "Type=simple",
+                f"ExecStart={' '.join(shlex.quote(part) for part in command)}",
+                "Restart=always",
+                "RestartSec=10",
+                f"StandardOutput=append:{stdout_path}",
+                f"StandardError=append:{stderr_path}",
+                "",
+                "[Install]",
+                "WantedBy=default.target",
+                "",
+            ]
+        )
+    )
+    return service_path
+
+
+def systemd_status(service_name: str) -> dict[str, Any]:
+    unit = systemd_unit_name(service_name)
+    service_path = systemd_service_path(unit)
+    status = {
+        "service": unit,
+        "service_path": str(service_path),
+        "installed": service_path.exists(),
+        "active": False,
+        "state": None,
+        "pid": None,
+    }
+    if not is_linux() or not shutil_lib.which("systemctl"):
+        return status
+    completed = systemctl_user(["show", unit, "--property=ActiveState,SubState,MainPID", "--no-page"])
+    if completed.returncode != 0:
+        return status
+    for raw_line in completed.stdout.splitlines():
+        key, _, value = raw_line.partition("=")
+        if key == "ActiveState":
+            status["active"] = value == "active"
+            status["state"] = value
+        elif key == "SubState" and status["state"]:
+            status["state"] = f"{status['state']}/{value}"
+        elif key == "MainPID" and value and value != "0":
+            status["pid"] = value
+    return status
+
+
+def background_service_status() -> dict[str, Any]:
+    if is_macos():
+        status = launchctl_status(DEFAULT_LAUNCHD_LABEL)
+        return {
+            "kind": "launchd",
+            "installed": status["installed"],
+            "running": bool(status["loaded"]),
+            "state": status["state"],
+            "pid": status["pid"],
+        }
+    if is_linux():
+        status = systemd_status(DEFAULT_SYSTEMD_SERVICE)
+        return {
+            "kind": "systemd",
+            "installed": status["installed"],
+            "running": bool(status["active"]),
+            "state": status["state"],
+            "pid": status["pid"],
+        }
+    return {"kind": platform.system(), "installed": False, "running": False, "state": None, "pid": None}
 
 
 def profile_record(state: dict[str, Any], account_id: str) -> dict[str, Any]:
@@ -1541,8 +1718,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
     for synced in synced_targets:
         print(f"synced secondary auth file {synced}")
     if getattr(args, "restart_after_switch", False):
-        restart_codex_app(Path(args.app_path), hard=not getattr(args, "graceful_restart", False))
-        print(f"restarted Codex app {args.app_path}")
+        if restart_codex_app(Path(args.app_path), hard=not getattr(args, "graceful_restart", False)):
+            print(f"restarted Codex app {args.app_path}")
     append_event(
         args.events_path,
         "apply_profile",
@@ -1988,21 +2165,23 @@ def cmd_check(args: argparse.Namespace) -> int:
         warnings += 1
         report("WARN", "config", f"missing at {args.config_path}; run `codex-auth-pool init`")
 
-    if Path(args.app_path).exists():
+    if is_macos() and Path(args.app_path).exists():
         report("OK", "Codex app", str(args.app_path))
-    else:
+    elif is_macos():
         issues += 1
         report("ERR", "Codex app", f"missing at {args.app_path}")
+    else:
+        report("OK", "Codex app", "not required on this platform")
 
-    launchd = launchctl_status(DEFAULT_LAUNCHD_LABEL)
-    if launchd["installed"] and launchd["loaded"]:
-        report("OK", "launchd", f"active label={DEFAULT_LAUNCHD_LABEL}")
-    elif launchd["installed"]:
+    background = background_service_status()
+    if background["installed"] and background["running"]:
+        report("OK", background["kind"], f"active state={background['state'] or '-'}")
+    elif background["installed"]:
         warnings += 1
-        report("WARN", "launchd", "plist exists but agent is not loaded")
+        report("WARN", background["kind"], "service exists but is not running")
     else:
         warnings += 1
-        report("WARN", "launchd", "not installed")
+        report("WARN", background["kind"], "background service not installed")
 
     snapshot = latest_rate_limit_snapshot(args.sessions_dir)
     current_summary = current_account_summary(Path(args.target), args.source_dir, args.managed_dir)
@@ -2041,7 +2220,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     current_item = next((item for item in ranked if item["is_current"]), None)
     next_item = next((item for item in ranked if item["available"] and not item["is_current"]), None)
     snapshot = latest_rate_limit_snapshot(args.sessions_dir)
-    launchd = launchctl_status(DEFAULT_LAUNCHD_LABEL)
+    background = background_service_status()
     recent_event = read_recent_event(args.events_path)
 
     print("Codex Auth Pool Dashboard")
@@ -2077,10 +2256,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         print(f"  next preferred: {'yes' if next_item['is_preferred_next'] else 'no'}")
     print("")
     print("Daemon")
-    print(f"  installed: {'yes' if launchd['installed'] else 'no'}")
-    print(f"  loaded: {'yes' if launchd['loaded'] else 'no'}")
-    print(f"  state: {launchd['state'] or '-'}")
-    print(f"  pid: {launchd['pid'] or '-'}")
+    print(f"  kind: {background['kind']}")
+    print(f"  installed: {'yes' if background['installed'] else 'no'}")
+    print(f"  running: {'yes' if background['running'] else 'no'}")
+    print(f"  state: {background['state'] or '-'}")
+    print(f"  pid: {background['pid'] or '-'}")
     stdout_line = read_recent_log_line(DEFAULT_LAUNCHD_STDOUT)
     stderr_line = read_recent_log_line(DEFAULT_LAUNCHD_STDERR)
     stdout_time = file_mtime(DEFAULT_LAUNCHD_STDOUT)
@@ -2129,7 +2309,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "snapshot_count": len(snapshots),
         "latest_snapshot": snapshots[0].name if snapshots else None,
     }
-    report["launchd"] = launchctl_status(DEFAULT_LAUNCHD_LABEL)
+    report["background_service"] = background_service_status()
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
@@ -2177,6 +2357,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
         args.secondary_threshold = args.secondary_threshold
         args.restart_after_switch = args.restart_after_switch
         cmd_launchd_install(args)
+    if getattr(args, "install_systemd", False):
+        systemd_args = argparse.Namespace(**vars(args))
+        systemd_args.service_name = DEFAULT_SYSTEMD_SERVICE
+        systemd_args.stdout_path = DEFAULT_SYSTEMD_STDOUT
+        systemd_args.stderr_path = DEFAULT_SYSTEMD_STDERR
+        cmd_systemd_install(systemd_args)
     print("setup complete")
     print("recommended next steps:")
     print("  1. codex-auth-pool doctor")
@@ -2228,6 +2414,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         launchd_args.stdout_path = DEFAULT_LAUNCHD_STDOUT
         launchd_args.stderr_path = DEFAULT_LAUNCHD_STDERR
         cmd_launchd_install(launchd_args)
+    if getattr(args, "install_systemd", False):
+        systemd_args = argparse.Namespace(**vars(args))
+        systemd_args.service_name = DEFAULT_SYSTEMD_SERVICE
+        systemd_args.stdout_path = DEFAULT_SYSTEMD_STDOUT
+        systemd_args.stderr_path = DEFAULT_SYSTEMD_STDERR
+        cmd_systemd_install(systemd_args)
 
     print("init complete")
     print("you can now use:")
@@ -2236,6 +2428,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     print("  codex-auth-pool apply-best --restart-after-switch")
     if args.install_launchd:
         print("  codex-auth-pool launchd-status")
+    if getattr(args, "install_systemd", False):
+        print("  codex-auth-pool systemd-status")
     return 0
 
 
@@ -2333,8 +2527,8 @@ def cmd_restore_env(args: argparse.Namespace) -> int:
     print(f"automatic backup saved to {backup_dir}")
     print(f"restored_items={len(restored['restored_items'])}")
     if getattr(args, "restart_codex", False):
-        restart_codex_app(Path(args.app_path), hard=not getattr(args, "graceful_restart", False))
-        print(f"restarted Codex app {args.app_path}")
+        if restart_codex_app(Path(args.app_path), hard=not getattr(args, "graceful_restart", False)):
+            print(f"restarted Codex app {args.app_path}")
     else:
         print("next step: restart Codex Desktop if you want connector/plugin state to reload immediately")
     return 0
@@ -2465,9 +2659,10 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
 
 def cmd_restart_codex(args: argparse.Namespace) -> int:
-    restart_codex_app(Path(args.app_path), hard=not args.graceful_restart)
+    restarted = restart_codex_app(Path(args.app_path), hard=not args.graceful_restart)
     mode = "graceful" if args.graceful_restart else "hard"
-    print(f"restarted Codex app via {mode} restart: {args.app_path}")
+    if restarted:
+        print(f"restarted Codex app via {mode} restart: {args.app_path}")
     return 0
 
 
@@ -2552,6 +2747,99 @@ def cmd_launchd_status(args: argparse.Namespace) -> int:
     print(f"  state: {status['state'] or '-'}")
     print(f"  pid: {status['pid'] or '-'}")
     print(f"  plist: {status['plist_path']}")
+    print(f"  recent stdout: {stdout_line or '-'}")
+    print(f"  stdout time: {fmt_dt(stdout_time)}")
+    print(f"  recent stderr: {stderr_line or '-'}")
+    print(f"  stderr time: {fmt_dt(stderr_time)}")
+    return 0
+
+
+def cmd_systemd_install(args: argparse.Namespace) -> int:
+    if not is_linux():
+        raise SystemExit("systemd user services are only supported on Linux; use launchd-install on macOS")
+    if not shutil_lib.which("systemctl"):
+        raise SystemExit("systemctl not found; install systemd or run `codex-auth-pool daemon` manually")
+    command_path = shutil_lib.which("codex-auth-pool")
+    if not command_path:
+        raise SystemExit("codex-auth-pool command not found in PATH; activate/install the package first")
+    service_path = write_systemd_service(
+        service_name=args.service_name,
+        command_path=command_path,
+        interval_seconds=args.interval_seconds,
+        state_path=args.state_path,
+        target=args.target,
+        sessions_dir=args.sessions_dir,
+        source_dir=args.source_dir,
+        managed_dir=args.managed_dir,
+        events_path=args.events_path,
+        primary_threshold=args.primary_threshold,
+        secondary_threshold=args.secondary_threshold,
+        restart_after_switch=args.restart_after_switch,
+        app_path=Path(args.app_path),
+        refresh_usage=args.refresh_usage,
+        usage_max_age_minutes=args.usage_max_age_minutes,
+        stdout_path=args.stdout_path,
+        stderr_path=args.stderr_path,
+    )
+    systemctl_user(["daemon-reload"])
+    unit = systemd_unit_name(args.service_name)
+    completed = systemctl_user(["enable", "--now", unit])
+    if completed.returncode != 0:
+        raise SystemExit(f"failed to enable systemd user service {unit}:\n{completed.stderr or completed.stdout}")
+    append_event(args.events_path, "systemd_install", service_name=unit, service_path=str(service_path))
+    print(f"installed systemd user service at {service_path}")
+    print(json.dumps(systemd_status(unit), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_systemd_start(args: argparse.Namespace) -> int:
+    if not is_linux():
+        raise SystemExit("systemd user services are only supported on Linux")
+    unit = systemd_unit_name(args.service_name)
+    completed = systemctl_user(["start", unit])
+    if completed.returncode != 0:
+        raise SystemExit(f"failed to start {unit}:\n{completed.stderr or completed.stdout}")
+    print(json.dumps(systemd_status(unit), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_systemd_stop(args: argparse.Namespace) -> int:
+    if not is_linux():
+        raise SystemExit("systemd user services are only supported on Linux")
+    unit = systemd_unit_name(args.service_name)
+    completed = systemctl_user(["stop", unit])
+    if completed.returncode != 0:
+        raise SystemExit(f"failed to stop {unit}:\n{completed.stderr or completed.stdout}")
+    print(json.dumps(systemd_status(unit), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_systemd_uninstall(args: argparse.Namespace) -> int:
+    if not is_linux():
+        raise SystemExit("systemd user services are only supported on Linux")
+    unit = systemd_unit_name(args.service_name)
+    systemctl_user(["disable", "--now", unit])
+    service_path = systemd_service_path(unit)
+    if service_path.exists():
+        service_path.unlink()
+    systemctl_user(["daemon-reload"])
+    print(json.dumps(systemd_status(unit), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_systemd_status(args: argparse.Namespace) -> int:
+    status = systemd_status(args.service_name)
+    stdout_line = read_recent_log_line(DEFAULT_SYSTEMD_STDOUT)
+    stderr_line = read_recent_log_line(DEFAULT_SYSTEMD_STDERR)
+    stdout_time = file_mtime(DEFAULT_SYSTEMD_STDOUT)
+    stderr_time = file_mtime(DEFAULT_SYSTEMD_STDERR)
+    print("Systemd")
+    print(f"  service: {status['service']}")
+    print(f"  installed: {'yes' if status['installed'] else 'no'}")
+    print(f"  active: {'yes' if status['active'] else 'no'}")
+    print(f"  state: {status['state'] or '-'}")
+    print(f"  pid: {status['pid'] or '-'}")
+    print(f"  path: {status['service_path']}")
     print(f"  recent stdout: {stdout_line or '-'}")
     print(f"  stdout time: {fmt_dt(stdout_time)}")
     print(f"  recent stderr: {stderr_line or '-'}")
@@ -2718,10 +3006,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also install the background launchd agent",
     )
+    init_parser.add_argument(
+        "--install-systemd",
+        action="store_true",
+        help="also install the background systemd user service on Linux",
+    )
     init_parser.add_argument("--interval-seconds", type=int, default=60)
     init_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     init_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     init_parser.add_argument("--restart-after-switch", action="store_true")
+    init_parser.add_argument("--usage-max-age-minutes", type=int, default=30)
+    init_parser.add_argument(
+        "--refresh-usage",
+        action="store_true",
+        default=True,
+        help="refresh per-account real usage windows before each rotation check (default: enabled)",
+    )
     init_parser.add_argument(
         "--no-notify",
         action="store_true",
@@ -2816,13 +3116,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_parser = subparsers.add_parser(
         "setup",
-        help="one-shot onboarding: write config and optionally install the background launchd agent",
+        help="one-shot onboarding: write config and optionally install a background agent/service",
     )
     setup_parser.add_argument("--install-launchd", action="store_true", help="also install the launchd background agent")
+    setup_parser.add_argument("--install-systemd", action="store_true", help="also install the systemd user service on Linux")
     setup_parser.add_argument("--interval-seconds", type=int, default=60)
     setup_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     setup_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     setup_parser.add_argument("--restart-after-switch", action="store_true")
+    setup_parser.add_argument("--usage-max-age-minutes", type=int, default=30)
+    setup_parser.add_argument(
+        "--refresh-usage",
+        action="store_true",
+        default=True,
+        help="refresh per-account real usage windows before each rotation check (default: enabled)",
+    )
     setup_parser.add_argument(
         "--snapshot-env",
         action="store_true",
@@ -2832,6 +3140,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--snapshot-name",
         help="optional snapshot name to use with --snapshot-env",
     )
+    setup_parser.add_argument("--no-notify", action="store_true", help="disable notifications for setup-triggered steps")
     setup_parser.set_defaults(func=cmd_setup)
 
     events_parser = subparsers.add_parser(
@@ -3094,6 +3403,52 @@ def build_parser() -> argparse.ArgumentParser:
     launchd_status_parser = subparsers.add_parser("launchd-status", help="show launchd agent status")
     launchd_status_parser.add_argument("--label", default=DEFAULT_LAUNCHD_LABEL)
     launchd_status_parser.set_defaults(func=cmd_launchd_status)
+
+    systemd_install_parser = subparsers.add_parser(
+        "systemd-install",
+        help="install a Linux systemd user service for automatic auth-pool rotation",
+    )
+    systemd_install_parser.add_argument("--service-name", default=DEFAULT_SYSTEMD_SERVICE)
+    systemd_install_parser.add_argument("--interval-seconds", type=int, default=60)
+    systemd_install_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
+    systemd_install_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
+    systemd_install_parser.add_argument(
+        "--refresh-usage",
+        action="store_true",
+        default=True,
+        help="refresh per-account real usage windows before each daemon rotation check (default: enabled)",
+    )
+    systemd_install_parser.add_argument(
+        "--no-refresh-usage",
+        action="store_false",
+        dest="refresh_usage",
+        help="skip direct per-account usage refreshes in the daemon",
+    )
+    systemd_install_parser.add_argument("--usage-max-age-minutes", type=int, default=30)
+    systemd_install_parser.add_argument(
+        "--restart-after-switch",
+        action="store_true",
+        help="request Codex restart after switching; currently a no-op on Linux",
+    )
+    systemd_install_parser.add_argument("--stdout-path", type=Path, default=DEFAULT_SYSTEMD_STDOUT)
+    systemd_install_parser.add_argument("--stderr-path", type=Path, default=DEFAULT_SYSTEMD_STDERR)
+    systemd_install_parser.set_defaults(func=cmd_systemd_install)
+
+    systemd_start_parser = subparsers.add_parser("systemd-start", help="start the systemd user service")
+    systemd_start_parser.add_argument("--service-name", default=DEFAULT_SYSTEMD_SERVICE)
+    systemd_start_parser.set_defaults(func=cmd_systemd_start)
+
+    systemd_stop_parser = subparsers.add_parser("systemd-stop", help="stop the systemd user service")
+    systemd_stop_parser.add_argument("--service-name", default=DEFAULT_SYSTEMD_SERVICE)
+    systemd_stop_parser.set_defaults(func=cmd_systemd_stop)
+
+    systemd_uninstall_parser = subparsers.add_parser("systemd-uninstall", help="remove the systemd user service")
+    systemd_uninstall_parser.add_argument("--service-name", default=DEFAULT_SYSTEMD_SERVICE)
+    systemd_uninstall_parser.set_defaults(func=cmd_systemd_uninstall)
+
+    systemd_status_parser = subparsers.add_parser("systemd-status", help="show systemd user service status")
+    systemd_status_parser.add_argument("--service-name", default=DEFAULT_SYSTEMD_SERVICE)
+    systemd_status_parser.set_defaults(func=cmd_systemd_status)
 
     return parser
 
