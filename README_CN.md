@@ -53,6 +53,7 @@
 - 排序时优先使用真实观测值，而不是只依赖本地元数据。
 - 账号额度触顶后自动冷却，并切换到下一个可用账号。
 - macOS 上切换后可自动重启 Codex Desktop。
+- 自动重启前会记录最近活跃的 Codex Desktop 会话，重启后对这些被打断的会话发送 `继续`。
 - 后台守护只有在真实额度触发阈值时才会切换和重启；普通轮询不会打断当前工作。
 - 内置防重入锁和短时间自动轮换节流，避免重复 tick 导致连续切号/重启。
 - 支持快照和恢复本地插件、配置、连接器缓存状态。
@@ -146,6 +147,20 @@ codex-auth-pool events --limit 10
 
 `tick --dry-run` 只报告是否会触发轮换，不会写入冷却、不切号、不重启。
 `events` 默认输出易读摘要；如果需要原始 JSONL，可以使用 `codex-auth-pool events --raw`。
+
+## 被重启打断的会话恢复
+
+macOS 上启用 `--restart-after-switch` 时，工具会做一个保守的恢复流程：
+
+- 重启 Codex Desktop 前，从 `~/.codex/state_5.sqlite` 和 `~/.codex/logs_2.sqlite` 捕获最近活跃的 Desktop 会话
+- Codex Desktop 重新启动后，后台执行 `codex exec resume <session_id> 继续`
+- 会话快照和恢复日志保存在 `~/.codex-auth-pool/session-recovery/`
+
+如果你只想自动重启，不想自动对会话发送 `继续`：
+
+```bash
+codex-auth-pool launchd-install --restart-after-switch --no-resume-interrupted-sessions
+```
 
 ## 最常用命令
 

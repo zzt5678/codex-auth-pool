@@ -53,6 +53,7 @@ when you need an emergency manual switch.
 - Rank accounts using observed reset data instead of only trusting local metadata.
 - Auto-cool down exhausted accounts and switch to the next available one.
 - Restart Codex Desktop automatically after switching on macOS.
+- Before an automatic restart, capture recently active Codex Desktop sessions; after restart, resume those interrupted sessions with `继续`.
 - Background rotation switches and restarts only after a real quota threshold trigger; normal polling does not interrupt your work.
 - Built-in locks and a short automatic-rotation throttle prevent repeated ticks from causing restart loops.
 - Snapshot and restore local Codex plugin, config, and connector cache state.
@@ -146,6 +147,20 @@ codex-auth-pool events --limit 10
 
 `tick --dry-run` reports whether a rotation would trigger without writing cooldowns, switching accounts, or restarting Codex.
 `events` prints a readable summary by default; use `codex-auth-pool events --raw` for raw JSONL.
+
+## Interrupted Session Recovery
+
+When `--restart-after-switch` is enabled on macOS, `codex-auth-pool` does a conservative recovery pass:
+
+- before quitting Codex Desktop, it captures recently active Desktop sessions from `~/.codex/state_5.sqlite` and `~/.codex/logs_2.sqlite`
+- after Codex Desktop comes back up, it starts `codex exec resume <session_id> 继续` for each captured session in the background
+- recovery snapshots and resume logs are written under `~/.codex-auth-pool/session-recovery/`
+
+If you only want the restart without auto-resuming interrupted sessions:
+
+```bash
+codex-auth-pool launchd-install --restart-after-switch --no-resume-interrupted-sessions
+```
 
 ## Most Useful Commands
 

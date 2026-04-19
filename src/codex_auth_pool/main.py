@@ -22,6 +22,7 @@ import platform
 import shlex
 import shutil as shutil_lib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import urllib.error
@@ -43,6 +44,8 @@ DEFAULT_CLIPROXY_DIR = Path.home() / ".cli-proxy-api"
 DEFAULT_CODEX_AUTH_PATH = Path.home() / ".codex" / "cache" / "auth.json"
 DEFAULT_CODEX_ROOT_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+DEFAULT_CODEX_STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
+DEFAULT_CODEX_LOGS_DB = Path.home() / ".codex" / "logs_2.sqlite"
 DEFAULT_EXPORT_DIR = Path.home() / ".codex-auth-pool" / "exports"
 DEFAULT_MANAGED_DIR = Path.home() / ".codex-auth-pool" / "profiles"
 DEFAULT_SOURCE_META_DIR = Path.home() / ".codex-auth-pool" / "source-meta"
@@ -50,6 +53,7 @@ DEFAULT_STATE_PATH = Path.home() / ".codex-auth-pool" / "state.json"
 DEFAULT_CONFIG_PATH = Path.home() / ".codex-auth-pool" / "config.json"
 DEFAULT_EVENTS_PATH = Path.home() / ".codex-auth-pool" / "events.jsonl"
 DEFAULT_ENV_SNAPSHOTS_DIR = Path.home() / ".codex-auth-pool" / "env-snapshots"
+DEFAULT_SESSION_RECOVERY_DIR = Path.home() / ".codex-auth-pool" / "session-recovery"
 DEFAULT_TICK_LOCK_PATH = Path.home() / ".codex-auth-pool" / "run" / "tick.lock"
 DEFAULT_APPLY_LOCK_PATH = Path.home() / ".codex-auth-pool" / "run" / "apply.lock"
 DEFAULT_CODEX_APP = Path("/Applications/Codex.app") if platform.system() == "Darwin" else Path("")
@@ -69,8 +73,11 @@ ENV_VAR_MAP = {
     "config_path": "CODEX_AUTH_POOL_CONFIG_PATH",
     "events_path": "CODEX_AUTH_POOL_EVENTS_PATH",
     "env_snapshots_dir": "CODEX_AUTH_POOL_ENV_SNAPSHOTS_DIR",
+    "session_recovery_dir": "CODEX_AUTH_POOL_SESSION_RECOVERY_DIR",
     "target": "CODEX_AUTH_POOL_TARGET",
     "sessions_dir": "CODEX_AUTH_POOL_SESSIONS_DIR",
+    "codex_state_db": "CODEX_AUTH_POOL_CODEX_STATE_DB",
+    "codex_logs_db": "CODEX_AUTH_POOL_CODEX_LOGS_DB",
     "app_path": "CODEX_AUTH_POOL_APP_PATH",
 }
 DEFAULT_ARG_VALUES = {
@@ -80,8 +87,11 @@ DEFAULT_ARG_VALUES = {
     "config_path": DEFAULT_CONFIG_PATH,
     "events_path": DEFAULT_EVENTS_PATH,
     "env_snapshots_dir": DEFAULT_ENV_SNAPSHOTS_DIR,
+    "session_recovery_dir": DEFAULT_SESSION_RECOVERY_DIR,
     "target": str(DEFAULT_CODEX_AUTH_PATH),
     "sessions_dir": DEFAULT_CODEX_SESSIONS_DIR,
+    "codex_state_db": DEFAULT_CODEX_STATE_DB,
+    "codex_logs_db": DEFAULT_CODEX_LOGS_DB,
     "app_path": str(DEFAULT_CODEX_APP),
 }
 REQUIRED_SOURCE_KEYS = (
@@ -95,6 +105,9 @@ DEFAULT_SECONDARY_THRESHOLD = 98.0
 DEFAULT_USAGE_MAX_AGE_MINUTES = 30
 MIN_AUTO_RESTART_INTERVAL_SECONDS = 120
 AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
+DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 600
+DEFAULT_INTERRUPTED_SESSION_MAX_COUNT = 12
+DEFAULT_INTERRUPTED_SESSION_PROMPT = "继续"
 
 
 @dataclass
@@ -137,6 +150,18 @@ class RemoteUsageSnapshot:
     secondary_window_seconds: int | None
     fetched_at: datetime
     source: str
+
+
+@dataclass
+class InterruptedSession:
+    id: str
+    title: str
+    cwd: str
+    source: str
+    rollout_path: str
+    updated_at: int
+    last_log_at: int | None
+    recent_log_count: int
 
 
 def now_local() -> datetime:
@@ -215,7 +240,10 @@ def _coerce_arg_value(key: str, value: Any) -> Any:
         "config_path",
         "events_path",
         "env_snapshots_dir",
+        "session_recovery_dir",
         "sessions_dir",
+        "codex_state_db",
+        "codex_logs_db",
     }
     if key in path_keys:
         return Path(str(value)).expanduser()
@@ -926,7 +954,216 @@ def sync_secondary_auth_files(primary_payload: dict[str, Any], primary_target: P
     return synced
 
 
-def restart_codex_app(app_path: Path, hard: bool = True, wait_seconds: float = 2.0) -> bool:
+def _connect_sqlite_readonly(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+
+
+def read_recent_desktop_sessions(
+    *,
+    codex_state_db: Path,
+    codex_logs_db: Path,
+    max_age_seconds: int,
+    max_count: int,
+) -> list[InterruptedSession]:
+    if not codex_state_db.exists():
+        return []
+
+    cutoff = int(time.time()) - max_age_seconds
+    sessions: list[InterruptedSession] = []
+    try:
+        with _connect_sqlite_readonly(codex_state_db) as conn:
+            conn.row_factory = sqlite3.Row
+            if codex_logs_db.exists():
+                conn.execute("ATTACH DATABASE ? AS logs_db", (str(codex_logs_db),))
+                rows = conn.execute(
+                    """
+                    SELECT
+                        t.id,
+                        t.title,
+                        t.cwd,
+                        t.source,
+                        t.rollout_path,
+                        t.updated_at,
+                        MAX(l.ts) AS last_log_at,
+                        COUNT(l.id) AS recent_log_count
+                    FROM threads t
+                    JOIN logs_db.logs l ON l.thread_id = t.id
+                    WHERE
+                        t.archived = 0
+                        AND t.source IN ('vscode', 'desktop', 'app')
+                        AND l.ts >= ?
+                    GROUP BY t.id
+                    ORDER BY MAX(l.ts) DESC, t.updated_at DESC
+                    LIMIT ?
+                    """,
+                    (cutoff, max_count),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        id,
+                        title,
+                        cwd,
+                        source,
+                        rollout_path,
+                        updated_at,
+                        NULL AS last_log_at,
+                        0 AS recent_log_count
+                    FROM threads
+                    WHERE
+                        archived = 0
+                        AND source IN ('vscode', 'desktop', 'app')
+                        AND updated_at >= ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (cutoff, max_count),
+                ).fetchall()
+    except sqlite3.Error:
+        return []
+
+    for row in rows:
+        sessions.append(
+            InterruptedSession(
+                id=str(row["id"]),
+                title=str(row["title"] or ""),
+                cwd=str(row["cwd"] or ""),
+                source=str(row["source"] or ""),
+                rollout_path=str(row["rollout_path"] or ""),
+                updated_at=int(row["updated_at"] or 0),
+                last_log_at=int(row["last_log_at"]) if row["last_log_at"] is not None else None,
+                recent_log_count=int(row["recent_log_count"] or 0),
+            )
+        )
+    return sessions
+
+
+def interrupted_session_snapshot_path(session_recovery_dir: Path) -> Path:
+    ts = datetime.now().strftime(BACKUP_TIMESTAMP_FMT)
+    return session_recovery_dir / f"interrupted-sessions-{ts}.json"
+
+
+def capture_interrupted_sessions(
+    *,
+    codex_state_db: Path,
+    codex_logs_db: Path,
+    session_recovery_dir: Path,
+    max_age_seconds: int,
+    max_count: int,
+    events_path: Path | None,
+) -> dict[str, Any]:
+    sessions = read_recent_desktop_sessions(
+        codex_state_db=codex_state_db,
+        codex_logs_db=codex_logs_db,
+        max_age_seconds=max_age_seconds,
+        max_count=max_count,
+    )
+    snapshot = {
+        "captured_at": now_local().isoformat(),
+        "state_db": str(codex_state_db),
+        "logs_db": str(codex_logs_db),
+        "max_age_seconds": max_age_seconds,
+        "max_count": max_count,
+        "sessions": [session.__dict__ for session in sessions],
+    }
+    path = interrupted_session_snapshot_path(session_recovery_dir)
+    write_json(path, snapshot)
+    snapshot["path"] = str(path)
+    if events_path is not None:
+        append_event(
+            events_path,
+            "interrupted_sessions_captured",
+            snapshot_path=str(path),
+            session_count=len(sessions),
+            session_ids=[session.id for session in sessions],
+        )
+    return snapshot
+
+
+def resume_interrupted_sessions(
+    snapshot: dict[str, Any],
+    *,
+    prompt: str,
+    session_recovery_dir: Path,
+    events_path: Path | None,
+) -> list[dict[str, Any]]:
+    codex_bin = shutil_lib.which("codex")
+    sessions = snapshot.get("sessions", [])
+    if not codex_bin or not isinstance(sessions, list):
+        if events_path is not None:
+            append_event(
+                events_path,
+                "interrupted_sessions_resume_failed",
+                reason="codex_cli_not_found" if not codex_bin else "invalid_snapshot",
+                snapshot_path=snapshot.get("path"),
+            )
+        return []
+
+    session_recovery_dir.mkdir(parents=True, exist_ok=True)
+    started: list[dict[str, Any]] = []
+    for raw_session in sessions:
+        if not isinstance(raw_session, dict):
+            continue
+        session_id = str(raw_session.get("id") or "")
+        if not session_id:
+            continue
+        cwd = Path(str(raw_session.get("cwd") or Path.home()))
+        if not cwd.exists() or not cwd.is_dir():
+            cwd = Path.home()
+        log_path = session_recovery_dir / f"{session_id}.resume.log"
+        command = [
+            codex_bin,
+            "exec",
+            "resume",
+            "--skip-git-repo-check",
+            session_id,
+            prompt,
+        ]
+        with log_path.open("ab") as log_handle:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        record = {
+            "session_id": session_id,
+            "title": raw_session.get("title"),
+            "cwd": str(cwd),
+            "pid": process.pid,
+            "log_path": str(log_path),
+        }
+        started.append(record)
+
+    if events_path is not None:
+        append_event(
+            events_path,
+            "interrupted_sessions_resume_started",
+            snapshot_path=snapshot.get("path"),
+            prompt=prompt,
+            session_count=len(started),
+            sessions=started,
+        )
+    return started
+
+
+def restart_codex_app(
+    app_path: Path,
+    hard: bool = True,
+    wait_seconds: float = 2.0,
+    *,
+    resume_interrupted: bool = True,
+    codex_state_db: Path = DEFAULT_CODEX_STATE_DB,
+    codex_logs_db: Path = DEFAULT_CODEX_LOGS_DB,
+    session_recovery_dir: Path = DEFAULT_SESSION_RECOVERY_DIR,
+    session_window_seconds: int = DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS,
+    session_max_count: int = DEFAULT_INTERRUPTED_SESSION_MAX_COUNT,
+    resume_prompt: str = DEFAULT_INTERRUPTED_SESSION_PROMPT,
+    events_path: Path | None = None,
+) -> bool:
     if not is_macos():
         print(
             "restart-after-switch requested, but automatic Codex app restart is only supported on macOS; "
@@ -934,6 +1171,17 @@ def restart_codex_app(app_path: Path, hard: bool = True, wait_seconds: float = 2
             file=sys.stderr,
         )
         return False
+
+    interrupted_snapshot = None
+    if resume_interrupted:
+        interrupted_snapshot = capture_interrupted_sessions(
+            codex_state_db=codex_state_db,
+            codex_logs_db=codex_logs_db,
+            session_recovery_dir=session_recovery_dir,
+            max_age_seconds=session_window_seconds,
+            max_count=session_max_count,
+            events_path=events_path,
+        )
 
     stop_codex_app(graceful_first=not hard, wait_seconds=wait_seconds)
 
@@ -946,6 +1194,13 @@ def restart_codex_app(app_path: Path, hard: bool = True, wait_seconds: float = 2
     time.sleep(1.5)
     if not codex_process_running():
         raise SystemExit("Codex briefly launched and then exited during restart verification")
+    if interrupted_snapshot is not None and interrupted_snapshot.get("sessions"):
+        resume_interrupted_sessions(
+            interrupted_snapshot,
+            prompt=resume_prompt,
+            session_recovery_dir=session_recovery_dir,
+            events_path=events_path,
+        )
     return True
 
 
@@ -982,6 +1237,7 @@ def write_launchd_plist(
     app_path: Path,
     refresh_usage: bool,
     usage_max_age_minutes: int,
+    resume_interrupted_sessions: bool,
 ) -> Path:
     plist_path = launchd_plist_path(label)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1015,7 +1271,8 @@ def write_launchd_plist(
             str(usage_max_age_minutes),
         ]
         + (["--restart-after-switch"] if restart_after_switch else [])
-        + (["--refresh-usage"] if refresh_usage else []),
+        + (["--refresh-usage"] if refresh_usage else [])
+        + ([] if resume_interrupted_sessions else ["--no-resume-interrupted-sessions"]),
         "WorkingDirectory": str(Path.home()),
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -1042,9 +1299,16 @@ def launchctl_bootout(label: str) -> None:
 def launchctl_bootstrap(label: str, plist_path: Path) -> None:
     if not is_macos():
         raise SystemExit("launchd is only available on macOS; use systemd-install on Linux")
-    completed = run_command(["launchctl", "bootstrap", launchctl_domain(), str(plist_path)])
-    if completed.returncode != 0:
-        raise SystemExit(f"failed to bootstrap {label}:\n{completed.stderr or completed.stdout}")
+    last_output = ""
+    for attempt in range(3):
+        completed = run_command(["launchctl", "bootstrap", launchctl_domain(), str(plist_path)])
+        if completed.returncode == 0:
+            return
+        last_output = completed.stderr or completed.stdout
+        if "Bootstrap failed: 5" not in last_output:
+            break
+        time.sleep(1.0 + attempt)
+    raise SystemExit(f"failed to bootstrap {label}:\n{last_output}")
 
 
 def launchctl_kickstart(label: str) -> None:
@@ -1109,6 +1373,7 @@ def write_systemd_service(
     app_path: Path,
     refresh_usage: bool,
     usage_max_age_minutes: int,
+    resume_interrupted_sessions: bool,
     stdout_path: Path,
     stderr_path: Path,
 ) -> Path:
@@ -1148,6 +1413,8 @@ def write_systemd_service(
         command.append("--restart-after-switch")
     if refresh_usage:
         command.append("--refresh-usage")
+    if not resume_interrupted_sessions:
+        command.append("--no-resume-interrupted-sessions")
 
     service_path.write_text(
         "\n".join(
@@ -2032,7 +2299,15 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
         if apply_source == "auto_rotation" and recently_blocked:
             restart_skipped_reason = f"recent_restart_retry_after_{retry_after_seconds}s"
             print(f"restart skipped: recent automatic restart, retry after {retry_after_seconds}s")
-        elif restart_codex_app(Path(args.app_path), hard=not getattr(args, "graceful_restart", False)):
+        elif restart_codex_app(
+            Path(args.app_path),
+            hard=not getattr(args, "graceful_restart", False),
+            resume_interrupted=not getattr(args, "no_resume_interrupted_sessions", False),
+            codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+            codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
+            session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
+            events_path=getattr(args, "events_path", None),
+        ):
             restart_performed = True
             state["last_restart_at"] = restart_now.isoformat()
             print(f"restarted Codex app {args.app_path}")
@@ -2940,7 +3215,15 @@ def cmd_restore_env(args: argparse.Namespace) -> int:
     print(f"automatic backup saved to {backup_dir}")
     print(f"restored_items={len(restored['restored_items'])}")
     if getattr(args, "restart_codex", False):
-        if restart_codex_app(Path(args.app_path), hard=not getattr(args, "graceful_restart", False)):
+        if restart_codex_app(
+            Path(args.app_path),
+            hard=not getattr(args, "graceful_restart", False),
+            resume_interrupted=not getattr(args, "no_resume_interrupted_sessions", False),
+            codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+            codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
+            session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
+            events_path=getattr(args, "events_path", None),
+        ):
             print(f"restarted Codex app {args.app_path}")
     else:
         print("next step: restart Codex Desktop if you want connector/plugin state to reload immediately")
@@ -3113,7 +3396,15 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
 
 def cmd_restart_codex(args: argparse.Namespace) -> int:
-    restarted = restart_codex_app(Path(args.app_path), hard=not args.graceful_restart)
+    restarted = restart_codex_app(
+        Path(args.app_path),
+        hard=not args.graceful_restart,
+        resume_interrupted=not getattr(args, "no_resume_interrupted_sessions", False),
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
+        session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
+        events_path=getattr(args, "events_path", None),
+    )
     mode = "graceful" if args.graceful_restart else "hard"
     if restarted:
         print(f"restarted Codex app via {mode} restart: {args.app_path}")
@@ -3145,6 +3436,7 @@ def cmd_launchd_install(args: argparse.Namespace) -> int:
         app_path=Path(args.app_path),
         refresh_usage=args.refresh_usage,
         usage_max_age_minutes=args.usage_max_age_minutes,
+        resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
     )
     launchctl_bootout(args.label)
     launchctl_bootstrap(args.label, plist_path)
@@ -3232,6 +3524,7 @@ def cmd_systemd_install(args: argparse.Namespace) -> int:
         app_path=Path(args.app_path),
         refresh_usage=args.refresh_usage,
         usage_max_age_minutes=args.usage_max_age_minutes,
+        resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
         stdout_path=args.stdout_path,
         stderr_path=args.stderr_path,
     )
@@ -3349,6 +3642,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"environment snapshot directory (default: {DEFAULT_ENV_SNAPSHOTS_DIR})",
     )
     parser.add_argument(
+        "--session-recovery-dir",
+        type=Path,
+        default=DEFAULT_SESSION_RECOVERY_DIR,
+        help=f"interrupted session recovery log directory (default: {DEFAULT_SESSION_RECOVERY_DIR})",
+    )
+    parser.add_argument(
         "--target",
         default=str(DEFAULT_CODEX_AUTH_PATH),
         help=f"Codex auth target path (default: {DEFAULT_CODEX_AUTH_PATH})",
@@ -3358,6 +3657,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_CODEX_SESSIONS_DIR,
         help=f"Codex sessions directory (default: {DEFAULT_CODEX_SESSIONS_DIR})",
+    )
+    parser.add_argument(
+        "--codex-state-db",
+        type=Path,
+        default=DEFAULT_CODEX_STATE_DB,
+        help=f"Codex Desktop state database (default: {DEFAULT_CODEX_STATE_DB})",
+    )
+    parser.add_argument(
+        "--codex-logs-db",
+        type=Path,
+        default=DEFAULT_CODEX_LOGS_DB,
+        help=f"Codex Desktop logs database (default: {DEFAULT_CODEX_LOGS_DB})",
     )
     parser.add_argument(
         "--app-path",
@@ -3469,6 +3780,11 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     init_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     init_parser.add_argument("--restart-after-switch", action="store_true")
+    init_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="when installing a background agent, do not auto-send '继续' after Codex restarts",
+    )
     init_parser.add_argument("--usage-max-age-minutes", type=int, default=DEFAULT_USAGE_MAX_AGE_MINUTES)
     init_parser.add_argument(
         "--refresh-usage",
@@ -3515,6 +3831,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--graceful-restart",
         action="store_true",
         help="use AppleScript quit instead of hard process kill before reopening",
+    )
+    restore_env_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="do not send '继续' to recently active Codex Desktop sessions after restarting",
     )
     restore_env_parser.add_argument("--no-notify", action="store_true", help="disable the restore notification")
     restore_env_parser.set_defaults(func=cmd_restore_env)
@@ -3578,6 +3899,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     setup_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     setup_parser.add_argument("--restart-after-switch", action="store_true")
+    setup_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="when installing a background agent, do not auto-send '继续' after Codex restarts",
+    )
     setup_parser.add_argument("--usage-max-age-minutes", type=int, default=DEFAULT_USAGE_MAX_AGE_MINUTES)
     setup_parser.add_argument(
         "--refresh-usage",
@@ -3659,6 +3985,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use AppleScript quit instead of hard process kill before reopening",
     )
+    apply_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="do not send '继续' to recently active Codex Desktop sessions after restarting",
+    )
     apply_parser.set_defaults(func=cmd_apply)
 
     apply_best_parser = subparsers.add_parser(
@@ -3674,6 +4005,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--graceful-restart",
         action="store_true",
         help="use AppleScript quit instead of hard process kill before reopening",
+    )
+    apply_best_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="do not send '继续' to recently active Codex Desktop sessions after restarting",
     )
     apply_best_parser.add_argument(
         "--usage-max-age-minutes",
@@ -3730,6 +4066,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="use AppleScript quit instead of hard process kill before reopening",
     )
     tick_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="do not send '继续' to recently active Codex Desktop sessions after restarting",
+    )
+    tick_parser.add_argument(
         "--refresh-usage",
         action="store_true",
         default=True,
@@ -3782,6 +4123,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="use AppleScript quit instead of hard process kill before reopening",
     )
     daemon_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="do not send '继续' to recently active Codex Desktop sessions after restarting",
+    )
+    daemon_parser.add_argument(
         "--refresh-usage",
         action="store_true",
         default=True,
@@ -3806,6 +4152,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--graceful-restart",
         action="store_true",
         help="use AppleScript quit instead of hard process kill before reopening",
+    )
+    restart_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="do not send '继续' to recently active Codex Desktop sessions after restarting",
     )
     restart_parser.set_defaults(func=cmd_restart_codex)
 
@@ -3839,6 +4190,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--restart-after-switch",
         action="store_true",
         help="restart Codex Desktop automatically after switching auth",
+    )
+    launchd_install_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="do not send '继续' to recently active Codex Desktop sessions after automatic restart",
     )
     launchd_install_parser.add_argument(
         "--stdout-path",
@@ -3895,6 +4251,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--restart-after-switch",
         action="store_true",
         help="request Codex restart after switching; currently a no-op on Linux",
+    )
+    systemd_install_parser.add_argument(
+        "--no-resume-interrupted-sessions",
+        action="store_true",
+        help="do not send '继续' to recently active Codex Desktop sessions after automatic restart",
     )
     systemd_install_parser.add_argument("--stdout-path", type=Path, default=DEFAULT_SYSTEMD_STDOUT)
     systemd_install_parser.add_argument("--stderr-path", type=Path, default=DEFAULT_SYSTEMD_STDERR)
