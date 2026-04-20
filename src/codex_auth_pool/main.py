@@ -487,6 +487,16 @@ def recent_resumed_sessions_summary(events_path: Path, limit: int = 3) -> dict[s
     }
 
 
+def recent_restarted_terminal_summary(events_path: Path) -> dict[str, Any] | None:
+    event = read_recent_event_of_type(events_path, "interrupted_terminal_commands_restarted")
+    if event is None:
+        return None
+    return {
+        "timestamp": event.get("timestamp"),
+        "command_count": int(event.get("command_count") or 0),
+    }
+
+
 def recent_interrupted_capture_summary(events_path: Path) -> dict[str, Any] | None:
     event = read_recent_event_of_type(events_path, "interrupted_sessions_captured")
     if event is None:
@@ -1352,6 +1362,84 @@ def resume_interrupted_sessions(
     return started
 
 
+def restart_interrupted_terminal_commands(
+    snapshot: dict[str, Any],
+    *,
+    session_recovery_dir: Path,
+    events_path: Path | None,
+) -> list[dict[str, Any]]:
+    sessions = snapshot.get("sessions", [])
+    if not isinstance(sessions, list):
+        return []
+    session_recovery_dir.mkdir(parents=True, exist_ok=True)
+    started: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_session in sessions:
+        if not isinstance(raw_session, dict):
+            continue
+        session_id = str(raw_session.get("id") or "")
+        tools = raw_session.get("interrupted_tools")
+        if not session_id or not isinstance(tools, list):
+            continue
+        for tool_index, tool in enumerate(tools, start=1):
+            if not isinstance(tool, dict):
+                continue
+            commands = tool.get("commands")
+            if not isinstance(commands, list):
+                continue
+            for command_index, command in enumerate(commands, start=1):
+                if not isinstance(command, dict):
+                    continue
+                cmd = str(command.get("cmd") or "").strip()
+                if not cmd:
+                    continue
+                workdir = Path(str(command.get("workdir") or raw_session.get("cwd") or Path.home()))
+                if not workdir.exists() or not workdir.is_dir():
+                    workdir = Path.home()
+                dedupe_key = (str(workdir), cmd)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                safe_session_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in session_id)
+                log_path = session_recovery_dir / f"{safe_session_id}.terminal-{tool_index}-{command_index}.log"
+                with log_path.open("ab") as log_handle:
+                    process = subprocess.Popen(
+                        ["/bin/zsh", "-lc", cmd],
+                        cwd=str(workdir),
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_handle,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                started.append(
+                    {
+                        "session_id": session_id,
+                        "title": raw_session.get("title"),
+                        "pid": process.pid,
+                        "cmd": cmd,
+                        "workdir": str(workdir),
+                        "log_path": str(log_path),
+                    }
+                )
+    if events_path is not None:
+        append_event(
+            events_path,
+            "interrupted_terminal_commands_restarted",
+            snapshot_path=snapshot.get("path"),
+            command_count=len(started),
+            commands=[
+                {
+                    "session_id": item["session_id"],
+                    "pid": item["pid"],
+                    "workdir": item["workdir"],
+                    "log_path": item["log_path"],
+                }
+                for item in started
+            ],
+        )
+    return started
+
+
 def resume_prompt_for_session(base_prompt: str, raw_session: dict[str, Any]) -> str:
     tools = raw_session.get("interrupted_tools")
     if not isinstance(tools, list) or not tools:
@@ -1360,8 +1448,9 @@ def resume_prompt_for_session(base_prompt: str, raw_session: dict[str, Any]) -> 
         base_prompt,
         "",
         "注意：Codex Desktop 重启前可能打断了下面的终端/工具调用。",
-        "请先检查对应工作目录、进程和产物状态；不要盲目重复非幂等操作。",
-        "如果确认未完成，请从安全断点继续，必要时重跑对应命令。",
+        "codex-auth-pool 已尝试在后台重新拉起这些终端命令，并把输出写入 session-recovery 日志。",
+        "请先检查对应工作目录、进程、产物状态和 session-recovery 日志；不要重复启动仍在运行的命令。",
+        "只有确认自动重启失败或命令已经退出时，才从安全断点继续或重跑对应命令。",
         "",
     ]
     index = 1
@@ -1426,6 +1515,11 @@ def restart_codex_app(
     if not codex_process_running():
         raise SystemExit("Codex briefly launched and then exited during restart verification")
     if interrupted_snapshot is not None and interrupted_snapshot.get("sessions"):
+        restart_interrupted_terminal_commands(
+            interrupted_snapshot,
+            session_recovery_dir=session_recovery_dir,
+            events_path=events_path,
+        )
         resume_interrupted_sessions(
             interrupted_snapshot,
             prompt=resume_prompt,
@@ -2396,8 +2490,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("")
     print("Session Recovery")
     capture = recent_interrupted_capture_summary(args.events_path)
+    terminal_recovery = recent_restarted_terminal_summary(args.events_path)
     recovery = recent_resumed_sessions_summary(args.events_path)
-    if capture is None and recovery is None:
+    if capture is None and terminal_recovery is None and recovery is None:
         print("  none")
     else:
         if capture is not None:
@@ -2405,6 +2500,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  recent candidates: {capture['recent_candidates'] if capture['recent_candidates'] is not None else '-'}")
             print(f"  filtered completed: {capture['filtered_terminal_sessions'] if capture['filtered_terminal_sessions'] is not None else '-'}")
             print(f"  queued for resume: {capture['session_count']}")
+        if terminal_recovery is not None:
+            print(f"  terminal commands restarted at: {terminal_recovery['timestamp'] or '-'}")
+            print(f"  terminal commands restarted: {terminal_recovery['command_count']}")
         if recovery is not None:
             print(f"  resumed at: {recovery['timestamp'] or '-'}")
             print(f"  resumed sessions: {recovery['session_count']}")
@@ -3162,8 +3260,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     print("")
     print("Session Recovery")
     capture = recent_interrupted_capture_summary(args.events_path)
+    terminal_recovery = recent_restarted_terminal_summary(args.events_path)
     recovery = recent_resumed_sessions_summary(args.events_path)
-    if capture is None and recovery is None:
+    if capture is None and terminal_recovery is None and recovery is None:
         print("  none")
     else:
         if capture is not None:
@@ -3171,6 +3270,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             print(f"  recent candidates: {capture['recent_candidates'] if capture['recent_candidates'] is not None else '-'}")
             print(f"  filtered completed: {capture['filtered_terminal_sessions'] if capture['filtered_terminal_sessions'] is not None else '-'}")
             print(f"  queued for resume: {capture['session_count']}")
+        if terminal_recovery is not None:
+            print(f"  terminal commands restarted at: {terminal_recovery['timestamp'] or '-'}")
+            print(f"  terminal commands restarted: {terminal_recovery['command_count']}")
         if recovery is not None:
             print(f"  resumed at: {recovery['timestamp'] or '-'}")
             print(f"  resumed sessions: {recovery['session_count']}")
@@ -3389,6 +3491,7 @@ def cmd_events(args: argparse.Namespace) -> int:
             "session_count",
             "recent_candidates",
             "filtered_terminal_sessions",
+            "command_count",
         ):
             value = event.get(key)
             if value not in (None, ""):
