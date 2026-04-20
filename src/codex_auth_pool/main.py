@@ -1067,6 +1067,90 @@ def _session_event_kind(event: dict[str, Any]) -> str | None:
     return None
 
 
+def _parse_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _tool_call_summary(payload: dict[str, Any]) -> dict[str, Any] | None:
+    name = str(payload.get("name") or "")
+    call_id = str(payload.get("call_id") or "")
+    arguments = _parse_json_object(payload.get("arguments"))
+    if not name or not call_id:
+        return None
+    summary: dict[str, Any] = {
+        "call_id": call_id,
+        "name": name,
+        "commands": [],
+    }
+    if name == "exec_command":
+        summary["commands"].append(
+            {
+                "cmd": arguments.get("cmd"),
+                "workdir": arguments.get("workdir"),
+            }
+        )
+    elif name == "parallel":
+        for tool_use in arguments.get("tool_uses", []):
+            if not isinstance(tool_use, dict):
+                continue
+            if tool_use.get("recipient_name") != "functions.exec_command":
+                continue
+            parameters = tool_use.get("parameters") if isinstance(tool_use.get("parameters"), dict) else {}
+            summary["commands"].append(
+                {
+                    "cmd": parameters.get("cmd"),
+                    "workdir": parameters.get("workdir"),
+                }
+            )
+    return summary
+
+
+def pending_tool_calls_at(session: InterruptedSession, captured_at: datetime) -> list[dict[str, Any]]:
+    rollout_path = Path(session.rollout_path)
+    if not rollout_path.exists() or not rollout_path.is_file():
+        return []
+    try:
+        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+
+    pending: dict[str, dict[str, Any]] = {}
+    for raw_line in lines:
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_at = parse_dt(str(event.get("timestamp") or ""))
+        if event_at is not None and event_at > captured_at:
+            break
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_type = event.get("type")
+        payload_type = payload.get("type")
+        call_id = str(payload.get("call_id") or "")
+        if event_type == "response_item" and payload_type == "function_call":
+            summary = _tool_call_summary(payload)
+            if summary is not None:
+                pending[str(summary["call_id"])] = summary
+        elif call_id and (
+            (event_type == "response_item" and payload_type == "function_call_output")
+            or (event_type == "event_msg" and str(payload_type).endswith("_end"))
+        ):
+            pending.pop(call_id, None)
+        elif event_type == "event_msg" and payload_type == "task_complete":
+            pending.clear()
+    return list(pending.values())
+
+
 def session_was_in_progress_at(session: InterruptedSession, captured_at: datetime) -> bool:
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
@@ -1092,6 +1176,14 @@ def session_was_in_progress_at(session: InterruptedSession, captured_at: datetim
         if kind == "active":
             return True
     return False
+
+
+def interrupted_session_record(session: InterruptedSession, captured_at: datetime) -> dict[str, Any]:
+    record = session.__dict__.copy()
+    pending_tools = pending_tool_calls_at(session, captured_at)
+    record["interrupted_tools"] = pending_tools
+    record["interrupted_tool_count"] = len(pending_tools)
+    return record
 
 
 def interrupted_session_snapshot_path(session_recovery_dir: Path) -> Path:
@@ -1128,7 +1220,7 @@ def capture_interrupted_sessions(
         "max_count": max_count,
         "recent_candidates": len(recent_sessions),
         "filtered_terminal_sessions": max(0, len(recent_sessions) - len(sessions)),
-        "sessions": [session.__dict__ for session in sessions],
+        "sessions": [interrupted_session_record(session, captured_at) for session in sessions],
     }
     path = interrupted_session_snapshot_path(session_recovery_dir)
     write_json(path, snapshot)
@@ -1177,13 +1269,14 @@ def resume_interrupted_sessions(
         if not cwd.exists() or not cwd.is_dir():
             cwd = Path.home()
         log_path = session_recovery_dir / f"{session_id}.resume.log"
+        session_prompt = resume_prompt_for_session(prompt, raw_session)
         command = [
             codex_bin,
             "exec",
             "resume",
             "--skip-git-repo-check",
             session_id,
-            prompt,
+            session_prompt,
         ]
         with log_path.open("ab") as log_handle:
             process = subprocess.Popen(
@@ -1200,6 +1293,7 @@ def resume_interrupted_sessions(
             "cwd": str(cwd),
             "pid": process.pid,
             "log_path": str(log_path),
+            "interrupted_tool_count": raw_session.get("interrupted_tool_count") or 0,
         }
         started.append(record)
 
@@ -1213,6 +1307,35 @@ def resume_interrupted_sessions(
             sessions=started,
         )
     return started
+
+
+def resume_prompt_for_session(base_prompt: str, raw_session: dict[str, Any]) -> str:
+    tools = raw_session.get("interrupted_tools")
+    if not isinstance(tools, list) or not tools:
+        return base_prompt
+    lines = [
+        base_prompt,
+        "",
+        "注意：Codex Desktop 重启前可能打断了下面的终端/工具调用。",
+        "请先检查对应工作目录、进程和产物状态；不要盲目重复非幂等操作。",
+        "如果确认未完成，请从安全断点继续，必要时重跑对应命令。",
+        "",
+    ]
+    index = 1
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        for command in tool.get("commands", []):
+            if not isinstance(command, dict):
+                continue
+            cmd = command.get("cmd")
+            if not cmd:
+                continue
+            workdir = command.get("workdir") or raw_session.get("cwd") or "-"
+            lines.append(f"{index}. workdir: {workdir}")
+            lines.append(f"   cmd: {cmd}")
+            index += 1
+    return "\n".join(lines).strip()
 
 
 def restart_codex_app(
