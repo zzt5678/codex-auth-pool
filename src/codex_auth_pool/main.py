@@ -101,8 +101,8 @@ REQUIRED_SOURCE_KEYS = (
     "id_token",
     "account_id",
 )
-DEFAULT_PRIMARY_THRESHOLD = 95.0
-DEFAULT_SECONDARY_THRESHOLD = 98.0
+DEFAULT_PRIMARY_THRESHOLD = 100.0
+DEFAULT_SECONDARY_THRESHOLD = 100.0
 DEFAULT_USAGE_MAX_AGE_MINUTES = 30
 MIN_AUTO_RESTART_INTERVAL_SECONDS = 120
 AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
@@ -1137,6 +1137,88 @@ def _output_says_process_exited(output: Any) -> bool:
     return isinstance(output, str) and "Process exited with code" in output
 
 
+def _command_first_segment(command: str) -> str:
+    return re.split(r"\s*(?:&&|\|\||;)\s*", command.strip(), maxsplit=1)[0].strip()
+
+
+def _is_sleep_only_command(command: str) -> bool:
+    first = _command_first_segment(command)
+    return bool(re.match(r"^(?:rtk\s+)?sleep\b", first))
+
+
+def _is_observational_command(command: str) -> bool:
+    lowered = command.lower()
+    observational_patterns = (
+        r"\bgrep\b",
+        r"\brg\b",
+        r"\btail\b",
+        r"\bhead\b",
+        r"\bsed\b",
+        r"\bawk\b",
+        r"\bcat\b",
+        r"\bls\b",
+        r"\bps\b",
+        r"\bfind\b",
+        r"\bnvidia-smi\b",
+        r"\bifconfig\b",
+        r"\bnetstat\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in observational_patterns)
+
+
+def _is_restartable_command(command: str) -> bool:
+    cmd = " ".join(command.strip().split())
+    if not cmd:
+        return False
+    if _is_sleep_only_command(cmd):
+        return False
+    lowered = cmd.lower()
+    if "<<" in cmd:
+        return False
+    long_running_hints = (
+        r"\b(?:bash|sh)\b.+\.sh\b",
+        r"\bpython(?:3)?\b\s+[^\n]*\.py\b",
+        r"\bpython(?:3)?\b\s+-m\b",
+        r"\buv\s+run\b",
+        r"\bpoetry\s+run\b",
+        r"\bnode\b\s+[^\n]*\.(?:mjs|cjs|js)\b",
+        r"\bnpm\s+run\b",
+        r"\bpnpm\b",
+        r"\byarn\b",
+        r"\bmake\b",
+        r"\bcodex\b",
+        r"\bclaude\b",
+    )
+    if _is_observational_command(cmd) and not any(re.search(pattern, lowered) for pattern in long_running_hints):
+        return False
+    return any(re.search(pattern, lowered) for pattern in long_running_hints)
+
+
+def _filter_restartable_tools(tools: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    filtered: list[dict[str, Any]] = []
+    skipped_commands = 0
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        commands = tool.get("commands")
+        if not isinstance(commands, list):
+            continue
+        kept_commands = []
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            cmd = str(command.get("cmd") or "").strip()
+            if not _is_restartable_command(cmd):
+                skipped_commands += 1
+                continue
+            kept_commands.append(command)
+        if kept_commands:
+            updated_tool = dict(tool)
+            updated_tool["commands"] = kept_commands
+            filtered.append(updated_tool)
+    return filtered, skipped_commands
+
+
 def pending_tool_calls_at(session: InterruptedSession, captured_at: datetime) -> list[dict[str, Any]]:
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
@@ -1234,8 +1316,11 @@ def session_was_in_progress_at(session: InterruptedSession, captured_at: datetim
 def interrupted_session_record(session: InterruptedSession, captured_at: datetime) -> dict[str, Any]:
     record = session.__dict__.copy()
     pending_tools = pending_tool_calls_at(session, captured_at)
-    record["interrupted_tools"] = pending_tools
-    record["interrupted_tool_count"] = len(pending_tools)
+    restartable_tools, skipped_commands = _filter_restartable_tools(pending_tools)
+    record["interrupted_tools"] = restartable_tools
+    record["interrupted_tool_count"] = len(restartable_tools)
+    record["ignored_interrupted_command_count"] = skipped_commands
+    record["raw_interrupted_tool_count"] = len(pending_tools)
     return record
 
 
@@ -1438,6 +1523,49 @@ def restart_interrupted_terminal_commands(
             ],
         )
     return started
+
+
+def determine_rotation_trigger(
+    usage: RemoteUsageSnapshot | None,
+    *,
+    primary_used_percent: float | None,
+    primary_reset_at: datetime | None,
+    secondary_used_percent: float | None,
+    secondary_reset_at: datetime | None,
+    primary_threshold: float,
+    secondary_threshold: float,
+) -> tuple[str | None, datetime | None]:
+    if usage is not None and (usage.limit_reached is True or usage.allowed is False):
+        if (
+            secondary_used_percent is not None
+            and secondary_used_percent >= secondary_threshold
+            and secondary_reset_at is not None
+        ):
+            return "weekly_limit", secondary_reset_at
+        if (
+            primary_used_percent is not None
+            and primary_used_percent >= primary_threshold
+            and primary_reset_at is not None
+        ):
+            return "primary_5h_limit", primary_reset_at
+        if secondary_reset_at is not None:
+            return "weekly_limit", secondary_reset_at
+        if primary_reset_at is not None:
+            return "primary_5h_limit", primary_reset_at
+
+    if (
+        secondary_used_percent is not None
+        and secondary_used_percent >= secondary_threshold
+        and secondary_reset_at is not None
+    ):
+        return "weekly_limit", secondary_reset_at
+    if (
+        primary_used_percent is not None
+        and primary_used_percent >= primary_threshold
+        and primary_reset_at is not None
+    ):
+        return "primary_5h_limit", primary_reset_at
+    return None, None
 
 
 def resume_prompt_for_session(base_prompt: str, raw_session: dict[str, Any]) -> str:
@@ -3680,23 +3808,15 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         print(f"no safe rotation signal; skipping auto-rotation ({note})")
         return 0
 
-    triggered_reason = None
-    triggered_until = None
-
-    if (
-        trigger_secondary_used is not None
-        and trigger_secondary_used >= args.secondary_threshold
-        and trigger_secondary_reset is not None
-    ):
-        triggered_reason = "weekly_limit"
-        triggered_until = trigger_secondary_reset
-    elif (
-        trigger_primary_used is not None
-        and trigger_primary_used >= args.primary_threshold
-        and trigger_primary_reset is not None
-    ):
-        triggered_reason = "primary_5h_limit"
-        triggered_until = trigger_primary_reset
+    triggered_reason, triggered_until = determine_rotation_trigger(
+        current_usage,
+        primary_used_percent=trigger_primary_used,
+        primary_reset_at=trigger_primary_reset,
+        secondary_used_percent=trigger_secondary_used,
+        secondary_reset_at=trigger_secondary_reset,
+        primary_threshold=args.primary_threshold,
+        secondary_threshold=args.secondary_threshold,
+    )
 
     if triggered_reason and triggered_until:
         if getattr(args, "dry_run", False):
