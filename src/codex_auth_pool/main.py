@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil as shutil_lib
 import shutil
@@ -1097,6 +1098,8 @@ def _tool_call_summary(payload: dict[str, Any]) -> dict[str, Any] | None:
                 "workdir": arguments.get("workdir"),
             }
         )
+    elif name == "write_stdin":
+        summary["terminal_session_id"] = arguments.get("session_id")
     elif name == "parallel":
         for tool_use in arguments.get("tool_uses", []):
             if not isinstance(tool_use, dict):
@@ -1113,6 +1116,17 @@ def _tool_call_summary(payload: dict[str, Any]) -> dict[str, Any] | None:
     return summary
 
 
+def _terminal_session_id_from_output(output: Any) -> str | None:
+    if not isinstance(output, str):
+        return None
+    match = re.search(r"session ID\s+([0-9]+)", output)
+    return match.group(1) if match else None
+
+
+def _output_says_process_exited(output: Any) -> bool:
+    return isinstance(output, str) and "Process exited with code" in output
+
+
 def pending_tool_calls_at(session: InterruptedSession, captured_at: datetime) -> list[dict[str, Any]]:
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
@@ -1123,6 +1137,9 @@ def pending_tool_calls_at(session: InterruptedSession, captured_at: datetime) ->
         return []
 
     pending: dict[str, dict[str, Any]] = {}
+    call_summaries: dict[str, dict[str, Any]] = {}
+    terminal_sessions: dict[str, dict[str, Any]] = {}
+    write_call_sessions: dict[str, str] = {}
     for raw_line in lines:
         try:
             event = json.loads(raw_line)
@@ -1141,14 +1158,40 @@ def pending_tool_calls_at(session: InterruptedSession, captured_at: datetime) ->
             summary = _tool_call_summary(payload)
             if summary is not None:
                 pending[str(summary["call_id"])] = summary
+                call_summaries[str(summary["call_id"])] = summary
+                if summary.get("name") == "write_stdin" and summary.get("terminal_session_id") is not None:
+                    write_call_sessions[str(summary["call_id"])] = str(summary["terminal_session_id"])
         elif call_id and (
             (event_type == "response_item" and payload_type == "function_call_output")
             or (event_type == "event_msg" and str(payload_type).endswith("_end"))
         ):
+            output = payload.get("output")
+            original_summary = call_summaries.get(call_id, {})
+            terminal_id = _terminal_session_id_from_output(output)
+            if terminal_id and original_summary.get("commands"):
+                terminal_sessions[terminal_id] = {
+                    "call_id": call_id,
+                    "name": "terminal_session",
+                    "terminal_session_id": terminal_id,
+                    "commands": original_summary.get("commands", []),
+                }
+            write_terminal_id = write_call_sessions.get(call_id)
+            if write_terminal_id and _output_says_process_exited(output):
+                terminal_sessions.pop(write_terminal_id, None)
             pending.pop(call_id, None)
         elif event_type == "event_msg" and payload_type == "task_complete":
             pending.clear()
-    return list(pending.values())
+            terminal_sessions.clear()
+    combined: dict[str, dict[str, Any]] = {}
+    for call_id, summary in pending.items():
+        terminal_id = summary.get("terminal_session_id")
+        if terminal_id is not None and str(terminal_id) in terminal_sessions:
+            combined[f"terminal:{terminal_id}"] = terminal_sessions[str(terminal_id)]
+        else:
+            combined[f"call:{call_id}"] = summary
+    for terminal_id, summary in terminal_sessions.items():
+        combined.setdefault(f"terminal:{terminal_id}", summary)
+    return list(combined.values())
 
 
 def session_was_in_progress_at(session: InterruptedSession, captured_at: datetime) -> bool:
