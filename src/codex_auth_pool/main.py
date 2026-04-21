@@ -109,7 +109,7 @@ AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
 DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 24 * 60 * 60
 DEFAULT_INTERRUPTED_SESSION_MAX_COUNT = 30
 DEFAULT_INTERRUPTED_SESSION_PROMPT = "继续"
-RESUME_VERIFY_DELAY_SECONDS = 8.0
+RESUME_VERIFY_DELAY_SECONDS = 12.0
 
 
 @dataclass
@@ -1456,6 +1456,8 @@ def resume_interrupted_sessions(
             "cwd": str(cwd),
             "pid": process.pid,
             "log_path": str(log_path),
+            "rollout_path": raw_session.get("rollout_path"),
+            "resume_started_at": now_local().isoformat(),
             "interrupted_tool_count": raw_session.get("interrupted_tool_count") or 0,
         }
         started.append(record)
@@ -1496,6 +1498,35 @@ def _resume_log_has_activity(text: str) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _rollout_has_activity_since(path: Path, started_at: datetime) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return False
+    for raw in reversed(lines):
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_at = parse_dt(str(event.get("timestamp") or ""))
+        if event_at is None:
+            continue
+        if event_at < started_at:
+            break
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_type = event.get("type")
+        payload_type = payload.get("type")
+        if event_type == "event_msg" and payload_type in {"task_started", "agent_message", "task_complete", "exec_command_end"}:
+            return True
+        if event_type == "response_item" and payload_type in {"function_call", "custom_tool_call", "reasoning"}:
+            return True
+    return False
+
+
 def verify_resumed_sessions_started(
     started_processes: list[tuple[dict[str, Any], subprocess.Popen[Any], int]],
     *,
@@ -1507,13 +1538,16 @@ def verify_resumed_sessions_started(
     sessions: list[dict[str, Any]] = []
     for record, process, log_offset in started_processes:
         log_path = Path(str(record.get("log_path") or ""))
+        rollout_path = Path(str(record.get("rollout_path") or ""))
+        started_at = parse_dt(str(record.get("resume_started_at") or "")) or now_local()
         text = _read_log_since(log_path, log_offset)
-        activity_detected = _resume_log_has_activity(text)
+        activity_detected = _rollout_has_activity_since(rollout_path, started_at) or _resume_log_has_activity(text)
         sessions.append(
             {
                 "session_id": record.get("session_id"),
                 "pid": record.get("pid"),
                 "log_path": record.get("log_path"),
+                "rollout_path": record.get("rollout_path"),
                 "process_status": "running" if process.poll() is None else f"exited:{process.returncode}",
                 "activity_detected": activity_detected,
             }
