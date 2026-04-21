@@ -109,6 +109,7 @@ AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
 DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 24 * 60 * 60
 DEFAULT_INTERRUPTED_SESSION_MAX_COUNT = 30
 DEFAULT_INTERRUPTED_SESSION_PROMPT = "继续"
+RESUME_VERIFY_DELAY_SECONDS = 8.0
 
 
 @dataclass
@@ -505,6 +506,17 @@ def recent_session_only_recovery_summary(events_path: Path) -> dict[str, Any] | 
         "timestamp": event.get("timestamp"),
         "reason": event.get("reason") or "session_owner_resume_only",
         "session_count": int(event.get("session_count") or 0),
+    }
+
+
+def recent_resume_verification_summary(events_path: Path) -> dict[str, Any] | None:
+    event = read_recent_event_of_type(events_path, "interrupted_sessions_resume_verified")
+    if event is None:
+        return None
+    return {
+        "timestamp": event.get("timestamp"),
+        "session_count": int(event.get("session_count") or 0),
+        "active_count": int(event.get("active_count") or 0),
     }
 
 
@@ -1408,6 +1420,7 @@ def resume_interrupted_sessions(
 
     session_recovery_dir.mkdir(parents=True, exist_ok=True)
     started: list[dict[str, Any]] = []
+    started_processes: list[tuple[dict[str, Any], subprocess.Popen[Any], int]] = []
     for raw_session in sessions:
         if not isinstance(raw_session, dict):
             continue
@@ -1418,6 +1431,7 @@ def resume_interrupted_sessions(
         if not cwd.exists() or not cwd.is_dir():
             cwd = Path.home()
         log_path = session_recovery_dir / f"{session_id}.resume.log"
+        log_offset = log_path.stat().st_size if log_path.exists() else 0
         session_prompt = resume_prompt_for_session(prompt, raw_session)
         command = [
             codex_bin,
@@ -1445,6 +1459,7 @@ def resume_interrupted_sessions(
             "interrupted_tool_count": raw_session.get("interrupted_tool_count") or 0,
         }
         started.append(record)
+        started_processes.append((record, process, log_offset))
 
     if events_path is not None:
         append_event(
@@ -1455,7 +1470,61 @@ def resume_interrupted_sessions(
             session_count=len(started),
             sessions=started,
         )
+        verify_resumed_sessions_started(started_processes, events_path=events_path)
     return started
+
+
+def _read_log_since(path: Path, offset: int, limit: int = 20000) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(max(offset, 0))
+            data = handle.read(limit)
+    except OSError:
+        return ""
+    return data.decode("utf-8", "replace")
+
+
+def _resume_log_has_activity(text: str) -> bool:
+    markers = (
+        "\ncodex\n",
+        "\nexec\n",
+        "\napply patch\n",
+        "\ntokens used\n",
+        "task_complete",
+        "function_call",
+    )
+    return any(marker in text for marker in markers)
+
+
+def verify_resumed_sessions_started(
+    started_processes: list[tuple[dict[str, Any], subprocess.Popen[Any], int]],
+    *,
+    events_path: Path,
+) -> None:
+    if not started_processes:
+        return
+    time.sleep(RESUME_VERIFY_DELAY_SECONDS)
+    sessions: list[dict[str, Any]] = []
+    for record, process, log_offset in started_processes:
+        log_path = Path(str(record.get("log_path") or ""))
+        text = _read_log_since(log_path, log_offset)
+        activity_detected = _resume_log_has_activity(text)
+        sessions.append(
+            {
+                "session_id": record.get("session_id"),
+                "pid": record.get("pid"),
+                "log_path": record.get("log_path"),
+                "process_status": "running" if process.poll() is None else f"exited:{process.returncode}",
+                "activity_detected": activity_detected,
+            }
+        )
+    append_event(
+        events_path,
+        "interrupted_sessions_resume_verified",
+        session_count=len(sessions),
+        active_count=sum(1 for session in sessions if session["activity_detected"]),
+        sessions=sessions,
+    )
 
 
 def determine_rotation_trigger(
@@ -1508,6 +1577,7 @@ def resume_prompt_for_session(base_prompt: str, raw_session: dict[str, Any]) -> 
             "",
             "注意：你是被 Codex Desktop 重启打断的原会话。",
             "请基于本会话已有上下文，继续执行重启前正在进行的任务。",
+            "不要只确认收到，也不要停下来等待用户；请立即检查中断点并继续实际执行，直到任务完成或遇到明确阻塞。",
             "不要把任务交给恢复器或其他会话接手；如有工具、终端命令或后台任务被打断，由你在本会话上下文中自行判断并继续。",
         ]
     ).strip()
@@ -2545,7 +2615,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     session_only_recovery = recent_session_only_recovery_summary(args.events_path)
     terminal_recovery = recent_restarted_terminal_summary(args.events_path)
     recovery = recent_resumed_sessions_summary(args.events_path)
-    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None:
+    resume_verification = recent_resume_verification_summary(args.events_path)
+    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None:
         print("  none")
     else:
         if capture is not None:
@@ -2563,6 +2634,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  resumed at: {recovery['timestamp'] or '-'}")
             print(f"  resumed sessions: {recovery['session_count']}")
             print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
+        if resume_verification is not None:
+            print(f"  resume verified at: {resume_verification['timestamp'] or '-'}")
+            print(f"  sessions with activity: {resume_verification['active_count']}/{resume_verification['session_count']}")
     print("")
     print("Pool")
     for index, item in enumerate(ranked[: min(len(ranked), 8)], start=1):
@@ -3319,7 +3393,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     session_only_recovery = recent_session_only_recovery_summary(args.events_path)
     terminal_recovery = recent_restarted_terminal_summary(args.events_path)
     recovery = recent_resumed_sessions_summary(args.events_path)
-    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None:
+    resume_verification = recent_resume_verification_summary(args.events_path)
+    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None:
         print("  none")
     else:
         if capture is not None:
@@ -3337,6 +3412,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             print(f"  resumed at: {recovery['timestamp'] or '-'}")
             print(f"  resumed sessions: {recovery['session_count']}")
             print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
+        if resume_verification is not None:
+            print(f"  resume verified at: {resume_verification['timestamp'] or '-'}")
+            print(f"  sessions with activity: {resume_verification['active_count']}/{resume_verification['session_count']}")
     print("")
     print("Daemon")
     print(f"  kind: {background['kind']}")
