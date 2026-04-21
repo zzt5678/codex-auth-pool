@@ -94,7 +94,7 @@ codex-auth-pool doctor
 macOS:
 
 ```bash
-codex-auth-pool init --install-launchd --restart-after-switch
+codex-auth-pool init --install-launchd
 ```
 
 Ubuntu/Linux:
@@ -150,7 +150,7 @@ codex-auth-pool events --limit 10
 
 ## Interrupted Session Recovery
 
-When `--restart-after-switch` is enabled on macOS, `codex-auth-pool` does a conservative recovery pass:
+Background services installed with `launchd-install`, `systemd-install`, `setup --install-*`, or `init --install-*` now enable `--restart-after-switch` by default. On macOS, that means `codex-auth-pool` does a conservative recovery pass whenever automatic rotation switches accounts:
 
 - before quitting Codex Desktop, it captures recently active Desktop sessions from `~/.codex/state_5.sqlite` and `~/.codex/logs_2.sqlite`
 - after Codex Desktop comes back up, it starts `codex exec resume <session_id> 继续` for each captured session in the background
@@ -159,7 +159,13 @@ When `--restart-after-switch` is enabled on macOS, `codex-auth-pool` does a cons
 If you only want the restart without auto-resuming interrupted sessions:
 
 ```bash
-codex-auth-pool launchd-install --restart-after-switch --no-resume-interrupted-sessions
+codex-auth-pool launchd-install --no-resume-interrupted-sessions
+```
+
+If you explicitly want auth switching without restarting Codex Desktop:
+
+```bash
+codex-auth-pool launchd-install --no-restart-after-switch
 ```
 
 ## Most Useful Commands
@@ -215,7 +221,7 @@ codex-auth-pool tick --dry-run
 codex-auth-pool events --limit 10
 codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool tick
-codex-auth-pool launchd-install --interval-seconds 60 --restart-after-switch
+codex-auth-pool launchd-install --interval-seconds 60
 codex-auth-pool launchd-status
 codex-auth-pool systemd-install --interval-seconds 60
 codex-auth-pool systemd-status
@@ -252,7 +258,7 @@ Important paths:
 - Ubuntu/Linux supports auth rotation and `systemd --user`; automatic Codex Desktop restart is a no-op there
 - updates both `~/.codex/cache/auth.json` and `~/.codex/auth.json`
 - keeps local plugin and connector state out of the auth rotation path
-- `apply-best --restart-after-switch` is an immediate manual switch command; use `init --install-launchd --restart-after-switch` or `launchd-install --restart-after-switch` for background auto-rotation
+- `apply-best --restart-after-switch` is an immediate manual switch command; use `init --install-launchd` or `launchd-install` for background auto-rotation. Background services restart Codex after switches by default; pass `--no-restart-after-switch` only if you intentionally want auth changes without a Desktop restart.
 - background rotation defaults to preemptive thresholds of `95%` for the 5-hour window and `98%` for the weekly window
 
 ## Ubuntu Deployment

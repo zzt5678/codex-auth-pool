@@ -1871,7 +1871,24 @@ def launchctl_status(label: str) -> dict[str, Any]:
         "loaded": False,
         "state": None,
         "pid": None,
+        "program_arguments": [],
+        "restart_after_switch": None,
+        "refresh_usage": None,
+        "resume_interrupted_sessions": None,
     }
+    if plist_path.exists():
+        try:
+            with plist_path.open("rb") as handle:
+                payload = plistlib.load(handle)
+            program_arguments = payload.get("ProgramArguments")
+            if isinstance(program_arguments, list):
+                args = [str(item) for item in program_arguments]
+                status["program_arguments"] = args
+                status["restart_after_switch"] = "--restart-after-switch" in args
+                status["refresh_usage"] = "--refresh-usage" in args
+                status["resume_interrupted_sessions"] = "--no-resume-interrupted-sessions" not in args
+        except (OSError, plistlib.InvalidFileException):
+            pass
     if not is_macos():
         return status
     completed = run_command(["launchctl", "print", launchctl_target(label)])
@@ -1993,7 +2010,18 @@ def systemd_status(service_name: str) -> dict[str, Any]:
         "active": False,
         "state": None,
         "pid": None,
+        "restart_after_switch": None,
+        "refresh_usage": None,
+        "resume_interrupted_sessions": None,
     }
+    if service_path.exists():
+        try:
+            text = service_path.read_text(encoding="utf-8", errors="ignore")
+            status["restart_after_switch"] = "--restart-after-switch" in text
+            status["refresh_usage"] = "--refresh-usage" in text
+            status["resume_interrupted_sessions"] = "--no-resume-interrupted-sessions" not in text
+        except OSError:
+            pass
     if not is_linux() or not shutil_lib.which("systemctl"):
         return status
     completed = systemctl_user(["show", unit, "--property=ActiveState,SubState,MainPID", "--no-page"])
@@ -2020,6 +2048,9 @@ def background_service_status() -> dict[str, Any]:
             "running": bool(status["loaded"]),
             "state": status["state"],
             "pid": status["pid"],
+            "restart_after_switch": status.get("restart_after_switch"),
+            "refresh_usage": status.get("refresh_usage"),
+            "resume_interrupted_sessions": status.get("resume_interrupted_sessions"),
         }
     if is_linux():
         status = systemd_status(DEFAULT_SYSTEMD_SERVICE)
@@ -2029,6 +2060,9 @@ def background_service_status() -> dict[str, Any]:
             "running": bool(status["active"]),
             "state": status["state"],
             "pid": status["pid"],
+            "restart_after_switch": status.get("restart_after_switch"),
+            "refresh_usage": status.get("refresh_usage"),
+            "resume_interrupted_sessions": status.get("resume_interrupted_sessions"),
         }
     return {"kind": platform.system(), "installed": False, "running": False, "state": None, "pid": None}
 
@@ -2502,6 +2536,24 @@ def latest_rate_limit_snapshot(sessions_dir: Path) -> RateLimitSnapshot | None:
                 event_timestamp=event.get("timestamp"),
             )
     return None
+
+
+def rate_limit_snapshot_is_usable(
+    snapshot: RateLimitSnapshot,
+    *,
+    state: dict[str, Any],
+    max_age_minutes: int,
+) -> bool:
+    event_at = parse_dt(snapshot.event_timestamp)
+    if event_at is None:
+        return False
+    if now_local() - event_at.astimezone() > timedelta(minutes=max_age_minutes):
+        return False
+    last_apply = state.get("last_apply") if isinstance(state.get("last_apply"), dict) else None
+    last_apply_at = parse_dt(str(last_apply.get("timestamp") or "")) if last_apply else None
+    if last_apply_at is not None and event_at < last_apply_at:
+        return False
+    return True
 
 
 def _safe_float(value: Any) -> float | None:
@@ -3518,6 +3570,13 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     print(f"  running: {'yes' if background['running'] else 'no'}")
     print(f"  state: {background['state'] or '-'}")
     print(f"  pid: {background['pid'] or '-'}")
+    if background["kind"] in {"launchd", "systemd"}:
+        restart_flag = background.get("restart_after_switch")
+        refresh_flag = background.get("refresh_usage")
+        resume_flag = background.get("resume_interrupted_sessions")
+        print(f"  restart after switch: {'yes' if restart_flag else 'no' if restart_flag is False else '-'}")
+        print(f"  refresh usage: {'yes' if refresh_flag else 'no' if refresh_flag is False else '-'}")
+        print(f"  resume interrupted sessions: {'yes' if resume_flag else 'no' if resume_flag is False else '-'}")
     stdout_line = read_recent_log_line(DEFAULT_LAUNCHD_STDOUT)
     stderr_line = read_recent_log_line(DEFAULT_LAUNCHD_STDERR)
     stdout_time = file_mtime(DEFAULT_LAUNCHD_STDOUT)
@@ -3903,7 +3962,11 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         trigger_secondary_used = current_usage.secondary_used_percent
         trigger_secondary_reset = current_usage.secondary_reset_at
         trigger_source = f"profile_usage:{current_usage.source}"
-    elif snapshot is not None and not getattr(args, "refresh_usage", False):
+    elif snapshot is not None and rate_limit_snapshot_is_usable(
+        snapshot,
+        state=state,
+        max_age_minutes=args.usage_max_age_minutes,
+    ):
         trigger_primary_used = snapshot.primary_used_percent
         trigger_primary_reset = snapshot.primary_resets_at
         trigger_secondary_used = snapshot.secondary_used_percent
@@ -4042,6 +4105,9 @@ def cmd_launchd_install(args: argparse.Namespace) -> int:
         "launchd_install",
         label=args.label,
         plist_path=str(plist_path),
+        restart_after_switch=args.restart_after_switch,
+        refresh_usage=args.refresh_usage,
+        resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
     )
     print(json.dumps(status, ensure_ascii=False, indent=2))
     return 0
@@ -4088,6 +4154,9 @@ def cmd_launchd_status(args: argparse.Namespace) -> int:
     print(f"  state: {status['state'] or '-'}")
     print(f"  pid: {status['pid'] or '-'}")
     print(f"  plist: {status['plist_path']}")
+    print(f"  restart after switch: {'yes' if status.get('restart_after_switch') else 'no' if status.get('restart_after_switch') is False else '-'}")
+    print(f"  refresh usage: {'yes' if status.get('refresh_usage') else 'no' if status.get('refresh_usage') is False else '-'}")
+    print(f"  resume interrupted sessions: {'yes' if status.get('resume_interrupted_sessions') else 'no' if status.get('resume_interrupted_sessions') is False else '-'}")
     print(f"  recent stdout: {stdout_line or '-'}")
     print(f"  stdout time: {fmt_dt(stdout_time)}")
     print(f"  recent stderr: {stderr_line or '-'}")
@@ -4128,7 +4197,15 @@ def cmd_systemd_install(args: argparse.Namespace) -> int:
     completed = systemctl_user(["enable", "--now", unit])
     if completed.returncode != 0:
         raise SystemExit(f"failed to enable systemd user service {unit}:\n{completed.stderr or completed.stdout}")
-    append_event(args.events_path, "systemd_install", service_name=unit, service_path=str(service_path))
+    append_event(
+        args.events_path,
+        "systemd_install",
+        service_name=unit,
+        service_path=str(service_path),
+        restart_after_switch=args.restart_after_switch,
+        refresh_usage=args.refresh_usage,
+        resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
+    )
     print(f"installed systemd user service at {service_path}")
     print(json.dumps(systemd_status(unit), ensure_ascii=False, indent=2))
     return 0
@@ -4182,6 +4259,9 @@ def cmd_systemd_status(args: argparse.Namespace) -> int:
     print(f"  state: {status['state'] or '-'}")
     print(f"  pid: {status['pid'] or '-'}")
     print(f"  path: {status['service_path']}")
+    print(f"  restart after switch: {'yes' if status.get('restart_after_switch') else 'no' if status.get('restart_after_switch') is False else '-'}")
+    print(f"  refresh usage: {'yes' if status.get('refresh_usage') else 'no' if status.get('refresh_usage') is False else '-'}")
+    print(f"  resume interrupted sessions: {'yes' if status.get('resume_interrupted_sessions') else 'no' if status.get('resume_interrupted_sessions') is False else '-'}")
     print(f"  recent stdout: {stdout_line or '-'}")
     print(f"  stdout time: {fmt_dt(stdout_time)}")
     print(f"  recent stderr: {stderr_line or '-'}")
@@ -4374,7 +4454,19 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--interval-seconds", type=int, default=60)
     init_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     init_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
-    init_parser.add_argument("--restart-after-switch", action="store_true")
+    init_parser.add_argument(
+        "--restart-after-switch",
+        action="store_true",
+        dest="restart_after_switch",
+        default=True,
+        help="restart Codex Desktop after automatic background switches (default: enabled for installed services)",
+    )
+    init_parser.add_argument(
+        "--no-restart-after-switch",
+        action="store_false",
+        dest="restart_after_switch",
+        help="install the background service without restarting Codex after account switches",
+    )
     init_parser.add_argument(
         "--no-resume-interrupted-sessions",
         action="store_true",
@@ -4493,7 +4585,19 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--interval-seconds", type=int, default=60)
     setup_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     setup_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
-    setup_parser.add_argument("--restart-after-switch", action="store_true")
+    setup_parser.add_argument(
+        "--restart-after-switch",
+        action="store_true",
+        dest="restart_after_switch",
+        default=True,
+        help="restart Codex Desktop after automatic background switches (default: enabled for installed services)",
+    )
+    setup_parser.add_argument(
+        "--no-restart-after-switch",
+        action="store_false",
+        dest="restart_after_switch",
+        help="install the background service without restarting Codex after account switches",
+    )
     setup_parser.add_argument(
         "--no-resume-interrupted-sessions",
         action="store_true",
@@ -4710,7 +4814,15 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument(
         "--restart-after-switch",
         action="store_true",
-        help="restart Codex Desktop automatically after switching auth",
+        dest="restart_after_switch",
+        default=True,
+        help="restart Codex Desktop automatically after switching auth (default: enabled)",
+    )
+    daemon_parser.add_argument(
+        "--no-restart-after-switch",
+        action="store_false",
+        dest="restart_after_switch",
+        help="switch auth without restarting Codex Desktop",
     )
     daemon_parser.add_argument(
         "--graceful-restart",
@@ -4784,7 +4896,15 @@ def build_parser() -> argparse.ArgumentParser:
     launchd_install_parser.add_argument(
         "--restart-after-switch",
         action="store_true",
-        help="restart Codex Desktop automatically after switching auth",
+        dest="restart_after_switch",
+        default=True,
+        help="restart Codex Desktop automatically after switching auth (default: enabled)",
+    )
+    launchd_install_parser.add_argument(
+        "--no-restart-after-switch",
+        action="store_false",
+        dest="restart_after_switch",
+        help="switch auth without restarting Codex Desktop",
     )
     launchd_install_parser.add_argument(
         "--no-resume-interrupted-sessions",
@@ -4845,7 +4965,15 @@ def build_parser() -> argparse.ArgumentParser:
     systemd_install_parser.add_argument(
         "--restart-after-switch",
         action="store_true",
-        help="request Codex restart after switching; currently a no-op on Linux",
+        dest="restart_after_switch",
+        default=True,
+        help="request Codex restart after switching; currently a no-op on Linux (default: enabled)",
+    )
+    systemd_install_parser.add_argument(
+        "--no-restart-after-switch",
+        action="store_false",
+        dest="restart_after_switch",
+        help="switch auth without requesting a Codex restart",
     )
     systemd_install_parser.add_argument(
         "--no-resume-interrupted-sessions",

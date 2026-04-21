@@ -94,7 +94,7 @@ codex-auth-pool doctor
 macOS：
 
 ```bash
-codex-auth-pool init --install-launchd --restart-after-switch
+codex-auth-pool init --install-launchd
 ```
 
 Ubuntu/Linux：
@@ -150,7 +150,7 @@ codex-auth-pool events --limit 10
 
 ## 被重启打断的会话恢复
 
-macOS 上启用 `--restart-after-switch` 时，工具会做一个保守的恢复流程：
+通过 `launchd-install`、`systemd-install`、`setup --install-*` 或 `init --install-*` 安装后台服务时，默认会启用切号后重启。macOS 上自动轮换切号后，工具会做一个保守的恢复流程：
 
 - 重启 Codex Desktop 前，从 `~/.codex/state_5.sqlite` 和 `~/.codex/logs_2.sqlite` 捕获最近活跃的 Desktop 会话
 - Codex Desktop 重新启动后，后台执行 `codex exec resume <session_id> 继续`
@@ -159,7 +159,13 @@ macOS 上启用 `--restart-after-switch` 时，工具会做一个保守的恢复
 如果你只想自动重启，不想自动对会话发送 `继续`：
 
 ```bash
-codex-auth-pool launchd-install --restart-after-switch --no-resume-interrupted-sessions
+codex-auth-pool launchd-install --no-resume-interrupted-sessions
+```
+
+如果你明确只想切 auth、不想重启 Codex Desktop：
+
+```bash
+codex-auth-pool launchd-install --no-restart-after-switch
 ```
 
 ## 最常用命令
@@ -215,7 +221,7 @@ codex-auth-pool tick --dry-run
 codex-auth-pool events --limit 10
 codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool tick
-codex-auth-pool launchd-install --interval-seconds 60 --restart-after-switch
+codex-auth-pool launchd-install --interval-seconds 60
 codex-auth-pool launchd-status
 codex-auth-pool systemd-install --interval-seconds 60
 codex-auth-pool systemd-status
@@ -252,7 +258,7 @@ codex-auth-pool restore-env baseline --restart-codex
 - Ubuntu/Linux 支持账号轮换和 `systemd --user`，但自动重启 Codex Desktop 会自动降级为 no-op
 - 会同时更新 `~/.codex/cache/auth.json` 和 `~/.codex/auth.json`
 - 插件和连接器状态尽量与 auth 轮换解耦
-- `apply-best --restart-after-switch` 是人工立即切换命令；后台自动切换请使用 `init --install-launchd --restart-after-switch` 或 `launchd-install --restart-after-switch`
+- `apply-best --restart-after-switch` 是人工立即切换命令；后台自动切换请使用 `init --install-launchd` 或 `launchd-install`。后台服务默认会在切号后重启 Codex；只有明确需要“只切 auth 不重启”时才加 `--no-restart-after-switch`
 - 后台轮换默认是提前切换：
   - 5 小时窗口默认阈值 `95%`
   - 周窗口默认阈值 `98%`
