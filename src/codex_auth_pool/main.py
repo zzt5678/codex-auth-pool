@@ -109,7 +109,10 @@ AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
 DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 24 * 60 * 60
 DEFAULT_INTERRUPTED_SESSION_MAX_COUNT = 30
 DEFAULT_INTERRUPTED_SESSION_PROMPT = "继续"
+DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT = "继续。如果你刚才只发送了确认文本，现在不要再确认，直接从上次中断点继续实际执行。"
+RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
 RESUME_VERIFY_DELAY_SECONDS = 12.0
+RESUME_RETRY_ATTEMPTS = 2
 
 
 @dataclass
@@ -1094,6 +1097,8 @@ def _session_event_kind(event: dict[str, Any]) -> str | None:
     payload_type = payload.get("type")
     if event_type == "event_msg" and payload_type == "task_complete":
         return "task_complete"
+    if event_type == "event_msg" and payload_type == "agent_message":
+        return "active"
     if event_type == "response_item" and payload_type in {"function_call", "function_call_output", "reasoning"}:
         return "active"
     if event_type == "event_msg" and payload_type in {"exec_command_end", "exec_command_start"}:
@@ -1310,6 +1315,9 @@ def pending_tool_calls_at(session: InterruptedSession, captured_at: datetime) ->
 
 
 def session_was_in_progress_at(session: InterruptedSession, captured_at: datetime) -> bool:
+    if pending_tool_calls_at(session, captured_at):
+        return True
+
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
         return False
@@ -1333,6 +1341,9 @@ def session_was_in_progress_at(session: InterruptedSession, captured_at: datetim
             return False
         if kind == "active":
             return True
+    captured_ts = int(captured_at.timestamp())
+    if session.updated_at > 0 and captured_ts - session.updated_at <= RECENT_SESSION_ACTIVITY_GRACE_SECONDS:
+        return True
     return False
 
 
@@ -1418,62 +1429,109 @@ def resume_interrupted_sessions(
             )
         return []
 
+    pending_sessions = [session for session in sessions if isinstance(session, dict)]
     session_recovery_dir.mkdir(parents=True, exist_ok=True)
-    started: list[dict[str, Any]] = []
-    started_processes: list[tuple[dict[str, Any], subprocess.Popen[Any], int]] = []
-    for raw_session in sessions:
-        if not isinstance(raw_session, dict):
-            continue
-        session_id = str(raw_session.get("id") or "")
-        if not session_id:
-            continue
-        cwd = Path(str(raw_session.get("cwd") or Path.home()))
-        if not cwd.exists() or not cwd.is_dir():
-            cwd = Path.home()
-        log_path = session_recovery_dir / f"{session_id}.resume.log"
-        log_offset = log_path.stat().st_size if log_path.exists() else 0
-        session_prompt = resume_prompt_for_session(prompt, raw_session)
-        command = [
-            codex_bin,
-            "exec",
-            "resume",
-            "--skip-git-repo-check",
-            session_id,
-            session_prompt,
-        ]
-        with log_path.open("ab") as log_handle:
-            process = subprocess.Popen(
-                command,
-                cwd=str(cwd),
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        record = {
-            "session_id": session_id,
-            "title": raw_session.get("title"),
-            "cwd": str(cwd),
-            "pid": process.pid,
-            "log_path": str(log_path),
-            "rollout_path": raw_session.get("rollout_path"),
-            "resume_started_at": now_local().isoformat(),
-            "interrupted_tool_count": raw_session.get("interrupted_tool_count") or 0,
-        }
-        started.append(record)
-        started_processes.append((record, process, log_offset))
+    all_started: list[dict[str, Any]] = []
+    inactive_session_ids: list[str] = []
 
-    if events_path is not None:
+    for attempt in range(1, RESUME_RETRY_ATTEMPTS + 1):
+        if not pending_sessions:
+            break
+        attempt_prompt = prompt if attempt == 1 else DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT
+        started: list[dict[str, Any]] = []
+        started_processes: list[tuple[dict[str, Any], subprocess.Popen[Any], int]] = []
+
+        for raw_session in pending_sessions:
+            session_id = str(raw_session.get("id") or "")
+            if not session_id:
+                continue
+            cwd = Path(str(raw_session.get("cwd") or Path.home()))
+            if not cwd.exists() or not cwd.is_dir():
+                cwd = Path.home()
+            log_path = session_recovery_dir / f"{session_id}.resume.log"
+            log_offset = log_path.stat().st_size if log_path.exists() else 0
+            session_prompt = resume_prompt_for_session(attempt_prompt, raw_session)
+            command = [
+                codex_bin,
+                "exec",
+                "resume",
+                "--skip-git-repo-check",
+                session_id,
+                session_prompt,
+            ]
+            with log_path.open("ab") as log_handle:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(cwd),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            record = {
+                "session_id": session_id,
+                "title": raw_session.get("title"),
+                "cwd": str(cwd),
+                "pid": process.pid,
+                "log_path": str(log_path),
+                "rollout_path": raw_session.get("rollout_path"),
+                "resume_started_at": now_local().isoformat(),
+                "interrupted_tool_count": raw_session.get("interrupted_tool_count") or 0,
+                "attempt": attempt,
+            }
+            started.append(record)
+            started_processes.append((record, process, log_offset))
+
+        all_started.extend(started)
+        verified_sessions: list[dict[str, Any]] = []
+        if events_path is not None:
+            append_event(
+                events_path,
+                "interrupted_sessions_resume_started",
+                snapshot_path=snapshot.get("path"),
+                prompt=attempt_prompt,
+                attempt=attempt,
+                session_count=len(started),
+                sessions=started,
+            )
+            verified_sessions = verify_resumed_sessions_started(
+                started_processes,
+                events_path=events_path,
+                attempt=attempt,
+            )
+
+        inactive_session_ids = [
+            str(session.get("session_id") or "")
+            for session in verified_sessions
+            if not session.get("activity_detected")
+        ]
+        if not inactive_session_ids:
+            break
+        if events_path is not None and attempt < RESUME_RETRY_ATTEMPTS:
+            append_event(
+                events_path,
+                "interrupted_sessions_resume_retry_scheduled",
+                snapshot_path=snapshot.get("path"),
+                next_attempt=attempt + 1,
+                session_count=len(inactive_session_ids),
+                session_ids=inactive_session_ids,
+            )
+        inactive_session_id_set = set(inactive_session_ids)
+        pending_sessions = [
+            session
+            for session in pending_sessions
+            if str(session.get("id") or "") in inactive_session_id_set
+        ]
+
+    if events_path is not None and inactive_session_ids:
         append_event(
             events_path,
-            "interrupted_sessions_resume_started",
+            "interrupted_sessions_resume_still_inactive",
             snapshot_path=snapshot.get("path"),
-            prompt=prompt,
-            session_count=len(started),
-            sessions=started,
+            session_count=len(inactive_session_ids),
+            session_ids=inactive_session_ids,
         )
-        verify_resumed_sessions_started(started_processes, events_path=events_path)
-    return started
+    return all_started
 
 
 def _read_log_since(path: Path, offset: int, limit: int = 20000) -> str:
@@ -1531,9 +1589,10 @@ def verify_resumed_sessions_started(
     started_processes: list[tuple[dict[str, Any], subprocess.Popen[Any], int]],
     *,
     events_path: Path,
-) -> None:
+    attempt: int = 1,
+) -> list[dict[str, Any]]:
     if not started_processes:
-        return
+        return []
     time.sleep(RESUME_VERIFY_DELAY_SECONDS)
     sessions: list[dict[str, Any]] = []
     for record, process, log_offset in started_processes:
@@ -1555,10 +1614,12 @@ def verify_resumed_sessions_started(
     append_event(
         events_path,
         "interrupted_sessions_resume_verified",
+        attempt=attempt,
         session_count=len(sessions),
         active_count=sum(1 for session in sessions if session["activity_detected"]),
         sessions=sessions,
     )
+    return sessions
 
 
 def determine_rotation_trigger(
