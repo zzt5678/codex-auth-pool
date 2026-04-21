@@ -51,6 +51,7 @@
 - 自动把新 `cliproxyapi` 账号吸收到 managed vault，并补齐第一次真实额度观测。
 - 直接查询 `https://chatgpt.com/backend-api/wham/usage`，获取每个账号真实的额度窗口和重置时间。
 - 排序时优先使用真实观测值，而不是只依赖本地元数据。
+- 把 `~/.codex/auth.json` 和 `~/.codex/cache/auth.json` 视为同一个有效登录态；如果两者漂移，后台守护会先自动对齐，再判断额度。
 - 账号额度触顶后自动冷却，并切换到下一个可用账号。
 - macOS 上切换后可自动重启 Codex Desktop。
 - 自动重启前会记录最近活跃的 Codex Desktop 会话，重启后对这些被打断的会话发送 `继续`。
@@ -257,6 +258,7 @@ codex-auth-pool restore-env baseline --restart-codex
 - macOS 支持切换后自动重启 Codex Desktop
 - Ubuntu/Linux 支持账号轮换和 `systemd --user`，但自动重启 Codex Desktop 会自动降级为 no-op
 - 会同时更新 `~/.codex/cache/auth.json` 和 `~/.codex/auth.json`
+- `status` 和 `dashboard` 会显示当前生效的 auth 文件，以及 root/cache 是否同步
 - 插件和连接器状态尽量与 auth 轮换解耦
 - `apply-best --restart-after-switch` 是人工立即切换命令；后台自动切换请使用 `init --install-launchd` 或 `launchd-install`。后台服务默认会在切号后重启 Codex；只有明确需要“只切 auth 不重启”时才加 `--no-restart-after-switch`
 - 后台轮换默认是提前切换：

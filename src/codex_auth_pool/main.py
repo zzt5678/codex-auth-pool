@@ -101,8 +101,8 @@ REQUIRED_SOURCE_KEYS = (
     "id_token",
     "account_id",
 )
-DEFAULT_PRIMARY_THRESHOLD = 99.0
-DEFAULT_SECONDARY_THRESHOLD = 99.0
+DEFAULT_PRIMARY_THRESHOLD = 95.0
+DEFAULT_SECONDARY_THRESHOLD = 98.0
 DEFAULT_USAGE_MAX_AGE_MINUTES = 30
 MIN_AUTO_RESTART_INTERVAL_SECONDS = 120
 AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
@@ -601,7 +601,7 @@ def auto_rotation_recently_blocked(state: dict[str, Any], *, now: datetime) -> t
 
 
 def current_account_summary(target_path: Path, source_dir: Path, managed_dir: Path) -> ProfileSummary | None:
-    current_account = current_auth_account_id(target_path)
+    current_account = active_auth_account_id(target_path)
     if not current_account:
         return None
     for path in discover_all_profiles(source_dir, managed_dir):
@@ -972,6 +972,117 @@ def current_auth_account_id(target_path: Path) -> str | None:
     return tokens.get("account_id")
 
 
+def auth_target_paths(primary_target: Path) -> list[Path]:
+    paths: list[Path] = []
+    for candidate in (primary_target, DEFAULT_CODEX_AUTH_PATH, DEFAULT_CODEX_ROOT_AUTH_PATH):
+        path = Path(candidate).expanduser()
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def newest_existing_auth_path(primary_target: Path) -> Path | None:
+    existing = [path for path in auth_target_paths(primary_target) if path.exists()]
+    if not existing:
+        return None
+    existing.sort(
+        key=lambda path: (
+            path.stat().st_mtime,
+            1 if path == DEFAULT_CODEX_ROOT_AUTH_PATH else 0,
+        ),
+        reverse=True,
+    )
+    return existing[0]
+
+
+def active_auth_account_id(target_path: Path) -> str | None:
+    active_path = newest_existing_auth_path(target_path)
+    if active_path is None:
+        return None
+    return current_auth_account_id(active_path)
+
+
+def active_auth_file_state(target_path: Path) -> dict[str, Any]:
+    files = []
+    for path in auth_target_paths(target_path):
+        account_id = current_auth_account_id(path)
+        files.append(
+            {
+                "path": path,
+                "exists": path.exists(),
+                "account_id": account_id,
+                "mtime": file_mtime(path),
+            }
+        )
+    active_path = newest_existing_auth_path(target_path)
+    existing_accounts = {
+        item["account_id"]
+        for item in files
+        if item["exists"] and item["account_id"]
+    }
+    return {
+        "active_path": active_path,
+        "active_account_id": current_auth_account_id(active_path) if active_path else None,
+        "files": files,
+        "mismatched": len(existing_accounts) > 1,
+    }
+
+
+def _json_payload_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return json.dumps(left, sort_keys=True, ensure_ascii=False) == json.dumps(
+        right, sort_keys=True, ensure_ascii=False
+    )
+
+
+def reconcile_auth_files(target_path: Path, events_path: Path | None = None, *, quiet: bool = False) -> str | None:
+    """Keep Codex's root and cache auth files on the same account.
+
+    Codex Desktop versions have used both ~/.codex/auth.json and
+    ~/.codex/cache/auth.json. Rotation must not trust only one of them.
+    """
+    active_path = newest_existing_auth_path(target_path)
+    if active_path is None:
+        return None
+    payload = read_json(active_path)
+    active_account = current_auth_account_id(active_path)
+    synced: list[str] = []
+    mismatched_before = active_auth_file_state(target_path)["mismatched"]
+
+    for path in auth_target_paths(target_path):
+        if path == active_path:
+            continue
+        existing_payload: dict[str, Any] | None = None
+        if path.exists():
+            try:
+                existing_payload = read_json(path)
+            except SystemExit:
+                existing_payload = None
+        if existing_payload is not None and _json_payload_equal(existing_payload, payload):
+            continue
+        if path.exists():
+            make_backup(path)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, payload)
+        synced.append(str(path))
+
+    if events_path is not None and (synced or mismatched_before):
+        append_event(
+            events_path,
+            "auth_files_reconciled",
+            active_path=str(active_path),
+            active_account_id=active_account,
+            synced_paths=synced,
+            mismatched_before=mismatched_before,
+        )
+    if synced and not quiet:
+        print(
+            f"reconciled Codex auth files from {active_path} "
+            f"(account_id={active_account or '-'})"
+        )
+    return active_account
+
+
 def current_auth_email(target_path: Path) -> str | None:
     if not target_path.exists():
         return None
@@ -1019,7 +1130,7 @@ def make_backup(path: Path) -> Path:
 
 def sync_secondary_auth_files(primary_payload: dict[str, Any], primary_target: Path) -> list[Path]:
     synced: list[Path] = []
-    secondary_targets = [DEFAULT_CODEX_ROOT_AUTH_PATH]
+    secondary_targets = auth_target_paths(primary_target)
     for target in secondary_targets:
         if target == primary_target:
             continue
@@ -2366,7 +2477,7 @@ def current_profile_usage_snapshot(
     *,
     max_age_minutes: int,
 ) -> tuple[RemoteUsageSnapshot | None, str | None]:
-    current_account = current_auth_account_id(target_path)
+    current_account = active_auth_account_id(target_path)
     if current_account is None:
         return None, "current profile not found in pool"
 
@@ -2418,6 +2529,61 @@ def current_profile_usage_snapshot(
         ),
         None,
     )
+
+
+def current_limits_for_display(
+    source_dir: Path,
+    managed_dir: Path,
+    target_path: Path,
+    sessions_dir: Path,
+    state: dict[str, Any],
+    *,
+    max_age_minutes: int,
+) -> dict[str, Any] | None:
+    current_usage, usage_note = current_profile_usage_snapshot(
+        source_dir,
+        managed_dir,
+        target_path,
+        max_age_minutes=max_age_minutes,
+    )
+    if current_usage is not None:
+        return {
+            "primary_used_percent": current_usage.primary_used_percent,
+            "primary_reset_at": current_usage.primary_reset_at,
+            "secondary_used_percent": current_usage.secondary_used_percent,
+            "secondary_reset_at": current_usage.secondary_reset_at,
+            "source": f"profile_usage:{current_usage.source}",
+            "timestamp": current_usage.fetched_at.isoformat(),
+            "note": None,
+        }
+
+    snapshot = latest_rate_limit_snapshot(sessions_dir)
+    if snapshot is not None and rate_limit_snapshot_is_usable(
+        snapshot,
+        state=state,
+        max_age_minutes=max_age_minutes,
+    ):
+        return {
+            "primary_used_percent": snapshot.primary_used_percent,
+            "primary_reset_at": snapshot.primary_resets_at,
+            "secondary_used_percent": snapshot.secondary_used_percent,
+            "secondary_reset_at": snapshot.secondary_resets_at,
+            "source": f"session_snapshot:{snapshot.source_file.name}",
+            "timestamp": snapshot.event_timestamp,
+            "note": None,
+        }
+
+    if snapshot is not None:
+        return {
+            "primary_used_percent": snapshot.primary_used_percent,
+            "primary_reset_at": snapshot.primary_resets_at,
+            "secondary_used_percent": snapshot.secondary_used_percent,
+            "secondary_reset_at": snapshot.secondary_resets_at,
+            "source": f"stale_session_snapshot:{snapshot.source_file.name}",
+            "timestamp": snapshot.event_timestamp,
+            "note": usage_note or "current-account usage unavailable",
+        }
+    return None
 
 
 def fetch_remote_usage_for_payload(payload: dict[str, Any]) -> RemoteUsageSnapshot:
@@ -2581,7 +2747,7 @@ def rank_profiles(
     target_path: Path,
 ) -> list[dict[str, Any]]:
     now = now_local()
-    current_account = current_auth_account_id(target_path)
+    current_account = active_auth_account_id(target_path)
     preferred_next = preferred_next_account_id(state)
     deduped: dict[str, dict[str, Any]] = {}
     for path in discover_all_profiles(source_dir, managed_dir):
@@ -2697,7 +2863,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"no auth profiles found in {args.source_dir} or {args.managed_dir}")
         return 0
 
-    snapshot = latest_rate_limit_snapshot(args.sessions_dir)
+    limits = current_limits_for_display(
+        args.source_dir,
+        args.managed_dir,
+        Path(args.target),
+        args.sessions_dir,
+        state,
+        max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+    )
     current_summary = current_account_summary(Path(args.target), args.source_dir, args.managed_dir)
     current_item = next((item for item in ranked if item["is_current"]), None)
     next_item = next((item for item in ranked if item["available"] and not item["is_current"]), None)
@@ -2717,12 +2890,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("  reset_source: -")
     print("")
     print("Limits")
-    if snapshot is None:
+    if limits is None:
         print("  latest snapshot: not found")
     else:
-        print(f"  5h window: {fmt_percent(snapshot.primary_used_percent)} used, resets in {fmt_timedelta_until(snapshot.primary_resets_at)}")
-        print(f"  weekly window: {fmt_percent(snapshot.secondary_used_percent)} used, resets in {fmt_timedelta_until(snapshot.secondary_resets_at)}")
-        print(f"  snapshot time: {snapshot.event_timestamp or '-'}")
+        print(f"  5h window: {fmt_percent(limits['primary_used_percent'])} used, resets in {fmt_timedelta_until(limits['primary_reset_at'])}")
+        print(f"  weekly window: {fmt_percent(limits['secondary_used_percent'])} used, resets in {fmt_timedelta_until(limits['secondary_reset_at'])}")
+        print(f"  source: {limits['source']}")
+        print(f"  snapshot time: {limits['timestamp'] or '-'}")
+        if limits.get("note"):
+            print(f"  note: {limits['note']}")
     print("")
     print("Next")
     if next_item is None:
@@ -3028,7 +3204,7 @@ def cmd_cooldown(args: argparse.Namespace) -> int:
 
 
 def current_auth_payload(target: Path, root_target: Path) -> tuple[Path, dict[str, Any]]:
-    primary = target if target.exists() else root_target
+    primary = newest_existing_auth_path(target) or (target if target.exists() else root_target)
     if not primary.exists():
         raise SystemExit(f"no current Codex auth found at {target} or {root_target}")
     return primary, read_json(primary)
@@ -3383,6 +3559,8 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     cache_account = current_auth_account_id(cache_auth)
     root_account = current_auth_account_id(root_auth)
+    auth_state = active_auth_file_state(Path(args.target))
+    active_path = auth_state.get("active_path")
     if cache_exists and root_exists:
         if cache_account and root_account and cache_account == root_account:
             report("OK", "auth sync", f"account_id={cache_account}")
@@ -3393,6 +3571,12 @@ def cmd_check(args: argparse.Namespace) -> int:
                 "auth sync",
                 f"cache account={cache_account or '-'} root account={root_account or '-'}",
             )
+    if active_path is not None:
+        report(
+            "OK",
+            "active auth",
+            f"{active_path} account_id={auth_state.get('active_account_id') or '-'}",
+        )
 
     profile_count = len(discover_all_profiles(args.source_dir, args.managed_dir))
     if profile_count > 0:
@@ -3432,18 +3616,27 @@ def cmd_check(args: argparse.Namespace) -> int:
         warnings += 1
         report("WARN", background["kind"], "background service not installed")
 
-    snapshot = latest_rate_limit_snapshot(args.sessions_dir)
     current_summary = current_account_summary(Path(args.target), args.source_dir, args.managed_dir)
-    ranked = rank_profiles(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
+    state_payload = load_state(args.state_path)
+    limits = current_limits_for_display(
+        args.source_dir,
+        args.managed_dir,
+        Path(args.target),
+        args.sessions_dir,
+        state_payload,
+        max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+    )
+    ranked = rank_profiles(args.source_dir, args.managed_dir, state_payload, Path(args.target))
     next_profile = next((item for item in ranked if item["available"] and not item["is_current"]), None)
     recent_event = read_recent_event(args.events_path)
-    preferred_next = preferred_next_account_id(load_state(args.state_path))
+    preferred_next = preferred_next_account_id(state_payload)
 
     print("\nOverview")
     print(f"  current account: {current_summary.email if current_summary else '-'}")
-    if snapshot is not None:
-        print(f"  5h window: {fmt_percent(snapshot.primary_used_percent)} used, resets {fmt_dt(snapshot.primary_resets_at)}")
-        print(f"  weekly window: {fmt_percent(snapshot.secondary_used_percent)} used, resets {fmt_dt(snapshot.secondary_resets_at)}")
+    if limits is not None:
+        print(f"  5h window: {fmt_percent(limits['primary_used_percent'])} used, resets {fmt_dt(limits['primary_reset_at'])}")
+        print(f"  weekly window: {fmt_percent(limits['secondary_used_percent'])} used, resets {fmt_dt(limits['secondary_reset_at'])}")
+        print(f"  limits source: {limits['source']}")
     else:
         print("  latest limits: not found")
     if next_profile is not None:
@@ -3475,7 +3668,15 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     ranked = rank_profiles(args.source_dir, args.managed_dir, state, target_path)
     current_item = next((item for item in ranked if item["is_current"]), None)
     next_item = next((item for item in ranked if item["available"] and not item["is_current"]), None)
-    snapshot = latest_rate_limit_snapshot(args.sessions_dir)
+    limits = current_limits_for_display(
+        args.source_dir,
+        args.managed_dir,
+        target_path,
+        args.sessions_dir,
+        state,
+        max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+    )
+    auth_state = active_auth_file_state(target_path)
     background = background_service_status()
     recent_event = read_recent_event(args.events_path)
 
@@ -3485,17 +3686,22 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     print(f"  account: {current_summary.email if current_summary else '-'}")
     print(f"  profile: {current_summary.path.name if current_summary else '-'}")
     print(f"  account_id: {current_summary.account_id if current_summary else '-'}")
+    print(f"  active auth: {auth_state['active_path'] or '-'}")
+    print(f"  auth sync: {'mismatch' if auth_state['mismatched'] else 'ok'}")
     print(f"  cooldown_until: {fmt_dt(current_item['cooldown_until']) if current_item else '-'}")
     print("")
     print("Limits")
-    if snapshot is None:
+    if limits is None:
         print("  5h window: -")
         print("  weekly window: -")
         print("  last snapshot: not found")
     else:
-        print(f"  5h window: {fmt_percent(snapshot.primary_used_percent)} used, resets in {fmt_timedelta_until(snapshot.primary_resets_at)}")
-        print(f"  weekly window: {fmt_percent(snapshot.secondary_used_percent)} used, resets in {fmt_timedelta_until(snapshot.secondary_resets_at)}")
-        print(f"  last snapshot: {snapshot.event_timestamp or '-'}")
+        print(f"  5h window: {fmt_percent(limits['primary_used_percent'])} used, resets in {fmt_timedelta_until(limits['primary_reset_at'])}")
+        print(f"  weekly window: {fmt_percent(limits['secondary_used_percent'])} used, resets in {fmt_timedelta_until(limits['secondary_reset_at'])}")
+        print(f"  source: {limits['source']}")
+        print(f"  last snapshot: {limits['timestamp'] or '-'}")
+        if limits.get("note"):
+            print(f"  note: {limits['note']}")
     print("")
     print("Rotation")
     print(f"  candidates available: {sum(1 for item in ranked if item['available'])}")
@@ -3921,7 +4127,11 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         refresh_missing_usage=False,
         max_age_minutes=args.usage_max_age_minutes,
     )
-    current_account = current_auth_account_id(Path(args.target))
+    current_account = reconcile_auth_files(
+        Path(args.target),
+        args.events_path,
+        quiet=getattr(args, "daemon_quiet", False),
+    )
     if current_account is None:
         print("no current Codex auth account detected")
         return 1

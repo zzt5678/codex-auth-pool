@@ -51,6 +51,7 @@ when you need an emergency manual switch.
 - Automatically import new `cliproxyapi` accounts into the managed vault and fetch their first real usage snapshot.
 - Query `https://chatgpt.com/backend-api/wham/usage` per account to get real reset windows.
 - Rank accounts using observed reset data instead of only trusting local metadata.
+- Treat `~/.codex/auth.json` and `~/.codex/cache/auth.json` as one active login state; if they drift, the daemon reconciles them before quota checks.
 - Auto-cool down exhausted accounts and switch to the next available one.
 - Restart Codex Desktop automatically after switching on macOS.
 - Before an automatic restart, capture recently active Codex Desktop sessions; after restart, resume those interrupted sessions with `继续`.
@@ -257,6 +258,7 @@ Important paths:
 - macOS supports Codex Desktop restart after switching
 - Ubuntu/Linux supports auth rotation and `systemd --user`; automatic Codex Desktop restart is a no-op there
 - updates both `~/.codex/cache/auth.json` and `~/.codex/auth.json`
+- status and dashboard show the active auth file and whether root/cache auth are in sync
 - keeps local plugin and connector state out of the auth rotation path
 - `apply-best --restart-after-switch` is an immediate manual switch command; use `init --install-launchd` or `launchd-install` for background auto-rotation. Background services restart Codex after switches by default; pass `--no-restart-after-switch` only if you intentionally want auth changes without a Desktop restart.
 - background rotation defaults to preemptive thresholds of `95%` for the 5-hour window and `98%` for the weekly window
