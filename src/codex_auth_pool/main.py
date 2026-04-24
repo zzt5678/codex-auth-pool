@@ -110,9 +110,10 @@ DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 24 * 60 * 60
 DEFAULT_INTERRUPTED_SESSION_MAX_COUNT = 30
 DEFAULT_INTERRUPTED_SESSION_PROMPT = "继续"
 DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT = "继续。如果你刚才只发送了确认文本，现在不要再确认，直接从上次中断点继续实际执行。"
+DEFAULT_RESUME_MODELS = ("gpt-5.4", "gpt-5.4-mini")
 RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
 RESUME_VERIFY_DELAY_SECONDS = 12.0
-RESUME_RETRY_ATTEMPTS = 2
+RESUME_RETRY_ATTEMPTS = len(DEFAULT_RESUME_MODELS)
 
 
 @dataclass
@@ -516,10 +517,20 @@ def recent_resume_verification_summary(events_path: Path) -> dict[str, Any] | No
     event = read_recent_event_of_type(events_path, "interrupted_sessions_resume_verified")
     if event is None:
         return None
+    sessions = event.get("sessions")
+    if not isinstance(sessions, list):
+        sessions = []
+    errors = [
+        str(session.get("error"))
+        for session in sessions
+        if isinstance(session, dict) and session.get("error")
+    ]
     return {
         "timestamp": event.get("timestamp"),
         "session_count": int(event.get("session_count") or 0),
         "active_count": int(event.get("active_count") or 0),
+        "failed_count": max(0, int(event.get("session_count") or 0) - int(event.get("active_count") or 0)),
+        "errors": errors[:3],
     }
 
 
@@ -1549,6 +1560,7 @@ def resume_interrupted_sessions(
         if not pending_sessions:
             break
         attempt_prompt = prompt if attempt == 1 else DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT
+        resume_model = DEFAULT_RESUME_MODELS[min(attempt - 1, len(DEFAULT_RESUME_MODELS) - 1)]
         started: list[dict[str, Any]] = []
         started_processes: list[tuple[dict[str, Any], subprocess.Popen[Any], int]] = []
 
@@ -1566,6 +1578,8 @@ def resume_interrupted_sessions(
                 codex_bin,
                 "exec",
                 "resume",
+                "--model",
+                resume_model,
                 "--skip-git-repo-check",
                 session_id,
                 session_prompt,
@@ -1589,6 +1603,7 @@ def resume_interrupted_sessions(
                 "resume_started_at": now_local().isoformat(),
                 "interrupted_tool_count": raw_session.get("interrupted_tool_count") or 0,
                 "attempt": attempt,
+                "resume_model": resume_model,
             }
             started.append(record)
             started_processes.append((record, process, log_offset))
@@ -1602,6 +1617,7 @@ def resume_interrupted_sessions(
                 snapshot_path=snapshot.get("path"),
                 prompt=attempt_prompt,
                 attempt=attempt,
+                resume_model=resume_model,
                 session_count=len(started),
                 sessions=started,
             )
@@ -1655,12 +1671,27 @@ def _read_log_since(path: Path, offset: int, limit: int = 20000) -> str:
     return data.decode("utf-8", "replace")
 
 
+def _resume_log_error(text: str) -> str | None:
+    error_patterns = (
+        r"stream disconnected before completion: .+",
+        r"The model `[^`]+` does not exist or you do not have access to it\.",
+        r"ERROR: .+",
+        r"error: .+",
+    )
+    for pattern in error_patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        if matches:
+            return str(matches[-1])[:300]
+    return None
+
+
 def _resume_log_has_activity(text: str) -> bool:
+    if _resume_log_error(text):
+        return False
     markers = (
         "\ncodex\n",
         "\nexec\n",
         "\napply patch\n",
-        "\ntokens used\n",
         "task_complete",
         "function_call",
     )
@@ -1689,9 +1720,17 @@ def _rollout_has_activity_since(path: Path, started_at: datetime) -> bool:
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         event_type = event.get("type")
         payload_type = payload.get("type")
-        if event_type == "event_msg" and payload_type in {"task_started", "agent_message", "task_complete", "exec_command_end"}:
+        if event_type == "event_msg" and payload_type == "agent_message":
             return True
-        if event_type == "response_item" and payload_type in {"function_call", "custom_tool_call", "reasoning"}:
+        if (
+            event_type == "event_msg"
+            and payload_type == "task_complete"
+            and payload.get("last_agent_message")
+        ):
+            return True
+        if event_type == "event_msg" and payload_type == "exec_command_end":
+            return True
+        if event_type == "response_item" and payload_type in {"function_call", "custom_tool_call"}:
             return True
     return False
 
@@ -1711,15 +1750,20 @@ def verify_resumed_sessions_started(
         rollout_path = Path(str(record.get("rollout_path") or ""))
         started_at = parse_dt(str(record.get("resume_started_at") or "")) or now_local()
         text = _read_log_since(log_path, log_offset)
-        activity_detected = _rollout_has_activity_since(rollout_path, started_at) or _resume_log_has_activity(text)
+        error_summary = _resume_log_error(text)
+        activity_detected = False if error_summary else (
+            _rollout_has_activity_since(rollout_path, started_at) or _resume_log_has_activity(text)
+        )
         sessions.append(
             {
                 "session_id": record.get("session_id"),
                 "pid": record.get("pid"),
                 "log_path": record.get("log_path"),
                 "rollout_path": record.get("rollout_path"),
+                "resume_model": record.get("resume_model"),
                 "process_status": "running" if process.poll() is None else f"exited:{process.returncode}",
                 "activity_detected": activity_detected,
+                "error": error_summary,
             }
         )
     append_event(
@@ -2961,6 +3005,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         if resume_verification is not None:
             print(f"  resume verified at: {resume_verification['timestamp'] or '-'}")
             print(f"  sessions with activity: {resume_verification['active_count']}/{resume_verification['session_count']}")
+            if resume_verification.get("failed_count"):
+                print(f"  resume failures: {resume_verification['failed_count']}")
+            if resume_verification.get("errors"):
+                print(f"  resume error: {resume_verification['errors'][0]}")
     print("")
     print("Pool")
     for index, item in enumerate(ranked[: min(len(ranked), 8)], start=1):
@@ -3769,6 +3817,10 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         if resume_verification is not None:
             print(f"  resume verified at: {resume_verification['timestamp'] or '-'}")
             print(f"  sessions with activity: {resume_verification['active_count']}/{resume_verification['session_count']}")
+            if resume_verification.get("failed_count"):
+                print(f"  resume failures: {resume_verification['failed_count']}")
+            if resume_verification.get("errors"):
+                print(f"  resume error: {resume_verification['errors'][0]}")
     print("")
     print("Daemon")
     print(f"  kind: {background['kind']}")

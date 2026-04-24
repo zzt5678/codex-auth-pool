@@ -55,6 +55,7 @@ when you need an emergency manual switch.
 - Auto-cool down exhausted accounts and switch to the next available one.
 - Restart Codex Desktop automatically after switching on macOS.
 - Before an automatic restart, capture recently active Codex Desktop sessions; after restart, resume those interrupted sessions with `继续`.
+- Resume uses a stable fallback model (`gpt-5.4`, then `gpt-5.4-mini`) so a session originally created with a model unavailable to the new account can still continue.
 - Background rotation switches and restarts only after a real quota threshold trigger; normal polling does not interrupt your work.
 - Built-in locks and a short automatic-rotation throttle prevent repeated ticks from causing restart loops.
 - Snapshot and restore local Codex plugin, config, and connector cache state.
