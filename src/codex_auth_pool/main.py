@@ -102,8 +102,8 @@ REQUIRED_SOURCE_KEYS = (
     "id_token",
     "account_id",
 )
-DEFAULT_PRIMARY_THRESHOLD = 95.0
-DEFAULT_SECONDARY_THRESHOLD = 98.0
+DEFAULT_PRIMARY_THRESHOLD = 90.0
+DEFAULT_SECONDARY_THRESHOLD = 97.0
 DEFAULT_USAGE_MAX_AGE_MINUTES = 30
 MIN_AUTO_RESTART_INTERVAL_SECONDS = 120
 AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
@@ -3593,6 +3593,56 @@ def choose_best_profile(
     return None
 
 
+def profile_block_reasons(item: dict[str, Any], *, now: datetime | None = None) -> list[str]:
+    now = now or now_local()
+    summary: ProfileSummary = item["summary"]
+    reasons: list[str] = []
+    if summary.disabled:
+        reasons.append("source disabled")
+    expired = parse_dt(summary.expired)
+    if expired is not None and expired <= now:
+        reasons.append(f"auth expired at {fmt_dt(expired)}")
+    cooldown = item.get("cooldown_until")
+    if cooldown is not None and cooldown > now:
+        reason = item.get("cooldown_reason") or "cooldown"
+        reasons.append(f"{reason} until {fmt_dt(cooldown)}")
+    limit_reset = item.get("limit_reset_at")
+    if limit_reset is not None and limit_reset > now:
+        reason = item.get("limit_reason") or "local limit"
+        reasons.append(f"{reason} until {fmt_dt(limit_reset)}")
+    remote_block = item.get("remote_block_until")
+    if remote_block is not None and remote_block > now:
+        reason = item.get("remote_block_reason") or "remote limit"
+        reasons.append(f"{reason} until {fmt_dt(remote_block)}")
+    return reasons or ["available"]
+
+
+def next_unblock_hint(ranked: list[dict[str, Any]], *, exclude_current: bool = True) -> str | None:
+    now = now_local()
+    candidates: list[tuple[datetime, str]] = []
+    for item in ranked:
+        if exclude_current and item.get("is_current"):
+            continue
+        summary: ProfileSummary = item["summary"]
+        expired = parse_dt(summary.expired)
+        if summary.disabled or (expired is not None and expired <= now):
+            continue
+        times = [
+            item.get("cooldown_until"),
+            item.get("limit_reset_at"),
+            item.get("remote_block_until"),
+            expired,
+        ]
+        future_times = [value for value in times if isinstance(value, datetime) and value > now]
+        if future_times:
+            candidates.append((min(future_times), summary.email or summary.account_id))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda entry: entry[0])
+    when, label = candidates[0]
+    return f"{label} may become available at {fmt_dt(when)}"
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     profiles = discover_all_profiles(args.source_dir, args.managed_dir)
     if not profiles:
@@ -3672,6 +3722,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("Next")
     if next_item is None:
         print("  next account: no alternate available account right now")
+        hint = next_unblock_hint(ranked)
+        if hint:
+            print(f"  next unblock: {hint}")
+        blocked = [item for item in ranked if not item["available"] and not item["is_current"]]
+        for item in blocked[:3]:
+            summary = item["summary"]
+            print(f"  blocked: {summary.email or summary.account_id} -> {'; '.join(profile_block_reasons(item))}")
     else:
         summary = next_item["summary"]
         reset_label, reset_source = effective_reset_label_for_profile(summary.path, summary)
@@ -4433,6 +4490,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"  next reset: {reset_label} ({reset_source})")
     else:
         print("  next candidate: none")
+        hint = next_unblock_hint(ranked)
+        if hint:
+            print(f"  next unblock: {hint}")
     print(f"  preferred next: {preferred_next or '-'}")
     if recent_event is not None:
         print(f"  recent event: {recent_event.get('event_type', '-')} at {recent_event.get('timestamp', '-')}")
@@ -4496,6 +4556,13 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     print(f"  preferred next account_id: {preferred_next_account_id(state) or '-'}")
     if next_item is None:
         print("  next account: no alternate available account right now")
+        hint = next_unblock_hint(ranked)
+        if hint:
+            print(f"  next unblock: {hint}")
+        blocked = [item for item in ranked if not item["available"] and not item["is_current"]]
+        for item in blocked[:3]:
+            summary = item["summary"]
+            print(f"  blocked: {summary.email or summary.account_id} -> {'; '.join(profile_block_reasons(item))}")
     else:
         summary = next_item["summary"]
         reset_label, reset_source = effective_reset_label_for_profile(summary.path, summary)
@@ -5059,13 +5126,29 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 args.rotation_trigger_source = trigger_source
                 cmd_apply(args)
             else:
+                ranked_after_cooldown = rank_profiles(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
+                hint = next_unblock_hint(ranked_after_cooldown)
+                blocked_examples = [
+                    {
+                        "account": item["summary"].email or item["summary"].account_id,
+                        "reasons": profile_block_reasons(item),
+                    }
+                    for item in ranked_after_cooldown
+                    if not item["available"] and not item["is_current"]
+                ][:5]
                 append_event(
                     args.events_path,
                     "rotation_blocked",
                     account_id=current_account,
                     reason=triggered_reason,
+                    next_unblock=hint,
+                    blocked_examples=blocked_examples,
                 )
                 print("no alternate available profile to switch to")
+                if hint:
+                    print(f"next unblock: {hint}")
+                for item in blocked_examples[:3]:
+                    print(f"blocked: {item['account']} -> {'; '.join(item['reasons'])}")
         return 0
 
     print(f"no rotation trigger; current account remains active (source={trigger_source})")

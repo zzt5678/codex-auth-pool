@@ -265,7 +265,8 @@ Important paths:
 - status and dashboard show the active auth file and whether root/cache auth are in sync
 - keeps local plugin and connector state out of the auth rotation path
 - `apply-best --restart-after-switch` is an immediate manual switch command; use `init --install-launchd` or `launchd-install` for background auto-rotation. Background services restart Codex after switches by default; pass `--no-restart-after-switch` only if you intentionally want auth changes without a Desktop restart.
-- background rotation defaults to preemptive thresholds of `95%` for the 5-hour window and `98%` for the weekly window
+- background rotation defaults to preemptive thresholds of `90%` for the 5-hour window and `97%` for the weekly window, leaving margin before the account hard-stops
+- when no alternate account is available, `status`, `dashboard`, and daemon events show blocked accounts and the earliest known unblock time
 
 ## Ubuntu Deployment
 

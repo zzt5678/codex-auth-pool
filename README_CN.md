@@ -266,8 +266,10 @@ codex-auth-pool restore-env baseline --restart-codex
 - 插件和连接器状态尽量与 auth 轮换解耦
 - `apply-best --restart-after-switch` 是人工立即切换命令；后台自动切换请使用 `init --install-launchd` 或 `launchd-install`。后台服务默认会在切号后重启 Codex；只有明确需要“只切 auth 不重启”时才加 `--no-restart-after-switch`
 - 后台轮换默认是提前切换：
-  - 5 小时窗口默认阈值 `95%`
-  - 周窗口默认阈值 `98%`
+  - 5 小时窗口默认阈值 `90%`
+  - 周窗口默认阈值 `97%`
+  - 留出余量，避免等到账号完全不可用才切换
+- 如果当前没有可切账号，`status`、`dashboard` 和后台事件会显示被阻塞账号的原因，以及最早可能恢复的时间
 
 ## Ubuntu 部署
 
