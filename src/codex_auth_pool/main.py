@@ -1534,6 +1534,81 @@ def pending_tool_calls_at(session: InterruptedSession, captured_at: datetime) ->
     return list(combined.values())
 
 
+def _message_text_from_payload(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    texts: list[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in {"input_text", "output_text"}:
+                text = str(item.get("text") or "").strip()
+                if text:
+                    texts.append(text)
+    elif isinstance(content, str):
+        text = content.strip()
+        if text:
+            texts.append(text)
+    return "\n".join(texts).strip()
+
+
+def _truncate_context_text(text: str, limit: int = 180) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def recent_rollout_context(session: InterruptedSession, captured_at: datetime, limit: int = 3) -> list[str]:
+    rollout_path = Path(session.rollout_path)
+    if not rollout_path.exists() or not rollout_path.is_file():
+        return []
+    try:
+        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+
+    context_lines: list[str] = []
+    for raw_line in reversed(lines):
+        if len(context_lines) >= limit:
+            break
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_at = parse_dt(str(event.get("timestamp") or ""))
+        if event_at is not None and event_at > captured_at:
+            continue
+        event_type = event.get("type")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        payload_type = payload.get("type")
+        if event_type == "event_msg" and payload_type in {"user_message", "agent_message"}:
+            text = str(payload.get("message") or "").strip()
+            if text:
+                context_lines.append(f"{payload_type}: {_truncate_context_text(text)}")
+        elif event_type == "response_item" and payload_type == "message":
+            role = str(payload.get("role") or "").strip()
+            if role in {"user", "assistant"}:
+                text = _message_text_from_payload(payload)
+                if text:
+                    context_lines.append(f"{role}: {_truncate_context_text(text)}")
+        elif event_type == "response_item" and payload_type == "function_call":
+            summary = _tool_call_summary(payload)
+            if summary is not None:
+                name = str(summary.get("name") or "tool")
+                commands = summary.get("commands")
+                if isinstance(commands, list) and commands:
+                    preview = "; ".join(str(command.get("cmd") or "") for command in commands[:2] if isinstance(command, dict))
+                    if preview:
+                        context_lines.append(f"tool: {name} -> {_truncate_context_text(preview)}")
+                else:
+                    context_lines.append(f"tool: {name}")
+    return list(reversed(context_lines))
+
+
 def session_was_in_progress_at(session: InterruptedSession, captured_at: datetime) -> bool:
     if pending_tool_calls_at(session, captured_at):
         return True
@@ -1655,6 +1730,7 @@ def resume_interrupted_sessions(
     session_recovery_dir.mkdir(parents=True, exist_ok=True)
     all_started: list[dict[str, Any]] = []
     inactive_session_ids: list[str] = []
+    snapshot_captured_at = parse_dt(str(snapshot.get("captured_at") or "")) or now_local()
     state = load_state(state_path) if state_path is not None else {}
     account_id = current_account_id or active_auth_account_id(DEFAULT_CODEX_AUTH_PATH)
     resume_models = select_resume_models(state, account_id)
@@ -1675,7 +1751,7 @@ def resume_interrupted_sessions(
                 cwd = Path.home()
             log_path = session_recovery_dir / f"{session_id}.resume.log"
             log_offset = log_path.stat().st_size if log_path.exists() else 0
-            session_prompt = resume_prompt_for_session(attempt_prompt, raw_session)
+            session_prompt = resume_prompt_for_session(attempt_prompt, raw_session, snapshot_captured_at)
             command = [
                 codex_bin,
                 "exec",
@@ -1961,18 +2037,46 @@ def determine_rotation_trigger(
     return None, None
 
 
-def resume_prompt_for_session(base_prompt: str, raw_session: dict[str, Any]) -> str:
-    return "\n".join(
+def resume_prompt_for_session(
+    base_prompt: str,
+    raw_session: dict[str, Any],
+    captured_at: datetime | None = None,
+) -> str:
+    captured_at = captured_at or parse_dt(str(raw_session.get("captured_at") or "")) or now_local()
+    restartable_count = int(raw_session.get("interrupted_tool_count") or 0)
+    context_lines = recent_rollout_context(
+        InterruptedSession(
+            id=str(raw_session.get("id") or ""),
+            title=str(raw_session.get("title") or ""),
+            cwd=str(raw_session.get("cwd") or ""),
+            source=str(raw_session.get("source") or ""),
+            rollout_path=str(raw_session.get("rollout_path") or ""),
+            updated_at=int(raw_session.get("updated_at") or 0),
+            last_log_at=None,
+            recent_log_count=0,
+        ),
+        captured_at,
+    )
+    lines = [
+        base_prompt,
+        "",
+        "注意：你是被 Codex Desktop 重启打断的原会话。",
+        "请基于本会话已有上下文，继续执行重启前正在进行的任务，不要只回复确认。",
+    ]
+    if context_lines:
+        lines.append("最近上下文：")
+        lines.extend(f"- {line}" for line in context_lines[-3:])
+    if restartable_count == 0:
+        lines.append("当前没有待恢复工具调用，但你仍然需要依据最近上下文继续任务。")
+    else:
+        lines.append(f"当前有 {restartable_count} 个待恢复工具调用，优先接着它们继续。")
+    lines.extend(
         [
-            base_prompt,
-            "",
-            "注意：你是被 Codex Desktop 重启打断的原会话。",
-            "请基于本会话已有上下文，继续执行重启前正在进行的任务。",
-            "先给用户一条非常简短的可见反馈，说明你正从哪个中断点继续、接下来立刻做什么；然后马上继续实际执行。",
-            "不要只确认收到，也不要停下来等待用户；发完这条简短反馈后，请立即检查中断点并继续实际执行，直到任务完成或遇到明确阻塞。",
+            "先给用户一条非常简短的可见反馈，说明你从哪个中断点继续、接下来立刻做什么；然后马上继续实际执行。",
             "不要把任务交给恢复器或其他会话接手；如有工具、终端命令或后台任务被打断，由你在本会话上下文中自行判断并继续。",
         ]
-    ).strip()
+    )
+    return "\n".join(lines).strip()
 
 
 def record_session_only_recovery(snapshot: dict[str, Any], events_path: Path | None) -> None:
