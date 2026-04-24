@@ -1177,13 +1177,46 @@ def _json_payload_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
     )
 
 
-def reconcile_auth_files(target_path: Path, events_path: Path | None = None, *, quiet: bool = False) -> str | None:
+def _account_auth_expired_in_state(state: dict[str, Any], account_id: str | None) -> bool:
+    if not account_id:
+        return False
+    record = profile_record(state, account_id)
+    if record.get("cooldown_reason") != "auth_token_expired":
+        return False
+    cooldown_until = parse_dt(record.get("cooldown_until"))
+    return cooldown_until is not None and cooldown_until > now_local()
+
+
+def _best_auth_sync_source(target_path: Path, state_path: Path | None = None) -> Path | None:
+    candidates = [
+        path
+        for path in auth_target_paths(target_path)
+        if path.exists() and current_auth_account_id(path)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: file_mtime(path) or 0, reverse=True)
+    state = load_state(state_path) if state_path is not None else {}
+    for path in candidates:
+        account_id = current_auth_account_id(path)
+        if not _account_auth_expired_in_state(state, account_id):
+            return path
+    return candidates[0]
+
+
+def reconcile_auth_files(
+    target_path: Path,
+    events_path: Path | None = None,
+    *,
+    quiet: bool = False,
+    state_path: Path | None = None,
+) -> str | None:
     """Keep Codex's root and cache auth files on the same account.
 
     Codex Desktop versions have used both ~/.codex/auth.json and
     ~/.codex/cache/auth.json. Rotation must not trust only one of them.
     """
-    active_path = newest_existing_auth_path(target_path)
+    active_path = _best_auth_sync_source(target_path, state_path)
     if active_path is None:
         return None
     payload = read_json(active_path)
@@ -4585,6 +4618,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         Path(args.target),
         args.events_path,
         quiet=getattr(args, "daemon_quiet", False),
+        state_path=args.state_path,
     )
     if current_account is None:
         print("no current Codex auth account detected")
