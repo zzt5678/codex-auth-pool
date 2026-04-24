@@ -3204,12 +3204,33 @@ def usage_error_blocks_current_account(error: str | None) -> bool:
     return "token_expired" in lowered or "http 401" in lowered or "authentication token is expired" in lowered
 
 
+def clear_auth_token_expired_cooldown(state_path: Path, account_id: str | None, events_path: Path | None = None) -> bool:
+    if not account_id:
+        return False
+    state = load_state(state_path)
+    record = profile_record(state, account_id)
+    if record.get("cooldown_reason") != "auth_token_expired":
+        return False
+    record.pop("cooldown_until", None)
+    record.pop("cooldown_reason", None)
+    save_state(state_path, state)
+    if events_path is not None:
+        append_event(
+            events_path,
+            "auth_token_expired_cooldown_cleared",
+            account_id=account_id,
+            reason="usage_refresh_succeeded",
+        )
+    return True
+
+
 def refresh_current_account_usage(args: argparse.Namespace, current_account: str) -> str | None:
     path = profile_path_for_account_usage(args.source_dir, args.managed_dir, current_account)
     if path is None:
         return "current profile not found in pool"
     try:
         refresh_profile_usage(path)
+        clear_auth_token_expired_cooldown(args.state_path, current_account, args.events_path)
         append_event(
             args.events_path,
             "refresh_current_usage",
@@ -4282,6 +4303,12 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
             continue
         try:
             meta = refresh_profile_usage(path)
+            refreshed_summary = summarize_profile(path)
+            clear_auth_token_expired_cooldown(
+                getattr(args, "state_path", DEFAULT_STATE_PATH),
+                refreshed_summary.account_id,
+                getattr(args, "events_path", None),
+            )
             refreshed += 1
             if not quiet:
                 print(
