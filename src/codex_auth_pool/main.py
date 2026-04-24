@@ -113,7 +113,7 @@ DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT = "继续。如果你刚才只发送了
 DEFAULT_RESUME_MODEL_CANDIDATES = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 RESUME_MODEL_NEGATIVE_CACHE_SECONDS = 24 * 60 * 60
 RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
-RESUME_VERIFY_DELAY_SECONDS = 12.0
+RESUME_VERIFY_DELAY_SECONDS = 60.0
 
 
 @dataclass
@@ -627,7 +627,13 @@ def recent_resume_verification_summary(events_path: Path) -> dict[str, Any] | No
         "timestamp": event.get("timestamp"),
         "session_count": int(event.get("session_count") or 0),
         "active_count": int(event.get("active_count") or 0),
-        "failed_count": max(0, int(event.get("session_count") or 0) - int(event.get("active_count") or 0)),
+        "pending_count": int(event.get("pending_count") or 0),
+        "failed_count": max(
+            0,
+            int(event.get("session_count") or 0)
+            - int(event.get("active_count") or 0)
+            - int(event.get("pending_count") or 0),
+        ),
         "errors": errors[:3],
     }
 
@@ -1730,6 +1736,7 @@ def resume_interrupted_sessions(
     session_recovery_dir.mkdir(parents=True, exist_ok=True)
     all_started: list[dict[str, Any]] = []
     inactive_session_ids: list[str] = []
+    pending_running_session_ids: list[str] = []
     snapshot_captured_at = parse_dt(str(snapshot.get("captured_at") or "")) or now_local()
     state = load_state(state_path) if state_path is not None else {}
     account_id = current_account_id or active_auth_account_id(DEFAULT_CODEX_AUTH_PATH)
@@ -1807,7 +1814,21 @@ def resume_interrupted_sessions(
                 attempt=attempt,
             )
 
-        if verified_sessions:
+        retry_session_ids: list[str] = []
+        pending_running_session_ids = []
+        for session in verified_sessions:
+            if session.get("activity_detected"):
+                continue
+            session_id = str(session.get("session_id") or "")
+            if not session_id:
+                continue
+            process_status = str(session.get("process_status") or "")
+            if session.get("error") or process_status.startswith("exited:"):
+                retry_session_ids.append(session_id)
+            elif process_status == "running":
+                pending_running_session_ids.append(session_id)
+
+        if verified_sessions and not pending_running_session_ids:
             attempt_ok = all(bool(session.get("activity_detected")) for session in verified_sessions)
             first_error = next(
                 (str(session.get("error")) for session in verified_sessions if session.get("error")),
@@ -1822,11 +1843,19 @@ def resume_interrupted_sessions(
                 events_path=events_path,
             )
 
-        inactive_session_ids = [
-            str(session.get("session_id") or "")
-            for session in verified_sessions
-            if not session.get("activity_detected")
-        ]
+        if events_path is not None and pending_running_session_ids:
+            append_event(
+                events_path,
+                "interrupted_sessions_resume_pending",
+                snapshot_path=snapshot.get("path"),
+                attempt=attempt,
+                resume_model=resume_model,
+                session_count=len(pending_running_session_ids),
+                session_ids=pending_running_session_ids,
+                reason="resume_process_still_running_without_detected_activity",
+            )
+
+        inactive_session_ids = retry_session_ids
         if not inactive_session_ids:
             break
         inactive_session_id_set = set(inactive_session_ids)
@@ -1979,7 +2008,12 @@ def verify_resumed_sessions_started(
     deadline = time.monotonic() + RESUME_VERIFY_DELAY_SECONDS
     sessions = collect()
     while time.monotonic() < deadline:
-        if sessions and all(session.get("activity_detected") or session.get("error") for session in sessions):
+        if sessions and all(
+            session.get("activity_detected")
+            or session.get("error")
+            or str(session.get("process_status") or "").startswith("exited:")
+            for session in sessions
+        ):
             break
         time.sleep(1.0)
         sessions = collect()
@@ -1989,6 +2023,13 @@ def verify_resumed_sessions_started(
         attempt=attempt,
         session_count=len(sessions),
         active_count=sum(1 for session in sessions if session["activity_detected"]),
+        pending_count=sum(
+            1
+            for session in sessions
+            if not session["activity_detected"]
+            and session.get("process_status") == "running"
+            and not session.get("error")
+        ),
         sessions=sessions,
     )
     return sessions
@@ -3263,6 +3304,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if resume_verification is not None:
             print(f"  resume verified at: {resume_verification['timestamp'] or '-'}")
             print(f"  sessions with activity: {resume_verification['active_count']}/{resume_verification['session_count']}")
+            if resume_verification.get("pending_count"):
+                print(f"  resume still running: {resume_verification['pending_count']}")
             if resume_verification.get("failed_count"):
                 print(f"  resume failures: {resume_verification['failed_count']}")
             if resume_verification.get("errors"):
@@ -4077,6 +4120,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         if resume_verification is not None:
             print(f"  resume verified at: {resume_verification['timestamp'] or '-'}")
             print(f"  sessions with activity: {resume_verification['active_count']}/{resume_verification['session_count']}")
+            if resume_verification.get("pending_count"):
+                print(f"  resume still running: {resume_verification['pending_count']}")
             if resume_verification.get("failed_count"):
                 print(f"  resume failures: {resume_verification['failed_count']}")
             if resume_verification.get("errors"):
