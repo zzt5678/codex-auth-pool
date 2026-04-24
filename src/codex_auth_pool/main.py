@@ -2431,6 +2431,7 @@ def launchctl_status(label: str) -> dict[str, Any]:
         "plist_path": str(plist_path),
         "installed": plist_path.exists(),
         "loaded": False,
+        "disabled": None,
         "state": None,
         "pid": None,
         "program_arguments": [],
@@ -2453,6 +2454,16 @@ def launchctl_status(label: str) -> dict[str, Any]:
             pass
     if not is_macos():
         return status
+    disabled = run_command(["launchctl", "print-disabled", launchctl_domain()])
+    if disabled.returncode == 0:
+        for raw_line in disabled.stdout.splitlines():
+            line = raw_line.strip()
+            if f'"{label}" => disabled' in line:
+                status["disabled"] = True
+                break
+            if f'"{label}" => enabled' in line:
+                status["disabled"] = False
+                break
     completed = run_command(["launchctl", "print", launchctl_target(label)])
     if completed.returncode != 0:
         return status
@@ -4860,6 +4871,7 @@ def cmd_launchd_status(args: argparse.Namespace) -> int:
     print(f"  label: {status['label']}")
     print(f"  installed: {'yes' if status['installed'] else 'no'}")
     print(f"  loaded: {'yes' if status['loaded'] else 'no'}")
+    print(f"  disabled: {'yes' if status.get('disabled') else 'no' if status.get('disabled') is False else '-'}")
     print(f"  state: {status['state'] or '-'}")
     print(f"  pid: {status['pid'] or '-'}")
     print(f"  plist: {status['plist_path']}")

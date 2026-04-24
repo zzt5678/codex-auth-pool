@@ -21,6 +21,11 @@ restart_background_service_if_present() {
   if [[ "${OS_NAME}" == "Darwin" ]]; then
     local plist="${HOME}/Library/LaunchAgents/ai.codex.auth.pool.plist"
     if [[ -f "${plist}" ]] && command -v launchctl >/dev/null 2>&1; then
+      if launchctl print-disabled "gui/$(id -u)" 2>/dev/null | grep -q '"ai.codex.auth.pool" => disabled'; then
+        echo "[codex-auth-pool] Existing launchd agent is disabled; leaving it stopped."
+        echo "[codex-auth-pool] Re-enable manually with: launchctl enable gui/$(id -u)/ai.codex.auth.pool"
+        return
+      fi
       if launchctl kickstart -k "gui/$(id -u)/ai.codex.auth.pool" >/dev/null 2>&1; then
         echo "[codex-auth-pool] Reloaded existing launchd agent: ai.codex.auth.pool"
       elif launchctl bootout "gui/$(id -u)/ai.codex.auth.pool" >/dev/null 2>&1 || true; launchctl bootstrap "gui/$(id -u)" "${plist}" >/dev/null 2>&1; then
