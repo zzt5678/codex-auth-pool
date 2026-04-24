@@ -110,10 +110,10 @@ DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 24 * 60 * 60
 DEFAULT_INTERRUPTED_SESSION_MAX_COUNT = 30
 DEFAULT_INTERRUPTED_SESSION_PROMPT = "继续"
 DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT = "继续。如果你刚才只发送了确认文本，现在不要再确认，直接从上次中断点继续实际执行。"
-DEFAULT_RESUME_MODELS = ("gpt-5.4", "gpt-5.4-mini")
+DEFAULT_RESUME_MODEL_CANDIDATES = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
+RESUME_MODEL_NEGATIVE_CACHE_SECONDS = 24 * 60 * 60
 RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
 RESUME_VERIFY_DELAY_SECONDS = 12.0
-RESUME_RETRY_ATTEMPTS = len(DEFAULT_RESUME_MODELS)
 
 
 @dataclass
@@ -227,6 +227,102 @@ def load_state(path: Path) -> dict[str, Any]:
 
 def save_state(path: Path, payload: dict[str, Any]) -> None:
     write_json(path, payload)
+
+
+def _resume_model_error_is_cacheable(error: str | None) -> bool:
+    if not error:
+        return False
+    lowered = error.lower()
+    return (
+        "does not exist" in lowered
+        or "do not have access" in lowered
+        or "unknown model" in lowered
+        or "model access" in lowered
+    )
+
+
+def resume_model_cache_entry(state: dict[str, Any], account_id: str, model: str) -> dict[str, Any] | None:
+    cache = state.get("resume_model_cache")
+    if not isinstance(cache, dict):
+        return None
+    account_cache = cache.get(account_id)
+    if not isinstance(account_cache, dict):
+        return None
+    entry = account_cache.get(model)
+    return entry if isinstance(entry, dict) else None
+
+
+def resume_model_recently_failed(
+    state: dict[str, Any],
+    account_id: str | None,
+    model: str,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if not account_id:
+        return False
+    entry = resume_model_cache_entry(state, account_id, model)
+    if not entry or entry.get("ok") is not False:
+        return False
+    error = str(entry.get("error") or "")
+    if not _resume_model_error_is_cacheable(error):
+        return False
+    checked_at = parse_dt(str(entry.get("checked_at") or ""))
+    if checked_at is None:
+        return False
+    return ((now or now_local()) - checked_at).total_seconds() < RESUME_MODEL_NEGATIVE_CACHE_SECONDS
+
+
+def select_resume_models(state: dict[str, Any], account_id: str | None) -> list[str]:
+    selected: list[str] = []
+    now = now_local()
+    for model in DEFAULT_RESUME_MODEL_CANDIDATES:
+        if resume_model_recently_failed(state, account_id, model, now=now):
+            continue
+        selected.append(model)
+    if not selected:
+        # Keep recovery available even if all candidates were marked failed.
+        return list(DEFAULT_RESUME_MODEL_CANDIDATES[-2:])
+    return selected
+
+
+def record_resume_model_result(
+    state_path: Path | None,
+    *,
+    account_id: str | None,
+    model: str,
+    ok: bool,
+    error: str | None,
+    events_path: Path | None,
+) -> None:
+    if state_path is None or not account_id:
+        return
+    if not ok and not _resume_model_error_is_cacheable(error):
+        return
+    state = load_state(state_path)
+    cache = state.setdefault("resume_model_cache", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        state["resume_model_cache"] = cache
+    account_cache = cache.setdefault(account_id, {})
+    if not isinstance(account_cache, dict):
+        account_cache = {}
+        cache[account_id] = account_cache
+    account_cache[model] = {
+        "ok": ok,
+        "checked_at": now_local().isoformat(),
+        "error": error,
+    }
+    save_state(state_path, state)
+    if events_path is not None:
+        append_event(
+            events_path,
+            "resume_model_cache_updated",
+            account_id=account_id,
+            model=model,
+            ok=ok,
+            error=error,
+        )
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -489,6 +585,8 @@ def recent_resumed_sessions_summary(events_path: Path, limit: int = 3) -> dict[s
         "session_count": int(event.get("session_count") or len(sessions)),
         "titles": titles,
         "snapshot_path": event.get("snapshot_path"),
+        "resume_model": event.get("resume_model"),
+        "account_id": event.get("account_id"),
     }
 
 
@@ -1538,6 +1636,8 @@ def resume_interrupted_sessions(
     prompt: str,
     session_recovery_dir: Path,
     events_path: Path | None,
+    state_path: Path | None = None,
+    current_account_id: str | None = None,
 ) -> list[dict[str, Any]]:
     codex_bin = shutil_lib.which("codex")
     sessions = snapshot.get("sessions", [])
@@ -1555,12 +1655,14 @@ def resume_interrupted_sessions(
     session_recovery_dir.mkdir(parents=True, exist_ok=True)
     all_started: list[dict[str, Any]] = []
     inactive_session_ids: list[str] = []
+    state = load_state(state_path) if state_path is not None else {}
+    account_id = current_account_id or active_auth_account_id(DEFAULT_CODEX_AUTH_PATH)
+    resume_models = select_resume_models(state, account_id)
 
-    for attempt in range(1, RESUME_RETRY_ATTEMPTS + 1):
+    for attempt, resume_model in enumerate(resume_models, start=1):
         if not pending_sessions:
             break
         attempt_prompt = prompt if attempt == 1 else DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT
-        resume_model = DEFAULT_RESUME_MODELS[min(attempt - 1, len(DEFAULT_RESUME_MODELS) - 1)]
         started: list[dict[str, Any]] = []
         started_processes: list[tuple[dict[str, Any], subprocess.Popen[Any], int]] = []
 
@@ -1604,6 +1706,7 @@ def resume_interrupted_sessions(
                 "interrupted_tool_count": raw_session.get("interrupted_tool_count") or 0,
                 "attempt": attempt,
                 "resume_model": resume_model,
+                "account_id": account_id,
             }
             started.append(record)
             started_processes.append((record, process, log_offset))
@@ -1618,6 +1721,7 @@ def resume_interrupted_sessions(
                 prompt=attempt_prompt,
                 attempt=attempt,
                 resume_model=resume_model,
+                account_id=account_id,
                 session_count=len(started),
                 sessions=started,
             )
@@ -1627,6 +1731,21 @@ def resume_interrupted_sessions(
                 attempt=attempt,
             )
 
+        if verified_sessions:
+            attempt_ok = all(bool(session.get("activity_detected")) for session in verified_sessions)
+            first_error = next(
+                (str(session.get("error")) for session in verified_sessions if session.get("error")),
+                None,
+            )
+            record_resume_model_result(
+                state_path,
+                account_id=account_id,
+                model=resume_model,
+                ok=attempt_ok,
+                error=first_error,
+                events_path=events_path,
+            )
+
         inactive_session_ids = [
             str(session.get("session_id") or "")
             for session in verified_sessions
@@ -1634,16 +1753,28 @@ def resume_interrupted_sessions(
         ]
         if not inactive_session_ids:
             break
-        if events_path is not None and attempt < RESUME_RETRY_ATTEMPTS:
+        inactive_session_id_set = set(inactive_session_ids)
+        for record, process, _log_offset in started_processes:
+            if str(record.get("session_id") or "") not in inactive_session_id_set:
+                continue
+            if process.poll() is not None:
+                continue
+            process.terminate()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        if events_path is not None and attempt < len(resume_models):
             append_event(
                 events_path,
                 "interrupted_sessions_resume_retry_scheduled",
                 snapshot_path=snapshot.get("path"),
                 next_attempt=attempt + 1,
+                failed_model=resume_model,
+                next_model=resume_models[attempt],
                 session_count=len(inactive_session_ids),
                 session_ids=inactive_session_ids,
             )
-        inactive_session_id_set = set(inactive_session_ids)
         pending_sessions = [
             session
             for session in pending_sessions
@@ -1743,29 +1874,39 @@ def verify_resumed_sessions_started(
 ) -> list[dict[str, Any]]:
     if not started_processes:
         return []
-    time.sleep(RESUME_VERIFY_DELAY_SECONDS)
-    sessions: list[dict[str, Any]] = []
-    for record, process, log_offset in started_processes:
-        log_path = Path(str(record.get("log_path") or ""))
-        rollout_path = Path(str(record.get("rollout_path") or ""))
-        started_at = parse_dt(str(record.get("resume_started_at") or "")) or now_local()
-        text = _read_log_since(log_path, log_offset)
-        error_summary = _resume_log_error(text)
-        activity_detected = False if error_summary else (
-            _rollout_has_activity_since(rollout_path, started_at) or _resume_log_has_activity(text)
-        )
-        sessions.append(
-            {
-                "session_id": record.get("session_id"),
-                "pid": record.get("pid"),
-                "log_path": record.get("log_path"),
-                "rollout_path": record.get("rollout_path"),
-                "resume_model": record.get("resume_model"),
-                "process_status": "running" if process.poll() is None else f"exited:{process.returncode}",
-                "activity_detected": activity_detected,
-                "error": error_summary,
-            }
-        )
+
+    def collect() -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        for record, process, log_offset in started_processes:
+            log_path = Path(str(record.get("log_path") or ""))
+            rollout_path = Path(str(record.get("rollout_path") or ""))
+            started_at = parse_dt(str(record.get("resume_started_at") or "")) or now_local()
+            text = _read_log_since(log_path, log_offset)
+            error_summary = _resume_log_error(text)
+            activity_detected = False if error_summary else (
+                _rollout_has_activity_since(rollout_path, started_at) or _resume_log_has_activity(text)
+            )
+            collected.append(
+                {
+                    "session_id": record.get("session_id"),
+                    "pid": record.get("pid"),
+                    "log_path": record.get("log_path"),
+                    "rollout_path": record.get("rollout_path"),
+                    "resume_model": record.get("resume_model"),
+                    "process_status": "running" if process.poll() is None else f"exited:{process.returncode}",
+                    "activity_detected": activity_detected,
+                    "error": error_summary,
+                }
+            )
+        return collected
+
+    deadline = time.monotonic() + RESUME_VERIFY_DELAY_SECONDS
+    sessions = collect()
+    while time.monotonic() < deadline:
+        if sessions and all(session.get("activity_detected") or session.get("error") for session in sessions):
+            break
+        time.sleep(1.0)
+        sessions = collect()
     append_event(
         events_path,
         "interrupted_sessions_resume_verified",
@@ -1860,6 +2001,8 @@ def restart_codex_app(
     session_max_count: int = DEFAULT_INTERRUPTED_SESSION_MAX_COUNT,
     resume_prompt: str = DEFAULT_INTERRUPTED_SESSION_PROMPT,
     events_path: Path | None = None,
+    state_path: Path | None = None,
+    current_account_id: str | None = None,
 ) -> bool:
     if not is_macos():
         print(
@@ -1898,6 +2041,8 @@ def restart_codex_app(
             prompt=resume_prompt,
             session_recovery_dir=session_recovery_dir,
             events_path=events_path,
+            state_path=state_path,
+            current_account_id=current_account_id,
         )
     return True
 
@@ -2480,10 +2625,17 @@ def profile_path_for_account_usage(source_dir: Path, managed_dir: Path, account_
     return matches[0].path
 
 
-def refresh_current_account_usage(args: argparse.Namespace, current_account: str) -> bool:
+def usage_error_blocks_current_account(error: str | None) -> bool:
+    if not error:
+        return False
+    lowered = error.lower()
+    return "token_expired" in lowered or "http 401" in lowered or "authentication token is expired" in lowered
+
+
+def refresh_current_account_usage(args: argparse.Namespace, current_account: str) -> str | None:
     path = profile_path_for_account_usage(args.source_dir, args.managed_dir, current_account)
     if path is None:
-        return False
+        return "current profile not found in pool"
     try:
         refresh_profile_usage(path)
         append_event(
@@ -2495,23 +2647,24 @@ def refresh_current_account_usage(args: argparse.Namespace, current_account: str
         )
         if not getattr(args, "daemon_quiet", False):
             print(f"refreshed current account usage: {path.name}")
-        return True
+        return None
     except SystemExit as exc:
+        error = str(exc)
         update_profile_metadata(
             path,
             usage_error_checked_at=now_local().isoformat(),
-            usage_error=str(exc)[:300],
+            usage_error=error[:300],
         )
         append_event(
             args.events_path,
             "refresh_current_usage_failed",
             profile=str(path),
             account_id=current_account,
-            error=str(exc)[:300],
+            error=error[:300],
         )
         if not getattr(args, "daemon_quiet", False):
             print(f"current account usage refresh failed: {exc}")
-        return False
+        return error
 
 
 def current_profile_usage_snapshot(
@@ -3001,6 +3154,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if recovery is not None:
             print(f"  resumed at: {recovery['timestamp'] or '-'}")
             print(f"  resumed sessions: {recovery['session_count']}")
+            print(f"  resume model: {recovery.get('resume_model') or '-'}")
             print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
         if resume_verification is not None:
             print(f"  resume verified at: {resume_verification['timestamp'] or '-'}")
@@ -3154,6 +3308,8 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
             codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
             session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
             events_path=getattr(args, "events_path", None),
+            state_path=getattr(args, "state_path", None),
+            current_account_id=normalized.get("account_id"),
         ):
             restart_performed = True
             state["last_restart_at"] = restart_now.isoformat()
@@ -3821,6 +3977,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 print(f"  resume failures: {resume_verification['failed_count']}")
             if resume_verification.get("errors"):
                 print(f"  resume error: {resume_verification['errors'][0]}")
+    resume_account_id = current_summary.account_id if current_summary else active_auth_account_id(target_path)
+    print(f"  model order: {', '.join(select_resume_models(state, resume_account_id))}")
     print("")
     print("Daemon")
     print(f"  kind: {background['kind']}")
@@ -4143,6 +4301,7 @@ def cmd_restore_env(args: argparse.Namespace) -> int:
             codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
             session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
             events_path=getattr(args, "events_path", None),
+            state_path=getattr(args, "state_path", None),
         ):
             print(f"restarted Codex app {args.app_path}")
     else:
@@ -4188,8 +4347,9 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         print("no current Codex auth account detected")
         return 1
 
+    current_usage_refresh_error = None
     if getattr(args, "refresh_usage", False):
-        refresh_current_account_usage(args, current_account)
+        current_usage_refresh_error = refresh_current_account_usage(args, current_account)
 
     if getattr(args, "refresh_usage", False):
         refresh_args = argparse.Namespace(
@@ -4217,8 +4377,14 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
     trigger_secondary_used = None
     trigger_secondary_reset = None
     trigger_source = None
+    forced_trigger_reason = None
+    forced_trigger_until = None
 
-    if current_usage is not None:
+    if usage_error_blocks_current_account(current_usage_refresh_error):
+        forced_trigger_reason = "auth_token_expired"
+        forced_trigger_until = now_local() + timedelta(hours=24)
+        trigger_source = "current_usage_refresh_error"
+    elif current_usage is not None:
         trigger_primary_used = current_usage.primary_used_percent
         trigger_primary_reset = current_usage.primary_reset_at
         trigger_secondary_used = current_usage.secondary_used_percent
@@ -4239,15 +4405,18 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         print(f"no safe rotation signal; skipping auto-rotation ({note})")
         return 0
 
-    triggered_reason, triggered_until = determine_rotation_trigger(
-        current_usage,
-        primary_used_percent=trigger_primary_used,
-        primary_reset_at=trigger_primary_reset,
-        secondary_used_percent=trigger_secondary_used,
-        secondary_reset_at=trigger_secondary_reset,
-        primary_threshold=args.primary_threshold,
-        secondary_threshold=args.secondary_threshold,
-    )
+    if forced_trigger_reason and forced_trigger_until:
+        triggered_reason, triggered_until = forced_trigger_reason, forced_trigger_until
+    else:
+        triggered_reason, triggered_until = determine_rotation_trigger(
+            current_usage,
+            primary_used_percent=trigger_primary_used,
+            primary_reset_at=trigger_primary_reset,
+            secondary_used_percent=trigger_secondary_used,
+            secondary_reset_at=trigger_secondary_reset,
+            primary_threshold=args.primary_threshold,
+            secondary_threshold=args.secondary_threshold,
+        )
 
     if triggered_reason and triggered_until:
         if getattr(args, "dry_run", False):
@@ -4324,6 +4493,7 @@ def cmd_restart_codex(args: argparse.Namespace) -> int:
         codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
         session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
         events_path=getattr(args, "events_path", None),
+        state_path=getattr(args, "state_path", None),
     )
     mode = "graceful" if args.graceful_restart else "hard"
     if restarted:

@@ -53,9 +53,11 @@ when you need an emergency manual switch.
 - Rank accounts using observed reset data instead of only trusting local metadata.
 - Treat `~/.codex/auth.json` and `~/.codex/cache/auth.json` as one active login state; if they drift, the daemon reconciles them before quota checks.
 - Auto-cool down exhausted accounts and switch to the next available one.
+- Treat an expired current auth token (`HTTP 401 token_expired`) as an unusable account and rotate away instead of trusting stale quota snapshots.
 - Restart Codex Desktop automatically after switching on macOS.
 - Before an automatic restart, capture recently active Codex Desktop sessions; after restart, resume those interrupted sessions with `继续`.
-- Resume uses a stable fallback model (`gpt-5.4`, then `gpt-5.4-mini`) so a session originally created with a model unavailable to the new account can still continue.
+- Resume prefers `gpt-5.5` when the current account's CLI resume path has not recently failed, then falls back to `gpt-5.4` and `gpt-5.4-mini`.
+- Per-account resume model failures are cached for 24 hours, so a model that is visible in Codex Desktop but unavailable to `codex exec resume` will not repeatedly stall recovery.
 - Background rotation switches and restarts only after a real quota threshold trigger; normal polling does not interrupt your work.
 - Built-in locks and a short automatic-rotation throttle prevent repeated ticks from causing restart loops.
 - Snapshot and restore local Codex plugin, config, and connector cache state.
@@ -127,6 +129,7 @@ This is the main command most people will care about. It shows:
 - next account in line
 - whether the reset time is `observed` or just local metadata
 - whether new `cliproxyapi` accounts were auto-imported and observed
+- the resume model order currently used for interrupted-session recovery
 - launchd daemon health
 
 New `cliproxyapi` Codex accounts do not require a manual `sync-cliproxy`.
@@ -156,6 +159,7 @@ Background services installed with `launchd-install`, `systemd-install`, `setup 
 
 - before quitting Codex Desktop, it captures recently active Desktop sessions from `~/.codex/state_5.sqlite` and `~/.codex/logs_2.sqlite`
 - after Codex Desktop comes back up, it starts `codex exec resume <session_id> 继续` for each captured session in the background
+- it tries `gpt-5.5`, `gpt-5.4`, then `gpt-5.4-mini`; if a model fails with an access/model error, that failure is cached per account for 24 hours
 - recovery snapshots and resume logs are written under `~/.codex-auth-pool/session-recovery/`
 
 If you only want the restart without auto-resuming interrupted sessions:

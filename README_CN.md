@@ -53,9 +53,11 @@
 - 排序时优先使用真实观测值，而不是只依赖本地元数据。
 - 把 `~/.codex/auth.json` 和 `~/.codex/cache/auth.json` 视为同一个有效登录态；如果两者漂移，后台守护会先自动对齐，再判断额度。
 - 账号额度触顶后自动冷却，并切换到下一个可用账号。
+- 当前账号 auth token 过期时（`HTTP 401 token_expired`），会视为账号不可用并自动切走，不再继续相信旧额度快照。
 - macOS 上切换后可自动重启 Codex Desktop。
 - 自动重启前会记录最近活跃的 Codex Desktop 会话，重启后对这些被打断的会话发送 `继续`。
-- 恢复会话时使用稳定兜底模型（先 `gpt-5.4`，再 `gpt-5.4-mini`），避免原会话模型在新账号上无权限导致“发了继续但没有反应”。
+- 恢复会话时会优先尝试当前账号在 CLI 恢复路径可用的 `gpt-5.5`，然后兜底到 `gpt-5.4` 和 `gpt-5.4-mini`。
+- 每个账号的恢复模型失败会缓存 24 小时，避免 App 里能看到但 `codex exec resume` 无权限的模型反复卡住恢复流程。
 - 后台守护只有在真实额度触发阈值时才会切换和重启；普通轮询不会打断当前工作。
 - 内置防重入锁和短时间自动轮换节流，避免重复 tick 导致连续切号/重启。
 - 支持快照和恢复本地插件、配置、连接器缓存状态。
@@ -127,6 +129,7 @@ codex-auth-pool dashboard
 - 下一个准备切换的账号
 - 这个重置时间是不是 `observed`
 - 是否自动导入并观测到了新的 `cliproxyapi` 账号
+- 当前被打断会话恢复时会按什么模型顺序尝试
 - 后台守护是否正常运行
 
 新加入的 `cliproxyapi` Codex 账号不需要手动执行 `sync-cliproxy`。
@@ -156,6 +159,7 @@ codex-auth-pool events --limit 10
 
 - 重启 Codex Desktop 前，从 `~/.codex/state_5.sqlite` 和 `~/.codex/logs_2.sqlite` 捕获最近活跃的 Desktop 会话
 - Codex Desktop 重新启动后，后台执行 `codex exec resume <session_id> 继续`
+- 恢复模型按 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini` 依次尝试；如果某个模型返回无权限或模型不存在，会按账号缓存 24 小时并跳过
 - 会话快照和恢复日志保存在 `~/.codex-auth-pool/session-recovery/`
 
 如果你只想自动重启，不想自动对会话发送 `继续`：
