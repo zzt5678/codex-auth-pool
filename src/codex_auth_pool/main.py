@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 import time
 import plistlib
+import select
 
 try:
     import fcntl
@@ -172,6 +173,7 @@ class InterruptedSession:
     title: str
     cwd: str
     source: str
+    model: str | None
     rollout_path: str
     updated_at: int
     last_log_at: int | None
@@ -577,6 +579,19 @@ def read_recent_event_of_type(events_path: Path, event_type: str) -> dict[str, A
 
 
 def recent_resumed_sessions_summary(events_path: Path, limit: int = 3) -> dict[str, Any] | None:
+    event = read_recent_event_of_type(events_path, "interrupted_sessions_app_server_resume_helper_started")
+    if event is not None:
+        return {
+            "timestamp": event.get("timestamp"),
+            "session_count": int(event.get("session_count") or 0),
+            "titles": [],
+            "snapshot_path": event.get("snapshot_path"),
+            "resume_model": "app-server-thread",
+            "account_id": event.get("account_id"),
+            "mode": event.get("mode") or "app_server_thread_resume",
+            "pid": event.get("pid"),
+            "log_path": event.get("log_path"),
+        }
     event = read_recent_event_of_type(events_path, "interrupted_sessions_resume_started")
     if event is None:
         return None
@@ -595,6 +610,9 @@ def recent_resumed_sessions_summary(events_path: Path, limit: int = 3) -> dict[s
         "snapshot_path": event.get("snapshot_path"),
         "resume_model": event.get("resume_model"),
         "account_id": event.get("account_id"),
+        "mode": "codex_exec_resume",
+        "pid": None,
+        "log_path": None,
     }
 
 
@@ -1345,6 +1363,7 @@ def read_recent_desktop_sessions(
                     title,
                     cwd,
                     source,
+                    model,
                     rollout_path,
                     updated_at,
                     NULL AS last_log_at,
@@ -1369,6 +1388,7 @@ def read_recent_desktop_sessions(
                 title=str(row["title"] or ""),
                 cwd=str(row["cwd"] or ""),
                 source=str(row["source"] or ""),
+                model=str(row["model"] or "") or None,
                 rollout_path=str(row["rollout_path"] or ""),
                 updated_at=int(row["updated_at"] or 0),
                 last_log_at=int(row["last_log_at"]) if row["last_log_at"] is not None else None,
@@ -1800,6 +1820,300 @@ def capture_interrupted_sessions(
     return snapshot
 
 
+def _command_path_for_self() -> str | None:
+    candidates = [Path(sys.argv[0])] if sys.argv and sys.argv[0] else []
+    which_path = shutil_lib.which("codex-auth-pool")
+    if which_path:
+        candidates.append(Path(which_path))
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return which_path
+
+
+def launch_app_server_resume_helper(
+    snapshot: dict[str, Any],
+    *,
+    prompt: str,
+    session_recovery_dir: Path,
+    events_path: Path | None,
+    state_path: Path | None,
+    current_account_id: str | None,
+) -> dict[str, Any] | None:
+    sessions = snapshot.get("sessions", [])
+    snapshot_path = str(snapshot.get("path") or "")
+    if not snapshot_path or not isinstance(sessions, list) or not sessions:
+        return None
+    command_path = _command_path_for_self()
+    if not command_path:
+        return None
+
+    session_recovery_dir.mkdir(parents=True, exist_ok=True)
+    log_path = session_recovery_dir / f"{Path(snapshot_path).stem}.appserver-resume.log"
+    command = [
+        command_path,
+        "--session-recovery-dir",
+        str(session_recovery_dir),
+        "resume-snapshot",
+        snapshot_path,
+        "--prompt",
+        prompt,
+    ]
+    if events_path is not None:
+        command.extend(["--events-path", str(events_path)])
+    if state_path is not None:
+        command.extend(["--state-path", str(state_path)])
+    if current_account_id:
+        command.extend(["--account-id", current_account_id])
+    with log_path.open("ab") as log_handle:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    record = {
+        "pid": process.pid,
+        "snapshot_path": snapshot_path,
+        "log_path": str(log_path),
+        "session_count": len([session for session in sessions if isinstance(session, dict)]),
+        "resume_started_at": now_local().isoformat(),
+        "mode": "app_server_thread_resume",
+    }
+    if events_path is not None:
+        append_event(
+            events_path,
+            "interrupted_sessions_app_server_resume_helper_started",
+            **record,
+        )
+    return record
+
+
+class AppServerJsonRpc:
+    def __init__(self, log_path: Path):
+        codex_bin = shutil_lib.which("codex")
+        if not codex_bin:
+            raise RuntimeError("codex CLI not found")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_handle = log_path.open("ab")
+        self.process = subprocess.Popen(
+            [codex_bin, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._log_handle,
+            text=True,
+            bufsize=1,
+        )
+        self._next_id = 1
+        self.notifications: list[dict[str, Any]] = []
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self._log_handle.close()
+
+    def request(self, method: str, params: Any = None, timeout_seconds: float = 60.0) -> dict[str, Any]:
+        if self.process.stdin is None or self.process.stdout is None:
+            raise RuntimeError("app-server stdio is not available")
+        request_id = self._next_id
+        self._next_id += 1
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        self.process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        self.process.stdin.flush()
+        return self.wait_response(request_id, timeout_seconds=timeout_seconds)
+
+    def notify(self, method: str, params: Any = None) -> None:
+        if self.process.stdin is None:
+            raise RuntimeError("app-server stdin is not available")
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        self.process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        self.process.stdin.flush()
+
+    def wait_response(self, request_id: int, timeout_seconds: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(f"app-server exited with code {self.process.returncode}")
+            assert self.process.stdout is not None
+            ready, _, _ = select.select([self.process.stdout], [], [], 0.5)
+            if not ready:
+                continue
+            line = self.process.stdout.readline()
+            if not line:
+                continue
+            message = json.loads(line)
+            if message.get("id") == request_id:
+                if "error" in message:
+                    raise RuntimeError(json.dumps(message["error"], ensure_ascii=False)[:500])
+                result = message.get("result")
+                return result if isinstance(result, dict) else {"result": result}
+            if "method" in message:
+                self.notifications.append(message)
+        raise TimeoutError(f"timed out waiting for app-server response {request_id}")
+
+    def read_notification(self, timeout_seconds: float = 1.0) -> dict[str, Any] | None:
+        if self.notifications:
+            return self.notifications.pop(0)
+        if self.process.poll() is not None:
+            return None
+        assert self.process.stdout is not None
+        ready, _, _ = select.select([self.process.stdout], [], [], timeout_seconds)
+        if not ready:
+            return None
+        line = self.process.stdout.readline()
+        if not line:
+            return None
+        message = json.loads(line)
+        if "method" in message:
+            return message
+        return None
+
+
+def _append_resume_helper_log(log_path: Path, payload: dict[str, Any]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+
+def resume_snapshot_via_app_server(
+    snapshot_path: Path,
+    *,
+    prompt: str,
+    session_recovery_dir: Path,
+    events_path: Path | None,
+    state_path: Path | None,
+    account_id: str | None,
+) -> int:
+    snapshot = read_json(snapshot_path)
+    sessions = [session for session in snapshot.get("sessions", []) if isinstance(session, dict)]
+    log_path = session_recovery_dir / f"{snapshot_path.stem}.appserver-resume.log"
+    server_log_path = session_recovery_dir / f"{snapshot_path.stem}.appserver.stderr.log"
+    if not sessions:
+        _append_resume_helper_log(log_path, {"event": "no_sessions", "snapshot_path": str(snapshot_path)})
+        return 0
+
+    captured_at = parse_dt(str(snapshot.get("captured_at") or "")) or now_local()
+    client = AppServerJsonRpc(server_log_path)
+    active_turns: dict[str, dict[str, Any]] = {}
+    try:
+        init = client.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "codex-auth-pool",
+                    "title": "Codex Auth Pool",
+                    "version": "0",
+                },
+                "capabilities": {
+                    "experimentalApi": True,
+                    "optOutNotificationMethods": None,
+                },
+            },
+        )
+        client.notify("initialized")
+        _append_resume_helper_log(log_path, {"event": "initialized", "result": init})
+        for raw_session in sessions:
+            session_id = str(raw_session.get("id") or "")
+            if not session_id:
+                continue
+            session_prompt = resume_prompt_for_session(prompt, raw_session, captured_at)
+            cwd = str(raw_session.get("cwd") or "")
+            model = str(raw_session.get("model") or "") or None
+            resume_params: dict[str, Any] = {"threadId": session_id}
+            if cwd:
+                resume_params["cwd"] = cwd
+            if model:
+                resume_params["model"] = model
+            resumed = client.request("thread/resume", resume_params, timeout_seconds=90.0)
+            turn_params: dict[str, Any] = {
+                "threadId": session_id,
+                "input": [{"type": "text", "text": session_prompt, "text_elements": []}],
+            }
+            if cwd:
+                turn_params["cwd"] = cwd
+            if model:
+                turn_params["model"] = model
+            started = client.request("turn/start", turn_params, timeout_seconds=90.0)
+            turn = started.get("turn") if isinstance(started.get("turn"), dict) else {}
+            turn_id = str(turn.get("id") or "")
+            active_turns[session_id] = {
+                "thread_id": session_id,
+                "turn_id": turn_id,
+                "title": raw_session.get("title"),
+                "cwd": cwd,
+                "model": model,
+                "rollout_path": raw_session.get("rollout_path"),
+                "started_at": now_local().isoformat(),
+            }
+            record = dict(active_turns[session_id])
+            record["event"] = "turn_started"
+            record["thread_status"] = (resumed.get("thread") or {}).get("status") if isinstance(resumed.get("thread"), dict) else None
+            _append_resume_helper_log(log_path, record)
+            if events_path is not None:
+                append_event(
+                    events_path,
+                    "interrupted_sessions_app_server_turn_started",
+                    snapshot_path=str(snapshot_path),
+                    account_id=account_id,
+                    **active_turns[session_id],
+                )
+
+        while active_turns:
+            notification = client.read_notification(timeout_seconds=5.0)
+            if notification is None:
+                continue
+            method = str(notification.get("method") or "")
+            params = notification.get("params") if isinstance(notification.get("params"), dict) else {}
+            thread_id = str(params.get("threadId") or "")
+            if method == "turn/completed" and thread_id in active_turns:
+                record = active_turns.pop(thread_id)
+                turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                record.update(
+                    {
+                        "event": "turn_completed",
+                        "completed_at": now_local().isoformat(),
+                        "status": turn.get("status"),
+                        "error": turn.get("error"),
+                    }
+                )
+                _append_resume_helper_log(log_path, record)
+                if events_path is not None:
+                    append_event(
+                        events_path,
+                        "interrupted_sessions_app_server_turn_completed",
+                        snapshot_path=str(snapshot_path),
+                        account_id=account_id,
+                        **record,
+                    )
+            elif method == "error":
+                _append_resume_helper_log(log_path, {"event": "server_error", "params": params})
+    except Exception as exc:
+        _append_resume_helper_log(log_path, {"event": "failed", "error": str(exc)})
+        if events_path is not None:
+            append_event(
+                events_path,
+                "interrupted_sessions_app_server_resume_failed",
+                snapshot_path=str(snapshot_path),
+                account_id=account_id,
+                error=str(exc),
+            )
+        return 1
+    finally:
+        client.close()
+    if state_path is not None and account_id:
+        record_resume_model_result(state_path, account_id=account_id, model="app-server-thread", ok=True, error=None, events_path=events_path)
+    return 0
+
+
 def resume_interrupted_sessions(
     snapshot: dict[str, Any],
     *,
@@ -1809,6 +2123,17 @@ def resume_interrupted_sessions(
     state_path: Path | None = None,
     current_account_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    helper = launch_app_server_resume_helper(
+        snapshot,
+        prompt=prompt,
+        session_recovery_dir=session_recovery_dir,
+        events_path=events_path,
+        state_path=state_path,
+        current_account_id=current_account_id,
+    )
+    if helper is not None:
+        return [helper]
+
     codex_bin = shutil_lib.which("codex")
     sessions = snapshot.get("sessions", [])
     if not codex_bin or not isinstance(sessions, list):
@@ -1822,33 +2147,6 @@ def resume_interrupted_sessions(
         return []
 
     pending_sessions = [session for session in sessions if isinstance(session, dict)]
-    desktop_plugin_sessions = [
-        session
-        for session in pending_sessions
-        if bool(session.get("desktop_plugin_resume_required"))
-    ]
-    if desktop_plugin_sessions and events_path is not None:
-        append_event(
-            events_path,
-            "interrupted_sessions_desktop_plugin_resume_skipped",
-            snapshot_path=snapshot.get("path"),
-            reason="browser_use_requires_codex_desktop",
-            session_count=len(desktop_plugin_sessions),
-            sessions=[
-                {
-                    "session_id": session.get("id"),
-                    "title": session.get("title"),
-                    "reason": session.get("desktop_plugin_resume_reason"),
-                    "rollout_path": session.get("rollout_path"),
-                }
-                for session in desktop_plugin_sessions
-            ],
-        )
-    pending_sessions = [
-        session
-        for session in pending_sessions
-        if not bool(session.get("desktop_plugin_resume_required"))
-    ]
     session_recovery_dir.mkdir(parents=True, exist_ok=True)
     all_started: list[dict[str, Any]] = []
     inactive_session_ids: list[str] = []
@@ -2207,6 +2505,7 @@ def resume_prompt_for_session(
             title=str(raw_session.get("title") or ""),
             cwd=str(raw_session.get("cwd") or ""),
             source=str(raw_session.get("source") or ""),
+            model=str(raw_session.get("model") or "") or None,
             rollout_path=str(raw_session.get("rollout_path") or ""),
             updated_at=int(raw_session.get("updated_at") or 0),
             last_log_at=None,
@@ -3428,7 +3727,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         if recovery is not None:
             print(f"  resumed at: {recovery['timestamp'] or '-'}")
             print(f"  resumed sessions: {recovery['session_count']}")
+            print(f"  resume mode: {recovery.get('mode') or '-'}")
             print(f"  resume model: {recovery.get('resume_model') or '-'}")
+            if recovery.get("pid"):
+                print(f"  resume helper pid: {recovery.get('pid')}")
+            if recovery.get("log_path"):
+                print(f"  resume log: {recovery.get('log_path')}")
             print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
         if resume_verification is not None:
             print(f"  resume verified at: {resume_verification['timestamp'] or '-'}")
@@ -4250,6 +4554,12 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         if recovery is not None:
             print(f"  resumed at: {recovery['timestamp'] or '-'}")
             print(f"  resumed sessions: {recovery['session_count']}")
+            print(f"  resume mode: {recovery.get('mode') or '-'}")
+            print(f"  resume model: {recovery.get('resume_model') or '-'}")
+            if recovery.get("pid"):
+                print(f"  resume helper pid: {recovery.get('pid')}")
+            if recovery.get("log_path"):
+                print(f"  resume log: {recovery.get('log_path')}")
             print(f"  examples: {', '.join(recovery['titles']) if recovery['titles'] else '-'}")
         if resume_verification is not None:
             print(f"  resume verified at: {resume_verification['timestamp'] or '-'}")
@@ -4787,6 +5097,17 @@ def cmd_restart_codex(args: argparse.Namespace) -> int:
     if restarted:
         print(f"restarted Codex app via {mode} restart: {args.app_path}")
     return 0
+
+
+def cmd_resume_snapshot(args: argparse.Namespace) -> int:
+    return resume_snapshot_via_app_server(
+        Path(args.snapshot_path),
+        prompt=args.prompt,
+        session_recovery_dir=args.session_recovery_dir,
+        events_path=getattr(args, "events_path", None),
+        state_path=getattr(args, "state_path", None),
+        account_id=getattr(args, "account_id", None),
+    )
 
 
 def cmd_launchd_install(args: argparse.Namespace) -> int:
@@ -5617,6 +5938,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not send '继续' to recently active Codex Desktop sessions after restarting",
     )
     restart_parser.set_defaults(func=cmd_restart_codex)
+
+    resume_snapshot_parser = subparsers.add_parser(
+        "resume-snapshot",
+        help=argparse.SUPPRESS,
+    )
+    resume_snapshot_parser.add_argument("snapshot_path")
+    resume_snapshot_parser.add_argument("--prompt", default=DEFAULT_INTERRUPTED_SESSION_PROMPT)
+    resume_snapshot_parser.add_argument("--account-id")
+    resume_snapshot_parser.set_defaults(func=cmd_resume_snapshot)
 
     launchd_install_parser = subparsers.add_parser(
         "launchd-install",
