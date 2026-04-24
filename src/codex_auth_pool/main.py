@@ -2135,7 +2135,7 @@ def record_session_only_recovery(snapshot: dict[str, Any], events_path: Path | N
 
 def restart_codex_app(
     app_path: Path,
-    hard: bool = True,
+    hard: bool = False,
     wait_seconds: float = 2.0,
     *,
     resume_interrupted: bool = True,
@@ -2170,13 +2170,14 @@ def restart_codex_app(
 
     stop_codex_app(graceful_first=not hard, wait_seconds=wait_seconds)
 
-    # Force a fresh app instance after we have confirmed the old one is gone.
-    completed = run_command(["open", "-n", "-a", str(app_path)])
+    # Reopen the app normally after the previous instance has exited. Forcing
+    # a second Electron instance can leave Codex's local sidecar map stale.
+    completed = run_command(["open", str(app_path)])
     if completed.returncode != 0:
         raise SystemExit(f"failed to open Codex app:\n{completed.stderr or completed.stdout}")
     if not wait_for_codex_state(running=True, timeout_seconds=15.0):
         raise SystemExit("Codex relaunch was requested, but the app did not come back up in time")
-    time.sleep(1.5)
+    time.sleep(4.0)
     if not codex_process_running():
         raise SystemExit("Codex briefly launched and then exited during restart verification")
     if interrupted_snapshot is not None and interrupted_snapshot.get("sessions"):
@@ -3449,7 +3450,7 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
             print(f"restart skipped: recent automatic restart, retry after {retry_after_seconds}s")
         elif restart_codex_app(
             Path(args.app_path),
-            hard=not getattr(args, "graceful_restart", False),
+            hard=bool(getattr(args, "hard_restart", False)),
             resume_interrupted=not getattr(args, "no_resume_interrupted_sessions", False),
             codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
             codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
@@ -4444,7 +4445,7 @@ def cmd_restore_env(args: argparse.Namespace) -> int:
     if getattr(args, "restart_codex", False):
         if restart_codex_app(
             Path(args.app_path),
-            hard=not getattr(args, "graceful_restart", False),
+            hard=bool(getattr(args, "hard_restart", False)),
             resume_interrupted=not getattr(args, "no_resume_interrupted_sessions", False),
             codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
             codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
@@ -4636,7 +4637,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 def cmd_restart_codex(args: argparse.Namespace) -> int:
     restarted = restart_codex_app(
         Path(args.app_path),
-        hard=not args.graceful_restart,
+        hard=bool(getattr(args, "hard_restart", False)),
         resume_interrupted=not getattr(args, "no_resume_interrupted_sessions", False),
         codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
         codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
@@ -4644,7 +4645,7 @@ def cmd_restart_codex(args: argparse.Namespace) -> int:
         events_path=getattr(args, "events_path", None),
         state_path=getattr(args, "state_path", None),
     )
-    mode = "graceful" if args.graceful_restart else "hard"
+    mode = "hard" if getattr(args, "hard_restart", False) else "graceful"
     if restarted:
         print(f"restarted Codex app via {mode} restart: {args.app_path}")
     return 0
@@ -5098,7 +5099,12 @@ def build_parser() -> argparse.ArgumentParser:
     restore_env_parser.add_argument(
         "--graceful-restart",
         action="store_true",
-        help="use AppleScript quit instead of hard process kill before reopening",
+        help="deprecated; graceful restart is now the default",
+    )
+    restore_env_parser.add_argument(
+        "--hard-restart",
+        action="store_true",
+        help="force-kill Codex before reopening if graceful restart is not enough",
     )
     restore_env_parser.add_argument(
         "--no-resume-interrupted-sessions",
@@ -5263,7 +5269,12 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument(
         "--graceful-restart",
         action="store_true",
-        help="use AppleScript quit instead of hard process kill before reopening",
+        help="deprecated; graceful restart is now the default",
+    )
+    apply_parser.add_argument(
+        "--hard-restart",
+        action="store_true",
+        help="force-kill Codex before reopening if graceful restart is not enough",
     )
     apply_parser.add_argument(
         "--no-resume-interrupted-sessions",
@@ -5284,7 +5295,12 @@ def build_parser() -> argparse.ArgumentParser:
     apply_best_parser.add_argument(
         "--graceful-restart",
         action="store_true",
-        help="use AppleScript quit instead of hard process kill before reopening",
+        help="deprecated; graceful restart is now the default",
+    )
+    apply_best_parser.add_argument(
+        "--hard-restart",
+        action="store_true",
+        help="force-kill Codex before reopening if graceful restart is not enough",
     )
     apply_best_parser.add_argument(
         "--no-resume-interrupted-sessions",
@@ -5343,7 +5359,12 @@ def build_parser() -> argparse.ArgumentParser:
     tick_parser.add_argument(
         "--graceful-restart",
         action="store_true",
-        help="use AppleScript quit instead of hard process kill before reopening",
+        help="deprecated; graceful restart is now the default",
+    )
+    tick_parser.add_argument(
+        "--hard-restart",
+        action="store_true",
+        help="force-kill Codex before reopening if graceful restart is not enough",
     )
     tick_parser.add_argument(
         "--no-resume-interrupted-sessions",
@@ -5408,7 +5429,12 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument(
         "--graceful-restart",
         action="store_true",
-        help="use AppleScript quit instead of hard process kill before reopening",
+        help="deprecated; graceful restart is now the default",
+    )
+    daemon_parser.add_argument(
+        "--hard-restart",
+        action="store_true",
+        help="force-kill Codex before reopening if graceful restart is not enough",
     )
     daemon_parser.add_argument(
         "--no-resume-interrupted-sessions",
@@ -5439,7 +5465,12 @@ def build_parser() -> argparse.ArgumentParser:
     restart_parser.add_argument(
         "--graceful-restart",
         action="store_true",
-        help="use AppleScript quit instead of hard process kill before reopening",
+        help="deprecated; graceful restart is now the default",
+    )
+    restart_parser.add_argument(
+        "--hard-restart",
+        action="store_true",
+        help="force-kill Codex before reopening if graceful restart is not enough",
     )
     restart_parser.add_argument(
         "--no-resume-interrupted-sessions",
