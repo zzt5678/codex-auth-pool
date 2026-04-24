@@ -114,6 +114,14 @@ DEFAULT_RESUME_MODEL_CANDIDATES = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 RESUME_MODEL_NEGATIVE_CACHE_SECONDS = 24 * 60 * 60
 RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
 RESUME_VERIFY_DELAY_SECONDS = 60.0
+BROWSER_USE_SESSION_MARKERS = (
+    "in app browser",
+    "browser-use",
+    "browser use",
+    "iab_lifecycle",
+    "mcp__browser",
+    "current url:",
+)
 
 
 @dataclass
@@ -635,6 +643,26 @@ def recent_resume_verification_summary(events_path: Path) -> dict[str, Any] | No
             - int(event.get("pending_count") or 0),
         ),
         "errors": errors[:3],
+    }
+
+
+def recent_desktop_plugin_resume_summary(events_path: Path) -> dict[str, Any] | None:
+    event = read_recent_event_of_type(events_path, "interrupted_sessions_desktop_plugin_resume_skipped")
+    if event is None:
+        return None
+    sessions = event.get("sessions")
+    if not isinstance(sessions, list):
+        sessions = []
+    titles = [
+        str(session.get("title") or session.get("session_id") or "")[:80]
+        for session in sessions[:3]
+        if isinstance(session, dict)
+    ]
+    return {
+        "timestamp": event.get("timestamp"),
+        "session_count": int(event.get("session_count") or len(sessions)),
+        "reason": event.get("reason") or "desktop_plugin_session",
+        "titles": titles,
     }
 
 
@@ -1566,6 +1594,31 @@ def _truncate_context_text(text: str, limit: int = 180) -> str:
     return compact[: limit - 1].rstrip() + "…"
 
 
+def session_uses_desktop_browser(session: InterruptedSession, captured_at: datetime) -> bool:
+    rollout_path = Path(session.rollout_path)
+    if not rollout_path.exists() or not rollout_path.is_file():
+        return False
+    try:
+        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return False
+
+    for raw_line in reversed(lines):
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_at = parse_dt(str(event.get("timestamp") or ""))
+        if event_at is not None and event_at > captured_at:
+            continue
+        text = json.dumps(event, ensure_ascii=False).lower()
+        if any(marker in text for marker in BROWSER_USE_SESSION_MARKERS):
+            return True
+    return False
+
+
 def recent_rollout_context(session: InterruptedSession, captured_at: datetime, limit: int = 3) -> list[str]:
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
@@ -1652,10 +1705,13 @@ def interrupted_session_record(session: InterruptedSession, captured_at: datetim
     record = session.__dict__.copy()
     pending_tools = pending_tool_calls_at(session, captured_at)
     restartable_tools, skipped_commands = _filter_restartable_tools(pending_tools)
+    uses_desktop_browser = session_uses_desktop_browser(session, captured_at)
     record["interrupted_tools"] = restartable_tools
     record["interrupted_tool_count"] = len(restartable_tools)
     record["ignored_interrupted_command_count"] = skipped_commands
     record["raw_interrupted_tool_count"] = len(pending_tools)
+    record["desktop_plugin_resume_required"] = uses_desktop_browser
+    record["desktop_plugin_resume_reason"] = "browser_use" if uses_desktop_browser else None
     return record
 
 
@@ -1733,6 +1789,33 @@ def resume_interrupted_sessions(
         return []
 
     pending_sessions = [session for session in sessions if isinstance(session, dict)]
+    desktop_plugin_sessions = [
+        session
+        for session in pending_sessions
+        if bool(session.get("desktop_plugin_resume_required"))
+    ]
+    if desktop_plugin_sessions and events_path is not None:
+        append_event(
+            events_path,
+            "interrupted_sessions_desktop_plugin_resume_skipped",
+            snapshot_path=snapshot.get("path"),
+            reason="browser_use_requires_codex_desktop",
+            session_count=len(desktop_plugin_sessions),
+            sessions=[
+                {
+                    "session_id": session.get("id"),
+                    "title": session.get("title"),
+                    "reason": session.get("desktop_plugin_resume_reason"),
+                    "rollout_path": session.get("rollout_path"),
+                }
+                for session in desktop_plugin_sessions
+            ],
+        )
+    pending_sessions = [
+        session
+        for session in pending_sessions
+        if not bool(session.get("desktop_plugin_resume_required"))
+    ]
     session_recovery_dir.mkdir(parents=True, exist_ok=True)
     all_started: list[dict[str, Any]] = []
     inactive_session_ids: list[str] = []
@@ -3283,7 +3366,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     terminal_recovery = recent_restarted_terminal_summary(args.events_path)
     recovery = recent_resumed_sessions_summary(args.events_path)
     resume_verification = recent_resume_verification_summary(args.events_path)
-    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None:
+    desktop_plugin_recovery = recent_desktop_plugin_resume_summary(args.events_path)
+    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None and desktop_plugin_recovery is None:
         print("  none")
     else:
         if capture is not None:
@@ -3311,6 +3395,10 @@ def cmd_status(args: argparse.Namespace) -> int:
                 print(f"  resume failures: {resume_verification['failed_count']}")
             if resume_verification.get("errors"):
                 print(f"  resume error: {resume_verification['errors'][0]}")
+        if desktop_plugin_recovery is not None:
+            print(f"  desktop plugin sessions: {desktop_plugin_recovery['session_count']}")
+            print(f"  desktop plugin reason: {desktop_plugin_recovery['reason']}")
+            print(f"  desktop plugin examples: {', '.join(desktop_plugin_recovery['titles']) if desktop_plugin_recovery['titles'] else '-'}")
     print("")
     print("Pool")
     for index, item in enumerate(ranked[: min(len(ranked), 8)], start=1):
@@ -4100,7 +4188,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     terminal_recovery = recent_restarted_terminal_summary(args.events_path)
     recovery = recent_resumed_sessions_summary(args.events_path)
     resume_verification = recent_resume_verification_summary(args.events_path)
-    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None:
+    desktop_plugin_recovery = recent_desktop_plugin_resume_summary(args.events_path)
+    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None and desktop_plugin_recovery is None:
         print("  none")
     else:
         if capture is not None:
@@ -4127,6 +4216,10 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 print(f"  resume failures: {resume_verification['failed_count']}")
             if resume_verification.get("errors"):
                 print(f"  resume error: {resume_verification['errors'][0]}")
+        if desktop_plugin_recovery is not None:
+            print(f"  desktop plugin sessions: {desktop_plugin_recovery['session_count']}")
+            print(f"  desktop plugin reason: {desktop_plugin_recovery['reason']}")
+            print(f"  desktop plugin examples: {', '.join(desktop_plugin_recovery['titles']) if desktop_plugin_recovery['titles'] else '-'}")
     resume_account_id = current_summary.account_id if current_summary else active_auth_account_id(target_path)
     print(f"  model order: {', '.join(select_resume_models(state, resume_account_id))}")
     print("")
