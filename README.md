@@ -60,6 +60,7 @@ when you need an emergency manual switch.
 - Background rotation switches and restarts only after a real quota threshold trigger; normal polling does not interrupt your work.
 - Built-in locks and a short automatic-rotation throttle prevent repeated ticks from causing restart loops.
 - Snapshot and restore local Codex plugin, config, and connector cache state.
+- Preserve Browser Use's local Electron browser state (`Cookies`, `Local Storage`, `Session Storage`, and `Partitions/codex-browser-app`) in environment snapshots.
 - Run as a background `launchd` agent on macOS.
 - Run as a background `systemd --user` service on Ubuntu/Linux.
 
@@ -264,6 +265,7 @@ Important paths:
 - updates both `~/.codex/cache/auth.json` and `~/.codex/auth.json`
 - status and dashboard show the active auth file and whether root/cache auth are in sync
 - keeps local plugin and connector state out of the auth rotation path
+- for Browser Use, authorize once while it works, then run `codex-auth-pool snapshot-env --name browser-use-working-$(date +%Y%m%d-%H%M%S)`; automatic switch restarts restore that snapshot before relaunching Codex
 - `apply-best --restart-after-switch` is an immediate manual switch command; use `init --install-launchd` or `launchd-install` for background auto-rotation. Background services restart Codex after switches by default; pass `--no-restart-after-switch` only if you intentionally want auth changes without a Desktop restart.
 - background rotation defaults to preemptive thresholds of `90%` for the 5-hour window and `97%` for the weekly window, leaving margin before the account hard-stops
 - when no alternate account is available, `status`, `dashboard`, and daemon events show blocked accounts and the earliest known unblock time

@@ -60,6 +60,7 @@
 - 后台守护只有在真实额度触发阈值时才会切换和重启；普通轮询不会打断当前工作。
 - 内置防重入锁和短时间自动轮换节流，避免重复 tick 导致连续切号/重启。
 - 支持快照和恢复本地插件、配置、连接器缓存状态。
+- 环境快照会保存 Browser Use 的本地 Electron 浏览器状态，包括 `Cookies`、`Local Storage`、`Session Storage` 和 `Partitions/codex-browser-app`。
 - 支持 macOS `launchd` 后台常驻。
 - 支持 Ubuntu/Linux `systemd --user` 后台常驻。
 
@@ -264,6 +265,7 @@ codex-auth-pool restore-env baseline --restart-codex
 - 会同时更新 `~/.codex/cache/auth.json` 和 `~/.codex/auth.json`
 - `status` 和 `dashboard` 会显示当前生效的 auth 文件，以及 root/cache 是否同步
 - 插件和连接器状态尽量与 auth 轮换解耦
+- Browser Use 可用时先授权一次，然后执行 `codex-auth-pool snapshot-env --name browser-use-working-$(date +%Y%m%d-%H%M%S)`；之后自动切号重启会在重新打开 Codex 前恢复这个快照
 - `apply-best --restart-after-switch` 是人工立即切换命令；后台自动切换请使用 `init --install-launchd` 或 `launchd-install`。后台服务默认会在切号后重启 Codex；只有明确需要“只切 auth 不重启”时才加 `--no-restart-after-switch`
 - 后台轮换默认是提前切换：
   - 5 小时窗口默认阈值 `90%`

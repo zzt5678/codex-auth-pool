@@ -457,12 +457,19 @@ def send_notification(title: str, message: str, enabled: bool = True) -> None:
 
 
 def env_snapshot_items() -> list[tuple[str, Path]]:
+    codex_app_support = Path.home() / "Library" / "Application Support" / "Codex"
     return [
         ("config.toml", Path.home() / ".codex" / "config.toml"),
         ("plugins", Path.home() / ".codex" / "plugins"),
         ("cache_codex_apps_tools", Path.home() / ".codex" / "cache" / "codex_apps_tools"),
         ("tmp_bundled_marketplaces", Path.home() / ".codex" / ".tmp" / "bundled-marketplaces"),
         ("tmp_marketplaces", Path.home() / ".codex" / ".tmp" / "marketplaces"),
+        ("app_support_cookies", codex_app_support / "Cookies"),
+        ("app_support_local_storage", codex_app_support / "Local Storage"),
+        ("app_support_session_storage", codex_app_support / "Session Storage"),
+        ("app_support_browser_partition", codex_app_support / "Partitions" / "codex-browser-app"),
+        ("app_support_preferences", codex_app_support / "Preferences"),
+        ("app_support_trust_tokens", codex_app_support / "Trust Tokens"),
     ]
 
 
@@ -860,6 +867,53 @@ def restore_env_snapshot(snapshot_dir: Path) -> dict[str, Any]:
         "snapshot_dir": str(snapshot_dir),
         "restored_items": restored,
     }
+
+
+def select_browser_use_snapshot(env_snapshots_dir: Path) -> Path | None:
+    snapshots = list_env_snapshots(env_snapshots_dir)
+    if not snapshots:
+        return None
+    for snapshot in snapshots:
+        if "browser-use-working" in snapshot.name.lower():
+            return snapshot
+    for snapshot in snapshots:
+        if "browser-use" in snapshot.name.lower():
+            return snapshot
+    return None
+
+
+def restore_browser_use_snapshot_if_available(env_snapshots_dir: Path, events_path: Path | None = None) -> dict[str, Any] | None:
+    snapshot = select_browser_use_snapshot(env_snapshots_dir)
+    if snapshot is None:
+        if events_path is not None:
+            append_event(
+                events_path,
+                "browser_use_snapshot_restore_skipped",
+                reason="no_browser_use_snapshot",
+                env_snapshots_dir=str(env_snapshots_dir),
+            )
+        return None
+    restored = restore_env_snapshot(snapshot)
+    if events_path is not None:
+        append_event(
+            events_path,
+            "browser_use_snapshot_restored",
+            snapshot_dir=str(snapshot),
+            restored_count=len(restored.get("restored_items", [])),
+        )
+    return restored
+
+
+def snapshot_item_names(snapshot_dir: Path) -> set[str]:
+    try:
+        manifest = load_snapshot_manifest(snapshot_dir)
+    except SystemExit:
+        return set()
+    names = set()
+    for item in manifest.get("items", []):
+        if isinstance(item, dict) and item.get("name"):
+            names.add(str(item["name"]))
+    return names
 
 
 def discover_profiles(source_dir: Path) -> list[Path]:
@@ -2557,6 +2611,7 @@ def restart_codex_app(
     codex_state_db: Path = DEFAULT_CODEX_STATE_DB,
     codex_logs_db: Path = DEFAULT_CODEX_LOGS_DB,
     session_recovery_dir: Path = DEFAULT_SESSION_RECOVERY_DIR,
+    env_snapshots_dir: Path = DEFAULT_ENV_SNAPSHOTS_DIR,
     session_window_seconds: int = DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS,
     session_max_count: int = DEFAULT_INTERRUPTED_SESSION_MAX_COUNT,
     resume_prompt: str = DEFAULT_INTERRUPTED_SESSION_PROMPT,
@@ -2584,6 +2639,12 @@ def restart_codex_app(
         )
 
     stop_codex_app(graceful_first=not hard, wait_seconds=wait_seconds)
+    restored_browser_use = restore_browser_use_snapshot_if_available(env_snapshots_dir, events_path)
+    if restored_browser_use is not None:
+        print(
+            "restored Browser Use environment snapshot before relaunch "
+            f"({len(restored_browser_use.get('restored_items', []))} items)"
+        )
 
     # Reopen the app normally after the previous instance has exited. Forcing
     # a second Electron instance can leave Codex's local sidecar map stale.
@@ -3969,6 +4030,7 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
             codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
             codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
             session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
+            env_snapshots_dir=getattr(args, "env_snapshots_dir", DEFAULT_ENV_SNAPSHOTS_DIR),
             events_path=getattr(args, "events_path", None),
             state_path=getattr(args, "state_path", None),
             current_account_id=normalized.get("account_id"),
@@ -4460,6 +4522,25 @@ def cmd_check(args: argparse.Namespace) -> int:
     snapshots = list_env_snapshots(args.env_snapshots_dir)
     if snapshots:
         report("OK", "environment snapshot", f"latest={snapshots[0].name}")
+        browser_snapshot = select_browser_use_snapshot(args.env_snapshots_dir)
+        if browser_snapshot is None:
+            warnings += 1
+            report(
+                "WARN",
+                "Browser Use snapshot",
+                "no browser-use snapshot found; after Browser Use auth works, run `codex-auth-pool snapshot-env --name browser-use-working-$(date +%Y%m%d-%H%M%S)`",
+            )
+        else:
+            names = snapshot_item_names(browser_snapshot)
+            if "app_support_browser_partition" in names and "app_support_cookies" in names:
+                report("OK", "Browser Use snapshot", browser_snapshot.name)
+            else:
+                warnings += 1
+                report(
+                    "WARN",
+                    "Browser Use snapshot",
+                    f"{browser_snapshot.name} is legacy and lacks Electron browser auth state; re-save it after Browser Use auth works",
+                )
     else:
         warnings += 1
         report("WARN", "environment snapshot", "no snapshot found; run `codex-auth-pool snapshot-env --name baseline`")
@@ -4991,6 +5072,7 @@ def cmd_restore_env(args: argparse.Namespace) -> int:
             codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
             codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
             session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
+            env_snapshots_dir=getattr(args, "env_snapshots_dir", DEFAULT_ENV_SNAPSHOTS_DIR),
             events_path=getattr(args, "events_path", None),
             state_path=getattr(args, "state_path", None),
         ):
@@ -5200,6 +5282,7 @@ def cmd_restart_codex(args: argparse.Namespace) -> int:
         codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
         codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
         session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
+        env_snapshots_dir=getattr(args, "env_snapshots_dir", DEFAULT_ENV_SNAPSHOTS_DIR),
         events_path=getattr(args, "events_path", None),
         state_path=getattr(args, "state_path", None),
     )
