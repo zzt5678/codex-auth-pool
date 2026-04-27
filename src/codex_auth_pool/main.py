@@ -105,6 +105,7 @@ REQUIRED_SOURCE_KEYS = (
 DEFAULT_PRIMARY_THRESHOLD = 90.0
 DEFAULT_SECONDARY_THRESHOLD = 97.0
 DEFAULT_USAGE_MAX_AGE_MINUTES = 30
+DEFAULT_USAGE_ERROR_BACKOFF_MINUTES = 30
 MIN_AUTO_RESTART_INTERVAL_SECONDS = 120
 AUTO_DISCOVERY_MAX_INITIAL_USAGE_REFRESHES = 5
 DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 24 * 60 * 60
@@ -3090,11 +3091,18 @@ def observed_allowed_for_profile(path: Path) -> bool | None:
 
 def observed_block_until_for_profile(path: Path, *, now: datetime | None = None) -> tuple[datetime | None, str | None]:
     now = now or now_local()
+    usage_error = str(read_profile_metadata(path).get("usage_error") or "")
+    usage_error_checked_at = usage_error_checked_at_for_profile(path)
+    if usage_error and usage_error_checked_at is not None and usage_error_blocks_current_account(usage_error):
+        token_refresh_due = usage_error_checked_at + timedelta(hours=24)
+        if token_refresh_due > now:
+            return token_refresh_due, "auth_token_expired"
+
     observed_secondary_used = observed_secondary_used_percent_for_profile(path)
     observed_secondary_reset = observed_secondary_reset_at_for_profile(path)
     if (
         observed_secondary_used is not None
-        and observed_secondary_used >= 100
+        and observed_secondary_used >= DEFAULT_SECONDARY_THRESHOLD
         and observed_secondary_reset is not None
         and observed_secondary_reset > now
     ):
@@ -3104,7 +3112,7 @@ def observed_block_until_for_profile(path: Path, *, now: datetime | None = None)
     observed_primary_reset = observed_primary_reset_at_for_profile(path)
     if (
         observed_primary_used is not None
-        and observed_primary_used >= 100
+        and observed_primary_used >= DEFAULT_PRIMARY_THRESHOLD
         and observed_primary_reset is not None
         and observed_primary_reset > now
     ):
@@ -3156,6 +3164,18 @@ def usage_is_stale(path: Path, max_age_minutes: int) -> bool:
 
 def usage_error_checked_at_for_profile(path: Path) -> datetime | None:
     return parse_dt(read_profile_metadata(path).get("usage_error_checked_at"))
+
+
+def usage_refresh_due(path: Path, max_age_minutes: int, *, force: bool = False) -> tuple[bool, str]:
+    if force:
+        return True, "forced"
+    checked_at = usage_checked_at_for_profile(path)
+    if checked_at is not None and now_local() - checked_at <= timedelta(minutes=max_age_minutes):
+        return False, f"fresh until {checked_at.isoformat()}"
+    failed_at = usage_error_checked_at_for_profile(path)
+    if failed_at is not None and now_local() - failed_at <= timedelta(minutes=DEFAULT_USAGE_ERROR_BACKOFF_MINUTES):
+        return False, f"recent failure at {failed_at.isoformat()}"
+    return True, "stale"
 
 
 def initial_usage_refresh_due(path: Path, max_age_minutes: int) -> bool:
@@ -3380,6 +3400,72 @@ def current_profile_usage_snapshot(
         ),
         None,
     )
+
+
+def validate_profile_before_apply(
+    args: argparse.Namespace,
+    profile_path: Path,
+    *,
+    apply_source: str,
+) -> tuple[bool, str | None]:
+    if bool(getattr(args, "skip_usage_validation", False)):
+        return True, None
+
+    summary = summarize_profile(profile_path)
+    state_path = getattr(args, "state_path", DEFAULT_STATE_PATH)
+    events_path = getattr(args, "events_path", None)
+    try:
+        refresh_profile_usage(profile_path)
+        refreshed_summary = summarize_profile(profile_path)
+        clear_auth_token_expired_cooldown(state_path, refreshed_summary.account_id, events_path)
+    except SystemExit as exc:
+        error = str(exc)
+        update_profile_metadata(
+            profile_path,
+            usage_error_checked_at=now_local().isoformat(),
+            usage_error=error[:300],
+        )
+        reason = "auth_token_expired" if usage_error_blocks_current_account(error) else "usage_refresh_failed"
+        if reason == "auth_token_expired" and summary.account_id:
+            set_cooldown_by_account_id(
+                state_path,
+                summary.account_id,
+                now_local() + timedelta(hours=24),
+                reason,
+            )
+        append_event(
+            events_path,
+            "apply_profile_rejected",
+            profile=str(profile_path),
+            email=summary.email,
+            account_id=summary.account_id,
+            apply_source=apply_source,
+            reason=reason,
+            error=error[:300],
+        )
+        if apply_source == "manual" and reason != "auth_token_expired":
+            print(f"warning: usage validation failed; applying anyway ({error})")
+            return True, None
+        return False, f"{reason}: {error}"
+
+    block_until, block_reason = observed_block_until_for_profile(profile_path)
+    if block_until is not None and block_until > now_local():
+        reason = block_reason or "usage_limit"
+        if summary.account_id:
+            set_cooldown_by_account_id(state_path, summary.account_id, block_until, reason)
+        append_event(
+            events_path,
+            "apply_profile_rejected",
+            profile=str(profile_path),
+            email=summary.email,
+            account_id=summary.account_id,
+            apply_source=apply_source,
+            reason=reason,
+            cooldown_until=block_until.isoformat(),
+        )
+        return False, f"{reason} until {fmt_dt(block_until)}"
+
+    return True, None
 
 
 def current_limits_for_display(
@@ -3994,6 +4080,13 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
 
     profile_path = pick_profile(args.source_dir, args.managed_dir, args.profile)
     normalized = normalize_source_payload(profile_path, read_json(profile_path))
+    validation_ok, validation_error = validate_profile_before_apply(
+        args,
+        profile_path,
+        apply_source=apply_source,
+    )
+    if not validation_ok:
+        raise SystemExit(f"refusing to apply unusable profile {profile_path.name}: {validation_error}")
     payload = convert_profile(normalized)
     target_path = Path(args.target).expanduser()
 
@@ -4089,7 +4182,20 @@ def cmd_apply_best(args: argparse.Namespace) -> int:
         max_age_minutes=getattr(args, "usage_max_age_minutes", DEFAULT_USAGE_MAX_AGE_MINUTES),
     )
     state = load_state(args.state_path)
-    picked = choose_best_profile(args.source_dir, args.managed_dir, state, Path(args.target))
+    picked = None
+    for candidate in rank_profiles(args.source_dir, args.managed_dir, state, Path(args.target)):
+        if not candidate["available"]:
+            continue
+        validation_ok, validation_error = validate_profile_before_apply(
+            args,
+            candidate["path"],
+            apply_source=getattr(args, "apply_source", "manual"),
+        )
+        if validation_ok:
+            picked = candidate
+            args.skip_usage_validation = True
+            break
+        print(f"skipped candidate {candidate['summary'].email or candidate['summary'].account_id}: {validation_error}")
     if picked is None:
         print("no currently available profile")
         return 1
@@ -4358,10 +4464,14 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
     if not quiet:
         print("Usage Refresh")
     for path in profiles:
-        if not getattr(args, "force", False) and usage_is_stale(path, args.max_age_minutes) is False:
-            checked_at = usage_checked_at_for_profile(path)
+        due, due_reason = usage_refresh_due(
+            path,
+            args.max_age_minutes,
+            force=bool(getattr(args, "force", False)),
+        )
+        if not due:
             if not quiet:
-                print(f"  - {path.name}: skipped (fresh until {checked_at.isoformat() if checked_at else '-'})")
+                print(f"  - {path.name}: skipped ({due_reason})")
             continue
         try:
             meta = refresh_profile_usage(path)
@@ -4379,6 +4489,31 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
                 )
         except SystemExit as exc:
             failed += 1
+            error = str(exc)
+            update_profile_metadata(
+                path,
+                usage_error_checked_at=now_local().isoformat(),
+                usage_error=error[:300],
+            )
+            refreshed_summary = summarize_profile(path)
+            if usage_error_blocks_current_account(error) and refreshed_summary.account_id:
+                cooldown_until = now_local() + timedelta(hours=24)
+                set_cooldown_by_account_id(
+                    getattr(args, "state_path", DEFAULT_STATE_PATH),
+                    refreshed_summary.account_id,
+                    cooldown_until,
+                    "auth_token_expired",
+                )
+                append_event(
+                    getattr(args, "events_path", None),
+                    "auto_cooldown",
+                    account_id=refreshed_summary.account_id,
+                    cooldown_until=cooldown_until.isoformat(),
+                    reason="auth_token_expired",
+                    primary_used_percent=None,
+                    secondary_used_percent=None,
+                    trigger_source="usage_refresh_error",
+                )
             if not quiet:
                 print(f"  - {path.name}: failed ({exc})")
 
@@ -5133,6 +5268,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             force=False,
             max_age_minutes=args.usage_max_age_minutes,
             events_path=args.events_path,
+            state_path=args.state_path,
             quiet=getattr(args, "daemon_quiet", False),
         )
         cmd_refresh_usage(refresh_args)
@@ -5227,12 +5363,31 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             f"{triggered_until.isoformat()} ({triggered_reason}, source={trigger_source})"
         )
         if not args.no_apply_best:
-            picked = choose_best_profile(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
+            picked = None
+            ranked_candidates = rank_profiles(
+                args.source_dir,
+                args.managed_dir,
+                load_state(args.state_path),
+                Path(args.target),
+            )
+            for candidate in ranked_candidates:
+                if not candidate["available"] or candidate["summary"].account_id == current_account:
+                    continue
+                validation_ok, validation_error = validate_profile_before_apply(
+                    args,
+                    candidate["path"],
+                    apply_source="auto_rotation",
+                )
+                if validation_ok:
+                    picked = candidate
+                    break
+                print(f"skipped candidate {candidate['summary'].email or candidate['summary'].account_id}: {validation_error}")
             if picked and picked["summary"].account_id != current_account:
                 args.profile = str(picked["path"])
                 args.apply_source = "auto_rotation"
                 args.rotation_reason = triggered_reason
                 args.rotation_trigger_source = trigger_source
+                args.skip_usage_validation = True
                 cmd_apply(args)
             else:
                 ranked_after_cooldown = rank_profiles(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
