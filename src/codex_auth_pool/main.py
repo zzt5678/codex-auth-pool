@@ -692,6 +692,19 @@ def recent_desktop_plugin_resume_summary(events_path: Path) -> dict[str, Any] | 
     }
 
 
+def recent_deferred_rotation_summary(events_path: Path) -> dict[str, Any] | None:
+    event = read_recent_event_of_type(events_path, "rotation_deferred_active_sessions")
+    if event is None:
+        return None
+    return {
+        "timestamp": event.get("timestamp"),
+        "reason": event.get("reason"),
+        "trigger_source": event.get("trigger_source"),
+        "session_count": int(event.get("session_count") or 0),
+        "snapshot_path": event.get("snapshot_path"),
+    }
+
+
 def recent_interrupted_capture_summary(events_path: Path) -> dict[str, Any] | None:
     event = read_recent_event_of_type(events_path, "interrupted_sessions_captured")
     if event is None:
@@ -2189,181 +2202,44 @@ def resume_interrupted_sessions(
     if helper is not None:
         return [helper]
 
-    codex_bin = shutil_lib.which("codex")
     sessions = snapshot.get("sessions", [])
-    if not codex_bin or not isinstance(sessions, list):
-        if events_path is not None:
-            append_event(
-                events_path,
-                "interrupted_sessions_resume_failed",
-                reason="codex_cli_not_found" if not codex_bin else "invalid_snapshot",
-                snapshot_path=snapshot.get("path"),
-            )
+    if not isinstance(sessions, list) or not sessions:
         return []
 
-    pending_sessions = [session for session in sessions if isinstance(session, dict)]
-    session_recovery_dir.mkdir(parents=True, exist_ok=True)
-    all_started: list[dict[str, Any]] = []
-    inactive_session_ids: list[str] = []
-    pending_running_session_ids: list[str] = []
-    snapshot_captured_at = parse_dt(str(snapshot.get("captured_at") or "")) or now_local()
-    state = load_state(state_path) if state_path is not None else {}
-    account_id = current_account_id or active_auth_account_id(DEFAULT_CODEX_AUTH_PATH)
-    resume_models = select_resume_models(state, account_id)
-
-    for attempt, resume_model in enumerate(resume_models, start=1):
-        if not pending_sessions:
-            break
-        attempt_prompt = prompt if attempt == 1 else DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT
-        started: list[dict[str, Any]] = []
-        started_processes: list[tuple[dict[str, Any], subprocess.Popen[Any], int]] = []
-
-        for raw_session in pending_sessions:
-            session_id = str(raw_session.get("id") or "")
-            if not session_id:
-                continue
-            cwd = Path(str(raw_session.get("cwd") or Path.home()))
-            if not cwd.exists() or not cwd.is_dir():
-                cwd = Path.home()
-            log_path = session_recovery_dir / f"{session_id}.resume.log"
-            log_offset = log_path.stat().st_size if log_path.exists() else 0
-            session_prompt = resume_prompt_for_session(attempt_prompt, raw_session, snapshot_captured_at)
-            command = [
-                codex_bin,
-                "exec",
-                "resume",
-                "--model",
-                resume_model,
-                "--skip-git-repo-check",
-                session_id,
-                session_prompt,
-            ]
-            with log_path.open("ab") as log_handle:
-                process = subprocess.Popen(
-                    command,
-                    cwd=str(cwd),
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-            record = {
-                "session_id": session_id,
-                "title": raw_session.get("title"),
-                "cwd": str(cwd),
-                "pid": process.pid,
-                "log_path": str(log_path),
-                "rollout_path": raw_session.get("rollout_path"),
-                "resume_started_at": now_local().isoformat(),
-                "interrupted_tool_count": raw_session.get("interrupted_tool_count") or 0,
-                "attempt": attempt,
-                "resume_model": resume_model,
-                "account_id": account_id,
-            }
-            started.append(record)
-            started_processes.append((record, process, log_offset))
-
-        all_started.extend(started)
-        verified_sessions: list[dict[str, Any]] = []
-        if events_path is not None:
-            append_event(
-                events_path,
-                "interrupted_sessions_resume_started",
-                snapshot_path=snapshot.get("path"),
-                prompt=attempt_prompt,
-                attempt=attempt,
-                resume_model=resume_model,
-                account_id=account_id,
-                session_count=len(started),
-                sessions=started,
-            )
-            verified_sessions = verify_resumed_sessions_started(
-                started_processes,
-                events_path=events_path,
-                attempt=attempt,
-            )
-
-        retry_session_ids: list[str] = []
-        pending_running_session_ids = []
-        for session in verified_sessions:
-            if session.get("activity_detected"):
-                continue
-            session_id = str(session.get("session_id") or "")
-            if not session_id:
-                continue
-            process_status = str(session.get("process_status") or "")
-            if session.get("error") or process_status.startswith("exited:"):
-                retry_session_ids.append(session_id)
-            elif process_status == "running":
-                pending_running_session_ids.append(session_id)
-
-        if verified_sessions and not pending_running_session_ids:
-            attempt_ok = all(bool(session.get("activity_detected")) for session in verified_sessions)
-            first_error = next(
-                (str(session.get("error")) for session in verified_sessions if session.get("error")),
-                None,
-            )
-            record_resume_model_result(
-                state_path,
-                account_id=account_id,
-                model=resume_model,
-                ok=attempt_ok,
-                error=first_error,
-                events_path=events_path,
-            )
-
-        if events_path is not None and pending_running_session_ids:
-            append_event(
-                events_path,
-                "interrupted_sessions_resume_pending",
-                snapshot_path=snapshot.get("path"),
-                attempt=attempt,
-                resume_model=resume_model,
-                session_count=len(pending_running_session_ids),
-                session_ids=pending_running_session_ids,
-                reason="resume_process_still_running_without_detected_activity",
-            )
-
-        inactive_session_ids = retry_session_ids
-        if not inactive_session_ids:
-            break
-        inactive_session_id_set = set(inactive_session_ids)
-        for record, process, _log_offset in started_processes:
-            if str(record.get("session_id") or "") not in inactive_session_id_set:
-                continue
-            if process.poll() is not None:
-                continue
-            process.terminate()
-            try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        if events_path is not None and attempt < len(resume_models):
-            append_event(
-                events_path,
-                "interrupted_sessions_resume_retry_scheduled",
-                snapshot_path=snapshot.get("path"),
-                next_attempt=attempt + 1,
-                failed_model=resume_model,
-                next_model=resume_models[attempt],
-                session_count=len(inactive_session_ids),
-                session_ids=inactive_session_ids,
-            )
-        pending_sessions = [
-            session
-            for session in pending_sessions
-            if str(session.get("id") or "") in inactive_session_id_set
-        ]
-
-    if events_path is not None and inactive_session_ids:
+    # A CLI resume is not a safe substitute for resuming the original Desktop
+    # thread. If the app-server path is unavailable, surface the failure instead
+    # of pretending the interrupted Desktop session was continued.
+    if events_path is not None:
         append_event(
             events_path,
-            "interrupted_sessions_resume_still_inactive",
+            "interrupted_sessions_resume_failed",
+            reason="app_server_resume_unavailable",
             snapshot_path=snapshot.get("path"),
-            session_count=len(inactive_session_ids),
-            session_ids=inactive_session_ids,
+            session_count=len(sessions),
         )
-    return all_started
+    return []
+
+
+def active_desktop_sessions_before_switch(args: argparse.Namespace) -> dict[str, Any] | None:
+    if not getattr(args, "defer_switch_while_active", True):
+        return None
+    if not getattr(args, "restart_after_switch", False):
+        return None
+    if getattr(args, "no_resume_interrupted_sessions", False):
+        return None
+
+    snapshot = capture_interrupted_sessions(
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        codex_logs_db=getattr(args, "codex_logs_db", DEFAULT_CODEX_LOGS_DB),
+        session_recovery_dir=getattr(args, "session_recovery_dir", DEFAULT_SESSION_RECOVERY_DIR),
+        max_age_seconds=DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS,
+        max_count=DEFAULT_INTERRUPTED_SESSION_MAX_COUNT,
+        events_path=getattr(args, "events_path", None),
+    )
+    sessions = snapshot.get("sessions")
+    if isinstance(sessions, list) and sessions:
+        return snapshot
+    return None
 
 
 def _read_log_since(path: Path, offset: int, limit: int = 20000) -> str:
@@ -2545,6 +2421,26 @@ def determine_rotation_trigger(
     ):
         return "primary_5h_limit", primary_reset_at
     return None, None
+
+
+def rotation_trigger_is_hard(
+    *,
+    forced_trigger_reason: str | None,
+    usage: RemoteUsageSnapshot | None,
+    primary_used_percent: float | None,
+    secondary_used_percent: float | None,
+) -> bool:
+    if forced_trigger_reason:
+        return True
+    if usage is not None and (usage.limit_reached is True or usage.allowed is False):
+        return True
+    # Values can be rounded in upstream snapshots. Treat near-100 as hard
+    # exhaustion so the daemon does not defer forever after the account is gone.
+    if primary_used_percent is not None and primary_used_percent >= 99.5:
+        return True
+    if secondary_used_percent is not None and secondary_used_percent >= 99.5:
+        return True
+    return False
 
 
 def resume_prompt_for_session(
@@ -2799,6 +2695,7 @@ def launchctl_status(label: str) -> dict[str, Any]:
         "restart_after_switch": None,
         "refresh_usage": None,
         "resume_interrupted_sessions": None,
+        "defer_switch_while_active": None,
     }
     if plist_path.exists():
         try:
@@ -2811,6 +2708,7 @@ def launchctl_status(label: str) -> dict[str, Any]:
                 status["restart_after_switch"] = "--restart-after-switch" in args
                 status["refresh_usage"] = "--refresh-usage" in args
                 status["resume_interrupted_sessions"] = "--no-resume-interrupted-sessions" not in args
+                status["defer_switch_while_active"] = "--no-defer-switch-while-active" not in args
         except (OSError, plistlib.InvalidFileException):
             pass
     if not is_macos():
@@ -2947,6 +2845,7 @@ def systemd_status(service_name: str) -> dict[str, Any]:
         "restart_after_switch": None,
         "refresh_usage": None,
         "resume_interrupted_sessions": None,
+        "defer_switch_while_active": None,
     }
     if service_path.exists():
         try:
@@ -2954,6 +2853,7 @@ def systemd_status(service_name: str) -> dict[str, Any]:
             status["restart_after_switch"] = "--restart-after-switch" in text
             status["refresh_usage"] = "--refresh-usage" in text
             status["resume_interrupted_sessions"] = "--no-resume-interrupted-sessions" not in text
+            status["defer_switch_while_active"] = "--no-defer-switch-while-active" not in text
         except OSError:
             pass
     if not is_linux() or not shutil_lib.which("systemctl"):
@@ -2985,6 +2885,7 @@ def background_service_status() -> dict[str, Any]:
             "restart_after_switch": status.get("restart_after_switch"),
             "refresh_usage": status.get("refresh_usage"),
             "resume_interrupted_sessions": status.get("resume_interrupted_sessions"),
+            "defer_switch_while_active": status.get("defer_switch_while_active"),
         }
     if is_linux():
         status = systemd_status(DEFAULT_SYSTEMD_SERVICE)
@@ -2997,6 +2898,7 @@ def background_service_status() -> dict[str, Any]:
             "restart_after_switch": status.get("restart_after_switch"),
             "refresh_usage": status.get("refresh_usage"),
             "resume_interrupted_sessions": status.get("resume_interrupted_sessions"),
+            "defer_switch_while_active": status.get("defer_switch_while_active"),
         }
     return {"kind": platform.system(), "installed": False, "running": False, "state": None, "pid": None}
 
@@ -3811,6 +3713,119 @@ def next_unblock_hint(ranked: list[dict[str, Any]], *, exclude_current: bool = T
     return f"{label} may become available at {fmt_dt(when)}"
 
 
+def profile_health(item: dict[str, Any]) -> str:
+    summary: ProfileSummary = item["summary"]
+    now = now_local()
+    if summary.disabled:
+        return "disabled"
+    expired = parse_dt(summary.expired)
+    if expired is not None and expired <= now:
+        return "auth-expired"
+    cooldown = item.get("cooldown_until")
+    if cooldown is not None and cooldown > now:
+        return str(item.get("cooldown_reason") or "cooldown")
+    remote_block = item.get("remote_block_until")
+    if remote_block is not None and remote_block > now:
+        return str(item.get("remote_block_reason") or "quota-delayed")
+    limit_reset = item.get("limit_reset_at")
+    if limit_reset is not None and limit_reset > now:
+        return str(item.get("limit_reason") or "quota-delayed")
+    return "ready" if item.get("available") else "blocked"
+
+
+def jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): jsonable(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [jsonable(item) for item in value]
+    return value
+
+
+def ranked_item_report(item: dict[str, Any]) -> dict[str, Any]:
+    summary: ProfileSummary = item["summary"]
+    reset_label, reset_source = effective_reset_label_for_profile(summary.path, summary)
+    return {
+        "email": summary.email,
+        "account_id": summary.account_id,
+        "profile": str(summary.path),
+        "source_kind": summary.source_kind,
+        "health": profile_health(item),
+        "available": bool(item["available"]),
+        "current": bool(item["is_current"]),
+        "preferred_next": bool(item["is_preferred_next"]),
+        "reset_at": reset_label,
+        "reset_source": reset_source,
+        "block_reasons": profile_block_reasons(item) if not item["available"] else [],
+    }
+
+
+def build_pool_report(args: argparse.Namespace, *, discover: bool = True) -> dict[str, Any]:
+    discovery = {"synced": [], "refreshed": [], "failed": []}
+    if discover:
+        discovery = auto_discover_new_profiles(
+            args.source_dir,
+            args.managed_dir,
+            args.events_path,
+            refresh_missing_usage=False,
+            max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+        )
+
+    state = load_state(args.state_path)
+    target_path = Path(args.target)
+    ranked = rank_profiles(args.source_dir, args.managed_dir, state, target_path)
+    current_summary = current_account_summary(target_path, args.source_dir, args.managed_dir)
+    limits = current_limits_for_display(
+        args.source_dir,
+        args.managed_dir,
+        target_path,
+        args.sessions_dir,
+        state,
+        max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+    )
+    current_item = next((item for item in ranked if item["is_current"]), None)
+    next_item = next((item for item in ranked if item["available"] and not item["is_current"]), None)
+    background = background_service_status()
+    auth_state = active_auth_file_state(target_path)
+    capture = recent_interrupted_capture_summary(args.events_path)
+    deferred_rotation = recent_deferred_rotation_summary(args.events_path)
+    last_apply = state.get("last_apply") if isinstance(state.get("last_apply"), dict) else None
+    if last_apply is None:
+        last_apply = read_recent_event_of_type(args.events_path, "apply_profile")
+
+    return {
+        "generated_at": now_local().isoformat(),
+        "auth": {
+            "active_path": str(auth_state.get("active_path") or ""),
+            "active_account_id": auth_state.get("active_account_id"),
+            "mismatched": bool(auth_state.get("mismatched")),
+        },
+        "current": ranked_item_report(current_item) if current_item is not None else {
+            "email": current_summary.email if current_summary else None,
+            "account_id": current_summary.account_id if current_summary else None,
+            "health": "unknown",
+        },
+        "limits": jsonable(limits),
+        "next": ranked_item_report(next_item) if next_item is not None else None,
+        "next_unblock": next_unblock_hint(ranked),
+        "accounts": [ranked_item_report(item) for item in ranked],
+        "background_service": jsonable(background),
+        "last_switch": jsonable(last_apply),
+        "session_recovery": {
+            "last_capture": jsonable(capture),
+            "deferred_rotation": jsonable(deferred_rotation),
+        },
+        "auto_discovery": {
+            "synced_count": len(discovery["synced"]),
+            "refreshed_count": len(discovery["refreshed"]),
+            "failed_count": len(discovery["failed"]),
+        },
+    }
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     profiles = discover_all_profiles(args.source_dir, args.managed_dir)
     if not profiles:
@@ -3935,9 +3950,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     recovery = recent_resumed_sessions_summary(args.events_path)
     resume_verification = recent_resume_verification_summary(args.events_path)
     desktop_plugin_recovery = recent_desktop_plugin_resume_summary(args.events_path)
-    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None and desktop_plugin_recovery is None:
+    deferred_rotation = recent_deferred_rotation_summary(args.events_path)
+    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None and desktop_plugin_recovery is None and deferred_rotation is None:
         print("  none")
     else:
+        if deferred_rotation is not None:
+            print(f"  deferred switch at: {deferred_rotation['timestamp'] or '-'}")
+            print(f"  deferred reason: {deferred_rotation['reason'] or '-'}")
+            print(f"  active sessions blocking switch: {deferred_rotation['session_count']}")
+            print(f"  trigger: {deferred_rotation['trigger_source'] or '-'}")
         if capture is not None:
             print(f"  captured at: {capture['timestamp'] or '-'}")
             print(f"  recent candidates: {capture['recent_candidates'] if capture['recent_candidates'] is not None else '-'}")
@@ -4745,6 +4766,163 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0 if issues == 0 else 1
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    report = build_pool_report(args, discover=not getattr(args, "no_discover", False))
+    print(json.dumps(jsonable(report), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_forecast(args: argparse.Namespace) -> int:
+    report = build_pool_report(args, discover=not getattr(args, "no_discover", False))
+    if getattr(args, "json", False):
+        print(json.dumps(jsonable(report), ensure_ascii=False, indent=2))
+        return 0
+
+    current = report.get("current") or {}
+    next_account = report.get("next")
+    limits = report.get("limits") or {}
+    background = report.get("background_service") or {}
+    auth = report.get("auth") or {}
+
+    print("Forecast")
+    print(f"  current: {current.get('email') or current.get('account_id') or '-'}")
+    print(f"  current health: {current.get('health') or '-'}")
+    print(f"  auth sync: {'mismatch' if auth.get('mismatched') else 'ok'}")
+    if limits:
+        primary_reset = parse_dt(str(limits.get("primary_reset_at") or ""))
+        secondary_reset = parse_dt(str(limits.get("secondary_reset_at") or ""))
+        print(f"  5h window: {fmt_percent(limits.get('primary_used_percent'))} used, resets in {fmt_timedelta_until(primary_reset)}")
+        print(f"  weekly window: {fmt_percent(limits.get('secondary_used_percent'))} used, resets in {fmt_timedelta_until(secondary_reset)}")
+        print(f"  limit source: {limits.get('source') or '-'}")
+    else:
+        print("  limits: not found")
+    if next_account:
+        print(f"  next: {next_account.get('email') or next_account.get('account_id')}")
+        print(f"  next health: {next_account.get('health')}")
+        print(f"  next reset: {next_account.get('reset_at')} ({next_account.get('reset_source')})")
+        print("  expected action: switch to next account when current hits hard quota")
+    else:
+        print("  next: no alternate available account right now")
+        print(f"  next unblock: {report.get('next_unblock') or '-'}")
+        print("  expected action: stay on current account and report blocked pool")
+    print(f"  daemon: {'running' if background.get('running') else 'not running'} ({background.get('kind') or '-'})")
+    if background.get("running") and background.get("restart_after_switch"):
+        print("  restart policy: enabled")
+    elif background.get("running"):
+        print("  restart policy: disabled")
+    else:
+        print("  restart policy: inactive until daemon is started")
+    return 0
+
+
+def collect_fix_actions(args: argparse.Namespace) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    auth_state = active_auth_file_state(Path(args.target))
+    if auth_state.get("mismatched"):
+        actions.append(
+            {
+                "type": "sync-auth-files",
+                "description": "Synchronize ~/.codex/auth.json and ~/.codex/cache/auth.json to the newest usable account",
+            }
+        )
+
+    state = load_state(args.state_path)
+    profiles = state.get("profiles")
+    if isinstance(profiles, dict):
+        expired_accounts = []
+        now = now_local()
+        for account_id, record in profiles.items():
+            if not isinstance(record, dict):
+                continue
+            until = parse_dt(str(record.get("cooldown_until") or ""))
+            if until is not None and until <= now:
+                expired_accounts.append(str(account_id))
+        if expired_accounts:
+            actions.append(
+                {
+                    "type": "clear-expired-cooldowns",
+                    "description": "Remove cooldown entries whose reset time is already in the past",
+                    "account_ids": expired_accounts,
+                }
+            )
+
+    missing_meta = []
+    for path in discover_all_profiles(args.source_dir, args.managed_dir):
+        if not meta_path_for_profile(path).exists() and not legacy_meta_path_for_profile(path).exists():
+            missing_meta.append(str(path))
+    if missing_meta:
+        actions.append(
+            {
+                "type": "create-missing-metadata",
+                "description": "Create sidecar metadata for profiles that do not have it yet",
+                "profiles": missing_meta,
+            }
+        )
+    return actions
+
+
+def apply_fix_actions(args: argparse.Namespace, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    applied: list[dict[str, Any]] = []
+    for action in actions:
+        action_type = action.get("type")
+        if action_type == "sync-auth-files":
+            account_id = reconcile_auth_files(
+                Path(args.target),
+                args.events_path,
+                quiet=True,
+                state_path=args.state_path,
+            )
+            applied.append({**action, "account_id": account_id})
+        elif action_type == "clear-expired-cooldowns":
+            state = load_state(args.state_path)
+            profiles = state.get("profiles")
+            cleared: list[str] = []
+            if isinstance(profiles, dict):
+                for account_id in action.get("account_ids", []):
+                    record = profiles.get(account_id)
+                    if not isinstance(record, dict):
+                        continue
+                    record.pop("cooldown_until", None)
+                    record.pop("cooldown_reason", None)
+                    cleared.append(str(account_id))
+                save_state(args.state_path, state)
+            applied.append({**action, "cleared": cleared})
+        elif action_type == "create-missing-metadata":
+            created: list[str] = []
+            for profile in action.get("profiles", []):
+                path = Path(str(profile))
+                if not path.exists():
+                    continue
+                normalized = normalize_source_payload(path, read_json(path), read_profile_metadata(path))
+                write_json(meta_path_for_profile(path), metadata_for_profile(normalized, path))
+                created.append(str(path))
+            applied.append({**action, "created": created})
+    if applied:
+        append_event(args.events_path, "fix_apply", applied_count=len(applied), actions=applied)
+    return applied
+
+
+def cmd_fix(args: argparse.Namespace) -> int:
+    actions = collect_fix_actions(args)
+    mode = "apply" if getattr(args, "apply", False) else "dry-run"
+    print(f"Fix ({mode})")
+    if not actions:
+        print("  no safe fixes needed")
+        return 0
+    for index, action in enumerate(actions, start=1):
+        print(f"  {index}. {action['type']}: {action['description']}")
+        if action.get("account_ids"):
+            print(f"     accounts: {', '.join(action['account_ids'])}")
+        if action.get("profiles"):
+            print(f"     profiles: {len(action['profiles'])}")
+    if not getattr(args, "apply", False):
+        print("  preview only: rerun with --apply to make these changes")
+        return 0
+    applied = apply_fix_actions(args, actions)
+    print(f"  applied: {len(applied)}")
+    return 0
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     discovery = auto_discover_new_profiles(
         args.source_dir,
@@ -4847,9 +5025,15 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     recovery = recent_resumed_sessions_summary(args.events_path)
     resume_verification = recent_resume_verification_summary(args.events_path)
     desktop_plugin_recovery = recent_desktop_plugin_resume_summary(args.events_path)
-    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None and desktop_plugin_recovery is None:
+    deferred_rotation = recent_deferred_rotation_summary(args.events_path)
+    if capture is None and session_only_recovery is None and terminal_recovery is None and recovery is None and resume_verification is None and desktop_plugin_recovery is None and deferred_rotation is None:
         print("  none")
     else:
+        if deferred_rotation is not None:
+            print(f"  deferred switch at: {deferred_rotation['timestamp'] or '-'}")
+            print(f"  deferred reason: {deferred_rotation['reason'] or '-'}")
+            print(f"  active sessions blocking switch: {deferred_rotation['session_count']}")
+            print(f"  trigger: {deferred_rotation['trigger_source'] or '-'}")
         if capture is not None:
             print(f"  captured at: {capture['timestamp'] or '-'}")
             print(f"  recent candidates: {capture['recent_candidates'] if capture['recent_candidates'] is not None else '-'}")
@@ -4897,9 +5081,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         restart_flag = background.get("restart_after_switch")
         refresh_flag = background.get("refresh_usage")
         resume_flag = background.get("resume_interrupted_sessions")
+        defer_flag = background.get("defer_switch_while_active")
         print(f"  restart after switch: {'yes' if restart_flag else 'no' if restart_flag is False else '-'}")
         print(f"  refresh usage: {'yes' if refresh_flag else 'no' if refresh_flag is False else '-'}")
         print(f"  resume interrupted sessions: {'yes' if resume_flag else 'no' if resume_flag is False else '-'}")
+        print(f"  defer switch while active: {'yes' if defer_flag else 'no' if defer_flag is False else '-'}")
     stdout_line = read_recent_log_line(DEFAULT_LAUNCHD_STDOUT)
     stderr_line = read_recent_log_line(DEFAULT_LAUNCHD_STDERR)
     stdout_time = file_mtime(DEFAULT_LAUNCHD_STDOUT)
@@ -5335,6 +5521,46 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 f"{triggered_until.isoformat()} ({triggered_reason}, source={trigger_source})"
             )
             return 0
+        hard_rotation = rotation_trigger_is_hard(
+            forced_trigger_reason=forced_trigger_reason,
+            usage=current_usage,
+            primary_used_percent=trigger_primary_used,
+            secondary_used_percent=trigger_secondary_used,
+        )
+        active_snapshot = None if hard_rotation else active_desktop_sessions_before_switch(args)
+        if active_snapshot is not None:
+            sessions = active_snapshot.get("sessions")
+            session_ids = [
+                str(session.get("id") or "")
+                for session in sessions
+                if isinstance(session, dict) and session.get("id")
+            ] if isinstance(sessions, list) else []
+            append_event(
+                args.events_path,
+                "rotation_deferred_active_sessions",
+                account_id=current_account,
+                reason=triggered_reason,
+                trigger_source=trigger_source,
+                cooldown_until=triggered_until.isoformat(),
+                snapshot_path=active_snapshot.get("path"),
+                session_count=len(session_ids),
+                session_ids=session_ids,
+            )
+            print(
+                "rotation deferred: active Codex Desktop session(s) are still running; "
+                "will switch after they become idle"
+            )
+            return 0
+        if hard_rotation:
+            append_event(
+                args.events_path,
+                "rotation_forced_hard_exhaustion",
+                account_id=current_account,
+                reason=triggered_reason,
+                trigger_source=trigger_source,
+                primary_used_percent=trigger_primary_used,
+                secondary_used_percent=trigger_secondary_used,
+            )
         recent_rotation, retry_after_seconds = auto_rotation_recently_blocked(state, now=now_local())
         if recent_rotation:
             append_event(
@@ -5547,6 +5773,7 @@ def cmd_launchd_status(args: argparse.Namespace) -> int:
     print(f"  restart after switch: {'yes' if status.get('restart_after_switch') else 'no' if status.get('restart_after_switch') is False else '-'}")
     print(f"  refresh usage: {'yes' if status.get('refresh_usage') else 'no' if status.get('refresh_usage') is False else '-'}")
     print(f"  resume interrupted sessions: {'yes' if status.get('resume_interrupted_sessions') else 'no' if status.get('resume_interrupted_sessions') is False else '-'}")
+    print(f"  defer switch while active: {'yes' if status.get('defer_switch_while_active') else 'no' if status.get('defer_switch_while_active') is False else '-'}")
     print(f"  recent stdout: {stdout_line or '-'}")
     print(f"  stdout time: {fmt_dt(stdout_time)}")
     print(f"  recent stderr: {stderr_line or '-'}")
@@ -5652,6 +5879,7 @@ def cmd_systemd_status(args: argparse.Namespace) -> int:
     print(f"  restart after switch: {'yes' if status.get('restart_after_switch') else 'no' if status.get('restart_after_switch') is False else '-'}")
     print(f"  refresh usage: {'yes' if status.get('refresh_usage') else 'no' if status.get('refresh_usage') is False else '-'}")
     print(f"  resume interrupted sessions: {'yes' if status.get('resume_interrupted_sessions') else 'no' if status.get('resume_interrupted_sessions') is False else '-'}")
+    print(f"  defer switch while active: {'yes' if status.get('defer_switch_while_active') else 'no' if status.get('defer_switch_while_active') is False else '-'}")
     print(f"  recent stdout: {stdout_line or '-'}")
     print(f"  stdout time: {fmt_dt(stdout_time)}")
     print(f"  recent stderr: {stderr_line or '-'}")
@@ -5762,6 +5990,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="show a human-friendly one-screen overview of current account, limits, next candidate, and daemon health",
     )
     dashboard_parser.set_defaults(func=cmd_dashboard)
+
+    forecast_parser = subparsers.add_parser(
+        "forecast",
+        help="explain which account will be used next and why",
+    )
+    forecast_parser.add_argument("--json", action="store_true", help="print machine-readable forecast JSON")
+    forecast_parser.add_argument("--no-discover", action="store_true", help="skip automatic account discovery during forecast")
+    forecast_parser.set_defaults(func=cmd_forecast)
+
+    report_parser = subparsers.add_parser(
+        "report",
+        help="print a machine-readable health report for automation and debugging",
+    )
+    report_parser.add_argument("--no-discover", action="store_true", help="skip automatic account discovery during report")
+    report_parser.set_defaults(func=cmd_report)
+
+    fix_parser = subparsers.add_parser(
+        "fix",
+        help="preview or apply low-risk repairs for auth sync, expired cooldowns, and missing metadata",
+    )
+    fix_parser.add_argument("--apply", action="store_true", help="apply the safe fixes; default is dry-run")
+    fix_parser.set_defaults(func=cmd_fix)
 
     info_parser = subparsers.add_parser(
         "info",
@@ -6180,6 +6430,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not send '继续' to recently active Codex Desktop sessions after restarting",
     )
     tick_parser.add_argument(
+        "--no-defer-switch-while-active",
+        action="store_false",
+        dest="defer_switch_while_active",
+        default=True,
+        help="allow automatic restart even when a Codex Desktop session still appears active",
+    )
+    tick_parser.add_argument(
         "--refresh-usage",
         action="store_true",
         default=True,
@@ -6248,6 +6505,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume-interrupted-sessions",
         action="store_true",
         help="do not send '继续' to recently active Codex Desktop sessions after restarting",
+    )
+    daemon_parser.add_argument(
+        "--no-defer-switch-while-active",
+        action="store_false",
+        dest="defer_switch_while_active",
+        default=True,
+        help="allow automatic restart even when a Codex Desktop session still appears active",
     )
     daemon_parser.add_argument(
         "--refresh-usage",

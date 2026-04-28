@@ -147,19 +147,27 @@ codex-auth-pool refresh-usage --force
 
 ```bash
 codex-auth-pool tick --dry-run
+codex-auth-pool forecast
+codex-auth-pool report --no-discover
+codex-auth-pool fix
 codex-auth-pool events --limit 10
 ```
 
 `tick --dry-run` 只报告是否会触发轮换，不会写入冷却、不切号、不重启。
+`forecast` 会在一个屏幕里说明当前账号、下一个账号、额度来源、后台状态，以及接下来会不会切号。
+`report` 输出同样信息的 JSON，方便后续做面板、脚本或排障。
+`fix` 默认是 dry-run，只预览低风险修复；确认后用 `fix --apply` 同步 auth 文件、清理过期冷却或补齐缺失元数据。
 `events` 默认输出易读摘要；如果需要原始 JSONL，可以使用 `codex-auth-pool events --raw`。
 
 ## 被重启打断的会话恢复
 
 通过 `launchd-install`、`systemd-install`、`setup --install-*` 或 `init --install-*` 安装后台服务时，默认会启用切号后重启。macOS 上自动轮换切号后，工具会做一个保守的恢复流程：
 
+- 软触发时，如果 Desktop 会话仍在执行，会先延迟切换，减少不必要打断
+- 硬耗尽时仍然强制切换/重启，包括明确 `limit_reached`、`allowed=false`、auth 失效或额度接近 100%
 - 重启 Codex Desktop 前，从 `~/.codex/state_5.sqlite` 和 `~/.codex/logs_2.sqlite` 捕获最近活跃的 Desktop 会话
 - Codex Desktop 重新启动后，后台启动轻量恢复 helper，对每个捕获到的 `threadId` 执行 `thread/resume` 和 `turn/start`
-- 恢复时优先沿用原线程已记录的模型，因此 Desktop/plugin 会话不再因为 `codex exec resume` 不兼容而被主动跳过
+- 恢复只走原 Desktop 线程路径；不再降级到 `codex exec resume`，因为那可能创建单独 CLI 恢复，而不是继续原 Desktop 会话
 - 会话快照和恢复日志保存在 `~/.codex-auth-pool/session-recovery/`
 
 如果你只想自动重启，不想自动对会话发送 `继续`：
@@ -216,6 +224,10 @@ codex-auth-pool systemd-status
 codex-auth-pool list
 codex-auth-pool dashboard
 codex-auth-pool status
+codex-auth-pool forecast
+codex-auth-pool report --no-discover
+codex-auth-pool fix
+codex-auth-pool fix --apply
 codex-auth-pool pick
 codex-auth-pool check
 codex-auth-pool doctor

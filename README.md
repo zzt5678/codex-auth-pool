@@ -147,19 +147,27 @@ This queries ChatGPT directly for each account and updates the cached reset data
 
 ```bash
 codex-auth-pool tick --dry-run
+codex-auth-pool forecast
+codex-auth-pool report --no-discover
+codex-auth-pool fix
 codex-auth-pool events --limit 10
 ```
 
 `tick --dry-run` reports whether a rotation would trigger without writing cooldowns, switching accounts, or restarting Codex.
+`forecast` explains the current account, next account, quota source, daemon status, and expected switching behavior in one screen.
+`report` prints the same state as JSON for automation and debugging.
+`fix` is dry-run by default and only previews low-risk repairs; use `fix --apply` to synchronize auth files, clear expired cooldowns, or create missing metadata.
 `events` prints a readable summary by default; use `codex-auth-pool events --raw` for raw JSONL.
 
 ## Interrupted Session Recovery
 
 Background services installed with `launchd-install`, `systemd-install`, `setup --install-*`, or `init --install-*` now enable `--restart-after-switch` by default. On macOS, that means `codex-auth-pool` does a conservative recovery pass whenever automatic rotation switches accounts:
 
+- soft quota triggers can defer switching while a Desktop session still appears active, reducing unnecessary interruptions
+- hard exhaustion triggers still force switching/restart, including explicit `limit_reached`, `allowed=false`, expired auth, or near-100% quota
 - before quitting Codex Desktop, it captures recently active Desktop sessions from `~/.codex/state_5.sqlite` and `~/.codex/logs_2.sqlite`
 - after Codex Desktop comes back up, it starts a lightweight recovery helper that calls `thread/resume` and `turn/start` for each captured `threadId`
-- recovery uses the original thread model when known, so Desktop/plugin sessions are no longer intentionally skipped as `codex exec resume` incompatibilities
+- recovery uses the original Desktop thread path only; it no longer falls back to `codex exec resume`, because that can create a separate CLI resume instead of continuing the original Desktop session
 - recovery snapshots and resume logs are written under `~/.codex-auth-pool/session-recovery/`
 
 If you only want the restart without auto-resuming interrupted sessions:
@@ -216,6 +224,10 @@ it means the value came from ChatGPT directly, not just a local guess.
 codex-auth-pool list
 codex-auth-pool dashboard
 codex-auth-pool status
+codex-auth-pool forecast
+codex-auth-pool report --no-discover
+codex-auth-pool fix
+codex-auth-pool fix --apply
 codex-auth-pool pick
 codex-auth-pool check
 codex-auth-pool doctor
