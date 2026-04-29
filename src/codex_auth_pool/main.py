@@ -4344,7 +4344,36 @@ def sync_cliproxy_into_managed(source_dir: Path, managed_dir: Path) -> list[Path
     }
     for source_path in discover_profiles(source_dir):
         normalized = normalize_source_payload(source_path, read_json(source_path))
-        if normalized.get("account_id") in existing_accounts:
+        account_id = str(normalized.get("account_id") or "")
+        existing_path = existing_accounts.get(account_id)
+        if existing_path is not None:
+            existing = normalize_source_payload(existing_path, read_json(existing_path), read_profile_metadata(existing_path))
+            source_last_refresh = parse_dt(str(normalized.get("last_refresh") or ""))
+            existing_last_refresh = parse_dt(str(existing.get("last_refresh") or ""))
+            source_expired = parse_dt(str(normalized.get("expired") or ""))
+            existing_expired = parse_dt(str(existing.get("expired") or ""))
+            source_is_newer = (
+                (source_last_refresh is not None and (existing_last_refresh is None or source_last_refresh > existing_last_refresh))
+                or (source_expired is not None and (existing_expired is None or source_expired > existing_expired))
+            )
+            token_changed = bool(normalized.get("access_token")) and normalized.get("access_token") != existing.get("access_token")
+            if not source_is_newer or not token_changed:
+                continue
+            backup = make_backup(existing_path)
+            write_json(existing_path, convert_profile(normalized))
+            write_json(meta_path_for_profile(existing_path), metadata_for_profile({**normalized, "source_kind": "managed"}, existing_path))
+            append_event(
+                DEFAULT_EVENTS_PATH,
+                "sync_cliproxy_profile_updated",
+                source_path=str(source_path),
+                managed_path=str(existing_path),
+                backup=str(backup),
+                account_id=account_id,
+                email=normalized.get("email"),
+                source_expired=normalized.get("expired"),
+                previous_expired=existing.get("expired"),
+            )
+            synced.append(existing_path)
             continue
         out = save_managed_profile_from_payload(
             normalized,
@@ -4354,7 +4383,7 @@ def sync_cliproxy_into_managed(source_dir: Path, managed_dir: Path) -> list[Path
             source_file=str(source_path),
         )
         synced.append(out)
-        existing_accounts[normalized["account_id"]] = out
+        existing_accounts[account_id] = out
     return synced
 
 
@@ -4422,28 +4451,33 @@ def cmd_sync_cliproxy(args: argparse.Namespace) -> int:
         for path in discover_managed_profiles(args.managed_dir)
     }
     synced = sync_cliproxy_into_managed(args.source_dir, args.managed_dir)
+    new_count = sum(1 for path in synced if summarize_profile(path).account_id not in before_accounts)
+    updated_count = len(synced) - new_count
     source_count = len(discover_profiles(args.source_dir))
     skipped = max(source_count - len(synced), 0)
     append_event(
         args.events_path,
         "sync_cliproxy_into_managed",
         synced_count=len(synced),
+        new_count=new_count,
+        updated_count=updated_count,
     )
     print("Sync Result")
     print(f"  source profiles found: {source_count}")
-    print(f"  imported into managed vault: {len(synced)}")
+    print(f"  imported new profiles: {new_count}")
+    print(f"  updated existing profiles: {updated_count}")
     print(f"  skipped: {skipped}")
     if skipped:
-        print("  skip reason: same account_id already existed in managed vault")
+        print("  skip reason: managed profile already had the same or newer auth")
     if synced:
         print("")
-        print("Imported")
+        print("Imported/Updated")
         for path in synced:
             summary = summarize_profile(path)
             status = "new" if summary.account_id not in before_accounts else "updated"
             print(f"  - {summary.email or summary.account_id} ({path.name}, {status})")
     else:
-        print("  nothing new to import")
+        print("  nothing new to import or update")
     return 0
 
 
