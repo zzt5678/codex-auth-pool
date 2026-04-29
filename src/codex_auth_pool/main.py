@@ -116,6 +116,7 @@ DEFAULT_RESUME_MODEL_CANDIDATES = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 RESUME_MODEL_NEGATIVE_CACHE_SECONDS = 24 * 60 * 60
 RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
 RESUME_VERIFY_DELAY_SECONDS = 60.0
+DEFAULT_HARD_ACTIVE_GRACE_SECONDS = 10 * 60
 BROWSER_USE_SESSION_MARKERS = (
     "in app browser",
     "browser-use",
@@ -2600,6 +2601,7 @@ def write_launchd_plist(
     refresh_usage: bool,
     usage_max_age_minutes: int,
     resume_interrupted_sessions: bool,
+    hard_active_grace_seconds: int,
 ) -> Path:
     plist_path = launchd_plist_path(label)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2631,6 +2633,8 @@ def write_launchd_plist(
             str(secondary_threshold),
             "--usage-max-age-minutes",
             str(usage_max_age_minutes),
+            "--hard-active-grace-seconds",
+            str(hard_active_grace_seconds),
         ]
         + (["--restart-after-switch"] if restart_after_switch else [])
         + (["--refresh-usage"] if refresh_usage else [])
@@ -2696,6 +2700,7 @@ def launchctl_status(label: str) -> dict[str, Any]:
         "refresh_usage": None,
         "resume_interrupted_sessions": None,
         "defer_switch_while_active": None,
+        "hard_active_grace_seconds": None,
     }
     if plist_path.exists():
         try:
@@ -2709,6 +2714,10 @@ def launchctl_status(label: str) -> dict[str, Any]:
                 status["refresh_usage"] = "--refresh-usage" in args
                 status["resume_interrupted_sessions"] = "--no-resume-interrupted-sessions" not in args
                 status["defer_switch_while_active"] = "--no-defer-switch-while-active" not in args
+                if "--hard-active-grace-seconds" in args:
+                    index = args.index("--hard-active-grace-seconds")
+                    if index + 1 < len(args):
+                        status["hard_active_grace_seconds"] = _safe_int(args[index + 1])
         except (OSError, plistlib.InvalidFileException):
             pass
     if not is_macos():
@@ -2768,6 +2777,7 @@ def write_systemd_service(
     resume_interrupted_sessions: bool,
     stdout_path: Path,
     stderr_path: Path,
+    hard_active_grace_seconds: int,
 ) -> Path:
     unit = systemd_unit_name(service_name)
     service_path = systemd_service_path(unit)
@@ -2800,6 +2810,8 @@ def write_systemd_service(
         str(secondary_threshold),
         "--usage-max-age-minutes",
         str(usage_max_age_minutes),
+        "--hard-active-grace-seconds",
+        str(hard_active_grace_seconds),
     ]
     if restart_after_switch:
         command.append("--restart-after-switch")
@@ -2846,6 +2858,7 @@ def systemd_status(service_name: str) -> dict[str, Any]:
         "refresh_usage": None,
         "resume_interrupted_sessions": None,
         "defer_switch_while_active": None,
+        "hard_active_grace_seconds": None,
     }
     if service_path.exists():
         try:
@@ -2854,6 +2867,9 @@ def systemd_status(service_name: str) -> dict[str, Any]:
             status["refresh_usage"] = "--refresh-usage" in text
             status["resume_interrupted_sessions"] = "--no-resume-interrupted-sessions" not in text
             status["defer_switch_while_active"] = "--no-defer-switch-while-active" not in text
+            match = re.search(r"--hard-active-grace-seconds\s+(\d+)", text)
+            if match:
+                status["hard_active_grace_seconds"] = _safe_int(match.group(1))
         except OSError:
             pass
     if not is_linux() or not shutil_lib.which("systemctl"):
@@ -2886,6 +2902,7 @@ def background_service_status() -> dict[str, Any]:
             "refresh_usage": status.get("refresh_usage"),
             "resume_interrupted_sessions": status.get("resume_interrupted_sessions"),
             "defer_switch_while_active": status.get("defer_switch_while_active"),
+            "hard_active_grace_seconds": status.get("hard_active_grace_seconds"),
         }
     if is_linux():
         status = systemd_status(DEFAULT_SYSTEMD_SERVICE)
@@ -2899,6 +2916,7 @@ def background_service_status() -> dict[str, Any]:
             "refresh_usage": status.get("refresh_usage"),
             "resume_interrupted_sessions": status.get("resume_interrupted_sessions"),
             "defer_switch_while_active": status.get("defer_switch_while_active"),
+            "hard_active_grace_seconds": status.get("hard_active_grace_seconds"),
         }
     return {"kind": platform.system(), "installed": False, "running": False, "state": None, "pid": None}
 
@@ -3814,6 +3832,7 @@ def build_pool_report(args: argparse.Namespace, *, discover: bool = True) -> dic
         "accounts": [ranked_item_report(item) for item in ranked],
         "background_service": jsonable(background),
         "last_switch": jsonable(last_apply),
+        "pending_rotation": jsonable(state.get("pending_rotation") if isinstance(state.get("pending_rotation"), dict) else None),
         "session_recovery": {
             "last_capture": jsonable(capture),
             "deferred_rotation": jsonable(deferred_rotation),
@@ -3925,6 +3944,20 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  imported new cliproxy accounts: {len(discovery['synced'])}")
         print(f"  refreshed new usage snapshots: {len(discovery['refreshed'])}")
         print(f"  failed new usage refreshes: {len(discovery['failed'])}")
+    print("")
+    print("Pending Rotation")
+    pending_rotation = state.get("pending_rotation") if isinstance(state.get("pending_rotation"), dict) else None
+    if pending_rotation is None:
+        print("  none")
+    else:
+        print(f"  account_id: {pending_rotation.get('account_id') or '-'}")
+        print(f"  reason: {pending_rotation.get('reason') or '-'}")
+        print(f"  trigger: {pending_rotation.get('trigger_source') or '-'}")
+        print(f"  hard: {'yes' if pending_rotation.get('hard') else 'no'}")
+        print(f"  cooldown_until: {pending_rotation.get('cooldown_until') or '-'}")
+        print(f"  hard_grace_until: {pending_rotation.get('hard_grace_until') or '-'}")
+        session_ids = pending_rotation.get("session_ids")
+        print(f"  sessions: {len(session_ids) if isinstance(session_ids, list) else 0}")
     print("")
     print("Last Switch")
     last_apply = state.get("last_apply") if isinstance(state.get("last_apply"), dict) else None
@@ -5082,10 +5115,12 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         refresh_flag = background.get("refresh_usage")
         resume_flag = background.get("resume_interrupted_sessions")
         defer_flag = background.get("defer_switch_while_active")
+        hard_grace = background.get("hard_active_grace_seconds")
         print(f"  restart after switch: {'yes' if restart_flag else 'no' if restart_flag is False else '-'}")
         print(f"  refresh usage: {'yes' if refresh_flag else 'no' if refresh_flag is False else '-'}")
         print(f"  resume interrupted sessions: {'yes' if resume_flag else 'no' if resume_flag is False else '-'}")
         print(f"  defer switch while active: {'yes' if defer_flag else 'no' if defer_flag is False else '-'}")
+        print(f"  hard active grace: {hard_grace}s" if hard_grace is not None else "  hard active grace: -")
     stdout_line = read_recent_log_line(DEFAULT_LAUNCHD_STDOUT)
     stderr_line = read_recent_log_line(DEFAULT_LAUNCHD_STDERR)
     stdout_time = file_mtime(DEFAULT_LAUNCHD_STDOUT)
@@ -5416,6 +5451,189 @@ def set_cooldown_by_account_id(
     save_state(state_path, state)
 
 
+def pending_rotation_session_ids(active_snapshot: dict[str, Any] | None) -> list[str]:
+    if active_snapshot is None:
+        return []
+    sessions = active_snapshot.get("sessions")
+    if not isinstance(sessions, list):
+        return []
+    return [
+        str(session.get("id") or "")
+        for session in sessions
+        if isinstance(session, dict) and session.get("id")
+    ]
+
+
+def pending_rotation_record(
+    *,
+    account_id: str,
+    reason: str,
+    cooldown_until: datetime,
+    trigger_source: str | None,
+    hard: bool,
+    active_snapshot: dict[str, Any] | None,
+    hard_active_grace_seconds: int,
+    primary_used_percent: float | None,
+    secondary_used_percent: float | None,
+) -> dict[str, Any]:
+    now = now_local()
+    hard_grace_until = None
+    if hard and hard_active_grace_seconds > 0:
+        hard_grace_until = now + timedelta(seconds=hard_active_grace_seconds)
+    return {
+        "account_id": account_id,
+        "reason": reason,
+        "cooldown_until": cooldown_until.isoformat(),
+        "trigger_source": trigger_source,
+        "hard": hard,
+        "created_at": now.isoformat(),
+        "hard_grace_until": hard_grace_until.isoformat() if hard_grace_until is not None else None,
+        "snapshot_path": active_snapshot.get("path") if active_snapshot else None,
+        "session_ids": pending_rotation_session_ids(active_snapshot),
+        "primary_used_percent": primary_used_percent,
+        "secondary_used_percent": secondary_used_percent,
+    }
+
+
+def set_pending_rotation(state_path: Path, record: dict[str, Any], events_path: Path) -> None:
+    state = load_state(state_path)
+    state["pending_rotation"] = record
+    save_state(state_path, state)
+    append_event(events_path, "rotation_pending_set", **record)
+
+
+def clear_pending_rotation(state_path: Path, events_path: Path, *, reason: str) -> None:
+    state = load_state(state_path)
+    existing = state.pop("pending_rotation", None)
+    save_state(state_path, state)
+    if isinstance(existing, dict):
+        append_event(
+            events_path,
+            "rotation_pending_cleared",
+            reason=reason,
+            account_id=existing.get("account_id"),
+            pending_reason=existing.get("reason"),
+            created_at=existing.get("created_at"),
+        )
+
+
+def apply_auto_rotation_from_trigger(
+    args: argparse.Namespace,
+    *,
+    current_account: str,
+    triggered_reason: str,
+    triggered_until: datetime,
+    trigger_source: str | None,
+    trigger_primary_used: float | None,
+    trigger_secondary_used: float | None,
+    pending: bool = False,
+) -> int:
+    state = load_state(args.state_path)
+    recent_rotation, retry_after_seconds = auto_rotation_recently_blocked(state, now=now_local())
+    if recent_rotation:
+        append_event(
+            args.events_path,
+            "rotation_skipped_recent",
+            account_id=current_account,
+            reason=triggered_reason,
+            retry_after_seconds=retry_after_seconds,
+            trigger_source=trigger_source,
+            pending=pending,
+        )
+        print(f"rotation skipped: recent automatic rotation, retry after {retry_after_seconds}s")
+        return 0
+
+    set_cooldown_by_account_id(args.state_path, current_account, triggered_until, triggered_reason)
+    append_event(
+        args.events_path,
+        "auto_cooldown",
+        account_id=current_account,
+        cooldown_until=triggered_until.isoformat(),
+        reason=triggered_reason,
+        primary_used_percent=trigger_primary_used,
+        secondary_used_percent=trigger_secondary_used,
+        trigger_source=trigger_source,
+        pending=pending,
+    )
+    print(
+        f"marked current account {current_account} on cooldown until "
+        f"{triggered_until.isoformat()} ({triggered_reason}, source={trigger_source})"
+    )
+
+    if args.no_apply_best:
+        if pending:
+            clear_pending_rotation(args.state_path, args.events_path, reason="cooldown_only")
+        return 0
+
+    picked = None
+    ranked_candidates = rank_profiles(
+        args.source_dir,
+        args.managed_dir,
+        load_state(args.state_path),
+        Path(args.target),
+    )
+    for candidate in ranked_candidates:
+        if not candidate["available"] or candidate["summary"].account_id == current_account:
+            continue
+        validation_ok, validation_error = validate_profile_before_apply(
+            args,
+            candidate["path"],
+            apply_source="auto_rotation",
+        )
+        if validation_ok:
+            picked = candidate
+            break
+        print(f"skipped candidate {candidate['summary'].email or candidate['summary'].account_id}: {validation_error}")
+
+    if picked and picked["summary"].account_id != current_account:
+        previous_profile = getattr(args, "profile", None)
+        previous_apply_source = getattr(args, "apply_source", None)
+        previous_rotation_reason = getattr(args, "rotation_reason", None)
+        previous_rotation_trigger_source = getattr(args, "rotation_trigger_source", None)
+        previous_skip_usage_validation = getattr(args, "skip_usage_validation", False)
+        try:
+            args.profile = str(picked["path"])
+            args.apply_source = "auto_rotation"
+            args.rotation_reason = triggered_reason
+            args.rotation_trigger_source = trigger_source
+            args.skip_usage_validation = True
+            result = cmd_apply(args)
+        finally:
+            args.profile = previous_profile
+            args.apply_source = previous_apply_source
+            args.rotation_reason = previous_rotation_reason
+            args.rotation_trigger_source = previous_rotation_trigger_source
+            args.skip_usage_validation = previous_skip_usage_validation
+        clear_pending_rotation(args.state_path, args.events_path, reason="applied")
+        return result
+
+    ranked_after_cooldown = rank_profiles(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
+    hint = next_unblock_hint(ranked_after_cooldown)
+    blocked_examples = [
+        {
+            "account": item["summary"].email or item["summary"].account_id,
+            "reasons": profile_block_reasons(item),
+        }
+        for item in ranked_after_cooldown
+        if not item["available"] and not item["is_current"]
+    ][:5]
+    append_event(
+        args.events_path,
+        "rotation_blocked",
+        account_id=current_account,
+        reason=triggered_reason,
+        next_unblock=hint,
+        blocked_examples=blocked_examples,
+        pending=pending,
+    )
+    print("no alternate available profile to switch to")
+    if hint:
+        print(f"next unblock: {hint}")
+    for item in blocked_examples[:3]:
+        print(f"blocked: {item['account']} -> {'; '.join(item['reasons'])}")
+    return 0
+
+
 def cmd_tick(args: argparse.Namespace) -> int:
     with exclusive_lock(DEFAULT_TICK_LOCK_PATH, blocking=False) as acquired:
         if not acquired:
@@ -5460,6 +5678,61 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         cmd_refresh_usage(refresh_args)
 
     state = load_state(args.state_path)
+    pending_rotation = state.get("pending_rotation")
+    if isinstance(pending_rotation, dict) and pending_rotation.get("account_id") and pending_rotation.get("account_id") != current_account:
+        clear_pending_rotation(args.state_path, args.events_path, reason="current_account_changed")
+        state = load_state(args.state_path)
+        pending_rotation = state.get("pending_rotation")
+    if isinstance(pending_rotation, dict) and pending_rotation.get("account_id") == current_account:
+        pending_reason = str(pending_rotation.get("reason") or "quota_limit")
+        pending_until = parse_dt(str(pending_rotation.get("cooldown_until") or ""))
+        if pending_until is None:
+            pending_until = now_local() + timedelta(hours=5)
+        if getattr(args, "dry_run", False):
+            print(
+                f"dry run: pending rotation for current account {current_account} "
+                f"until {pending_until.isoformat()} ({pending_reason})"
+            )
+            return 0
+        active_snapshot = active_desktop_sessions_before_switch(args)
+        pending_hard = bool(pending_rotation.get("hard"))
+        grace_until = parse_dt(str(pending_rotation.get("hard_grace_until") or ""))
+        if active_snapshot is not None and (not pending_hard or (grace_until is not None and now_local() < grace_until)):
+            session_ids = pending_rotation_session_ids(active_snapshot)
+            append_event(
+                args.events_path,
+                "rotation_pending_waiting_active_sessions",
+                account_id=current_account,
+                reason=pending_reason,
+                trigger_source=pending_rotation.get("trigger_source"),
+                hard=pending_hard,
+                hard_grace_until=grace_until.isoformat() if grace_until is not None else None,
+                snapshot_path=active_snapshot.get("path"),
+                session_count=len(session_ids),
+                session_ids=session_ids,
+            )
+            print("rotation pending: active Codex Desktop session(s) are still running; will switch after they become idle")
+            return 0
+        append_event(
+            args.events_path,
+            "rotation_pending_ready",
+            account_id=current_account,
+            reason=pending_reason,
+            trigger_source=pending_rotation.get("trigger_source"),
+            hard=pending_hard,
+            grace_expired=active_snapshot is not None and pending_hard,
+        )
+        return apply_auto_rotation_from_trigger(
+            args,
+            current_account=current_account,
+            triggered_reason=pending_reason,
+            triggered_until=pending_until,
+            trigger_source=str(pending_rotation.get("trigger_source") or "pending_rotation"),
+            trigger_primary_used=pending_rotation.get("primary_used_percent"),
+            trigger_secondary_used=pending_rotation.get("secondary_used_percent"),
+            pending=True,
+        )
+
     snapshot = latest_rate_limit_snapshot(args.sessions_dir)
     current_usage, usage_note = current_profile_usage_snapshot(
         args.source_dir,
@@ -5527,30 +5800,58 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             primary_used_percent=trigger_primary_used,
             secondary_used_percent=trigger_secondary_used,
         )
-        active_snapshot = None if hard_rotation else active_desktop_sessions_before_switch(args)
+        active_snapshot = active_desktop_sessions_before_switch(args)
         if active_snapshot is not None:
-            sessions = active_snapshot.get("sessions")
-            session_ids = [
-                str(session.get("id") or "")
-                for session in sessions
-                if isinstance(session, dict) and session.get("id")
-            ] if isinstance(sessions, list) else []
-            append_event(
-                args.events_path,
-                "rotation_deferred_active_sessions",
-                account_id=current_account,
-                reason=triggered_reason,
-                trigger_source=trigger_source,
-                cooldown_until=triggered_until.isoformat(),
-                snapshot_path=active_snapshot.get("path"),
-                session_count=len(session_ids),
-                session_ids=session_ids,
-            )
-            print(
-                "rotation deferred: active Codex Desktop session(s) are still running; "
-                "will switch after they become idle"
-            )
-            return 0
+            session_ids = pending_rotation_session_ids(active_snapshot)
+            hard_active_grace_seconds = max(0, int(getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS)))
+            if hard_rotation and hard_active_grace_seconds <= 0:
+                append_event(
+                    args.events_path,
+                    "rotation_forced_hard_exhaustion",
+                    account_id=current_account,
+                    reason=triggered_reason,
+                    trigger_source=trigger_source,
+                    primary_used_percent=trigger_primary_used,
+                    secondary_used_percent=trigger_secondary_used,
+                    active_session_count=len(session_ids),
+                )
+            else:
+                pending_record = pending_rotation_record(
+                    account_id=current_account,
+                    reason=triggered_reason,
+                    cooldown_until=triggered_until,
+                    trigger_source=trigger_source,
+                    hard=hard_rotation,
+                    active_snapshot=active_snapshot,
+                    hard_active_grace_seconds=hard_active_grace_seconds,
+                    primary_used_percent=trigger_primary_used,
+                    secondary_used_percent=trigger_secondary_used,
+                )
+                set_pending_rotation(args.state_path, pending_record, args.events_path)
+                event_type = "rotation_deferred_hard_active_sessions" if hard_rotation else "rotation_deferred_active_sessions"
+                append_event(
+                    args.events_path,
+                    event_type,
+                    account_id=current_account,
+                    reason=triggered_reason,
+                    trigger_source=trigger_source,
+                    cooldown_until=triggered_until.isoformat(),
+                    hard_grace_until=pending_record.get("hard_grace_until"),
+                    snapshot_path=active_snapshot.get("path"),
+                    session_count=len(session_ids),
+                    session_ids=session_ids,
+                )
+                if hard_rotation:
+                    print(
+                        "rotation deferred briefly: account is exhausted but active session(s) are still running; "
+                        f"will switch after idle or after {hard_active_grace_seconds}s"
+                    )
+                else:
+                    print(
+                        "rotation deferred: active Codex Desktop session(s) are still running; "
+                        "will switch after they become idle"
+                    )
+                return 0
         if hard_rotation:
             append_event(
                 args.events_path,
@@ -5561,85 +5862,15 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 primary_used_percent=trigger_primary_used,
                 secondary_used_percent=trigger_secondary_used,
             )
-        recent_rotation, retry_after_seconds = auto_rotation_recently_blocked(state, now=now_local())
-        if recent_rotation:
-            append_event(
-                args.events_path,
-                "rotation_skipped_recent",
-                account_id=current_account,
-                reason=triggered_reason,
-                retry_after_seconds=retry_after_seconds,
-                trigger_source=trigger_source,
-            )
-            print(f"rotation skipped: recent automatic rotation, retry after {retry_after_seconds}s")
-            return 0
-        set_cooldown_by_account_id(args.state_path, current_account, triggered_until, triggered_reason)
-        append_event(
-            args.events_path,
-            "auto_cooldown",
-            account_id=current_account,
-            cooldown_until=triggered_until.isoformat(),
-            reason=triggered_reason,
-            primary_used_percent=trigger_primary_used,
-            secondary_used_percent=trigger_secondary_used,
+        return apply_auto_rotation_from_trigger(
+            args,
+            current_account=current_account,
+            triggered_reason=triggered_reason,
+            triggered_until=triggered_until,
             trigger_source=trigger_source,
+            trigger_primary_used=trigger_primary_used,
+            trigger_secondary_used=trigger_secondary_used,
         )
-        print(
-            f"marked current account {current_account} on cooldown until "
-            f"{triggered_until.isoformat()} ({triggered_reason}, source={trigger_source})"
-        )
-        if not args.no_apply_best:
-            picked = None
-            ranked_candidates = rank_profiles(
-                args.source_dir,
-                args.managed_dir,
-                load_state(args.state_path),
-                Path(args.target),
-            )
-            for candidate in ranked_candidates:
-                if not candidate["available"] or candidate["summary"].account_id == current_account:
-                    continue
-                validation_ok, validation_error = validate_profile_before_apply(
-                    args,
-                    candidate["path"],
-                    apply_source="auto_rotation",
-                )
-                if validation_ok:
-                    picked = candidate
-                    break
-                print(f"skipped candidate {candidate['summary'].email or candidate['summary'].account_id}: {validation_error}")
-            if picked and picked["summary"].account_id != current_account:
-                args.profile = str(picked["path"])
-                args.apply_source = "auto_rotation"
-                args.rotation_reason = triggered_reason
-                args.rotation_trigger_source = trigger_source
-                args.skip_usage_validation = True
-                cmd_apply(args)
-            else:
-                ranked_after_cooldown = rank_profiles(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
-                hint = next_unblock_hint(ranked_after_cooldown)
-                blocked_examples = [
-                    {
-                        "account": item["summary"].email or item["summary"].account_id,
-                        "reasons": profile_block_reasons(item),
-                    }
-                    for item in ranked_after_cooldown
-                    if not item["available"] and not item["is_current"]
-                ][:5]
-                append_event(
-                    args.events_path,
-                    "rotation_blocked",
-                    account_id=current_account,
-                    reason=triggered_reason,
-                    next_unblock=hint,
-                    blocked_examples=blocked_examples,
-                )
-                print("no alternate available profile to switch to")
-                if hint:
-                    print(f"next unblock: {hint}")
-                for item in blocked_examples[:3]:
-                    print(f"blocked: {item['account']} -> {'; '.join(item['reasons'])}")
-        return 0
 
     print(f"no rotation trigger; current account remains active (source={trigger_source})")
     return 0
@@ -5710,6 +5941,7 @@ def cmd_launchd_install(args: argparse.Namespace) -> int:
         refresh_usage=args.refresh_usage,
         usage_max_age_minutes=args.usage_max_age_minutes,
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
+        hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
     )
     launchctl_bootout(args.label)
     launchctl_bootstrap(args.label, plist_path)
@@ -5723,6 +5955,7 @@ def cmd_launchd_install(args: argparse.Namespace) -> int:
         restart_after_switch=args.restart_after_switch,
         refresh_usage=args.refresh_usage,
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
+        hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
     )
     print(json.dumps(status, ensure_ascii=False, indent=2))
     return 0
@@ -5774,6 +6007,8 @@ def cmd_launchd_status(args: argparse.Namespace) -> int:
     print(f"  refresh usage: {'yes' if status.get('refresh_usage') else 'no' if status.get('refresh_usage') is False else '-'}")
     print(f"  resume interrupted sessions: {'yes' if status.get('resume_interrupted_sessions') else 'no' if status.get('resume_interrupted_sessions') is False else '-'}")
     print(f"  defer switch while active: {'yes' if status.get('defer_switch_while_active') else 'no' if status.get('defer_switch_while_active') is False else '-'}")
+    grace = status.get("hard_active_grace_seconds")
+    print(f"  hard active grace: {grace}s" if grace is not None else "  hard active grace: -")
     print(f"  recent stdout: {stdout_line or '-'}")
     print(f"  stdout time: {fmt_dt(stdout_time)}")
     print(f"  recent stderr: {stderr_line or '-'}")
@@ -5808,6 +6043,7 @@ def cmd_systemd_install(args: argparse.Namespace) -> int:
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
         stdout_path=args.stdout_path,
         stderr_path=args.stderr_path,
+        hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
     )
     systemctl_user(["daemon-reload"])
     unit = systemd_unit_name(args.service_name)
@@ -5822,6 +6058,7 @@ def cmd_systemd_install(args: argparse.Namespace) -> int:
         restart_after_switch=args.restart_after_switch,
         refresh_usage=args.refresh_usage,
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
+        hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
     )
     print(f"installed systemd user service at {service_path}")
     print(json.dumps(systemd_status(unit), ensure_ascii=False, indent=2))
@@ -5880,6 +6117,8 @@ def cmd_systemd_status(args: argparse.Namespace) -> int:
     print(f"  refresh usage: {'yes' if status.get('refresh_usage') else 'no' if status.get('refresh_usage') is False else '-'}")
     print(f"  resume interrupted sessions: {'yes' if status.get('resume_interrupted_sessions') else 'no' if status.get('resume_interrupted_sessions') is False else '-'}")
     print(f"  defer switch while active: {'yes' if status.get('defer_switch_while_active') else 'no' if status.get('defer_switch_while_active') is False else '-'}")
+    grace = status.get("hard_active_grace_seconds")
+    print(f"  hard active grace: {grace}s" if grace is not None else "  hard active grace: -")
     print(f"  recent stdout: {stdout_line or '-'}")
     print(f"  stdout time: {fmt_dt(stdout_time)}")
     print(f"  recent stderr: {stderr_line or '-'}")
@@ -6112,6 +6351,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="when installing a background agent, do not auto-send '继续' after Codex restarts",
     )
+    init_parser.add_argument(
+        "--hard-active-grace-seconds",
+        type=int,
+        default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
+        help="when quota is exhausted but a Desktop session is active, wait this many seconds before forcing rotation",
+    )
     init_parser.add_argument("--usage-max-age-minutes", type=int, default=DEFAULT_USAGE_MAX_AGE_MINUTES)
     init_parser.add_argument(
         "--refresh-usage",
@@ -6247,6 +6492,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume-interrupted-sessions",
         action="store_true",
         help="when installing a background agent, do not auto-send '继续' after Codex restarts",
+    )
+    setup_parser.add_argument(
+        "--hard-active-grace-seconds",
+        type=int,
+        default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
+        help="when quota is exhausted but a Desktop session is active, wait this many seconds before forcing rotation",
     )
     setup_parser.add_argument("--usage-max-age-minutes", type=int, default=DEFAULT_USAGE_MAX_AGE_MINUTES)
     setup_parser.add_argument(
@@ -6437,6 +6688,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow automatic restart even when a Codex Desktop session still appears active",
     )
     tick_parser.add_argument(
+        "--hard-active-grace-seconds",
+        type=int,
+        default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
+        help="when quota is exhausted but a Desktop session is active, wait this many seconds before forcing rotation",
+    )
+    tick_parser.add_argument(
         "--refresh-usage",
         action="store_true",
         default=True,
@@ -6512,6 +6769,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="defer_switch_while_active",
         default=True,
         help="allow automatic restart even when a Codex Desktop session still appears active",
+    )
+    daemon_parser.add_argument(
+        "--hard-active-grace-seconds",
+        type=int,
+        default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
+        help="when quota is exhausted but a Desktop session is active, wait this many seconds before forcing rotation",
     )
     daemon_parser.add_argument(
         "--refresh-usage",
@@ -6605,6 +6868,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not send '继续' to recently active Codex Desktop sessions after automatic restart",
     )
     launchd_install_parser.add_argument(
+        "--hard-active-grace-seconds",
+        type=int,
+        default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
+        help="when quota is exhausted but a Desktop session is active, wait this many seconds before forcing rotation",
+    )
+    launchd_install_parser.add_argument(
         "--stdout-path",
         type=Path,
         default=DEFAULT_LAUNCHD_STDOUT,
@@ -6672,6 +6941,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume-interrupted-sessions",
         action="store_true",
         help="do not send '继续' to recently active Codex Desktop sessions after automatic restart",
+    )
+    systemd_install_parser.add_argument(
+        "--hard-active-grace-seconds",
+        type=int,
+        default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
+        help="when quota is exhausted but a Desktop session is active, wait this many seconds before forcing rotation",
     )
     systemd_install_parser.add_argument("--stdout-path", type=Path, default=DEFAULT_SYSTEMD_STDOUT)
     systemd_install_parser.add_argument("--stderr-path", type=Path, default=DEFAULT_SYSTEMD_STDERR)

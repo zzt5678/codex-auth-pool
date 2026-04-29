@@ -163,12 +163,18 @@ codex-auth-pool events --limit 10
 
 通过 `launchd-install`、`systemd-install`、`setup --install-*` 或 `init --install-*` 安装后台服务时，默认会启用切号后重启。macOS 上自动轮换切号后，工具会做一个保守的恢复流程：
 
-- 软触发时，如果 Desktop 会话仍在执行，会先延迟切换，减少不必要打断
-- 硬耗尽时仍然强制切换/重启，包括明确 `limit_reached`、`allowed=false`、auth 失效或额度接近 100%
+- 软触发时，如果 Desktop 会话仍在执行，会把轮换写入 `pending_rotation`，等会话空闲后自动切换，不会丢掉这次切换信号
+- 硬耗尽时也会先短暂等待活跃任务结束；默认最多等 10 分钟，任务提前结束就立即切换，超过宽限期仍未结束则强制切换，避免额度已经为 0 后永久卡死
 - 重启 Codex Desktop 前，从 `~/.codex/state_5.sqlite` 和 `~/.codex/logs_2.sqlite` 捕获最近活跃的 Desktop 会话
 - Codex Desktop 重新启动后，后台启动轻量恢复 helper，对每个捕获到的 `threadId` 执行 `thread/resume` 和 `turn/start`
 - 恢复只走原 Desktop 线程路径；不再降级到 `codex exec resume`，因为那可能创建单独 CLI 恢复，而不是继续原 Desktop 会话
 - 会话快照和恢复日志保存在 `~/.codex-auth-pool/session-recovery/`
+
+后台守护进程独立于当前 Codex 账号运行，所以即便当前账号额度已经归零、Codex App 不能继续回答，守护进程仍然可以读取 pending 状态、替换 auth，并重启 Codex。硬耗尽宽限期可调整：
+
+```bash
+codex-auth-pool launchd-install --hard-active-grace-seconds 600
+```
 
 如果你只想自动重启，不想自动对会话发送 `继续`：
 

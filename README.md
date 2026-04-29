@@ -163,12 +163,18 @@ codex-auth-pool events --limit 10
 
 Background services installed with `launchd-install`, `systemd-install`, `setup --install-*`, or `init --install-*` now enable `--restart-after-switch` by default. On macOS, that means `codex-auth-pool` does a conservative recovery pass whenever automatic rotation switches accounts:
 
-- soft quota triggers can defer switching while a Desktop session still appears active, reducing unnecessary interruptions
-- hard exhaustion triggers still force switching/restart, including explicit `limit_reached`, `allowed=false`, expired auth, or near-100% quota
+- soft quota triggers write a durable `pending_rotation` record while a Desktop session still appears active, then switch automatically once the session becomes idle
+- hard exhaustion also waits briefly for active work to finish; by default it waits up to 10 minutes, switches immediately if the session becomes idle sooner, and then forces rotation after the grace window so a zero-quota account cannot deadlock the app forever
 - before quitting Codex Desktop, it captures recently active Desktop sessions from `~/.codex/state_5.sqlite` and `~/.codex/logs_2.sqlite`
 - after Codex Desktop comes back up, it starts a lightweight recovery helper that calls `thread/resume` and `turn/start` for each captured `threadId`
 - recovery uses the original Desktop thread path only; it no longer falls back to `codex exec resume`, because that can create a separate CLI resume instead of continuing the original Desktop session
 - recovery snapshots and resume logs are written under `~/.codex-auth-pool/session-recovery/`
+
+The daemon runs independently from the currently selected Codex account. Even if the active account has reached zero quota and Codex Desktop can no longer answer, the daemon can still observe the pending rotation, replace the auth file, and restart Codex. Adjust the hard-exhaustion grace window with:
+
+```bash
+codex-auth-pool launchd-install --hard-active-grace-seconds 600
+```
 
 If you only want the restart without auto-resuming interrupted sessions:
 
