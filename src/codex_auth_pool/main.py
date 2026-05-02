@@ -858,10 +858,20 @@ def load_snapshot_manifest(snapshot_dir: Path) -> dict[str, Any]:
     return read_json(manifest_path)
 
 
-def restore_env_snapshot(snapshot_dir: Path) -> dict[str, Any]:
+def restore_env_snapshot(
+    snapshot_dir: Path,
+    *,
+    include_names: set[str] | None = None,
+    exclude_names: set[str] | None = None,
+) -> dict[str, Any]:
     manifest = load_snapshot_manifest(snapshot_dir)
     restored: list[dict[str, Any]] = []
     for item in manifest.get("items", []):
+        item_name = str(item.get("name") or "")
+        if include_names is not None and item_name not in include_names:
+            continue
+        if exclude_names is not None and item_name in exclude_names:
+            continue
         source_path = item.get("stored_path")
         target_path = item.get("source_path")
         if not source_path or not target_path:
@@ -908,7 +918,20 @@ def restore_browser_use_snapshot_if_available(env_snapshots_dir: Path, events_pa
                 env_snapshots_dir=str(env_snapshots_dir),
             )
         return None
-    restored = restore_env_snapshot(snapshot)
+    # Browser Use auth lives in Codex Desktop's Electron browser storage. Do not
+    # restore the whole historical snapshot here: that would roll back plugins
+    # installed after the snapshot and make users reinstall them after switches.
+    restored = restore_env_snapshot(
+        snapshot,
+        include_names={
+            "app_support_cookies",
+            "app_support_local_storage",
+            "app_support_session_storage",
+            "app_support_browser_partition",
+            "app_support_preferences",
+            "app_support_trust_tokens",
+        },
+    )
     if events_path is not None:
         append_event(
             events_path,
@@ -3472,6 +3495,10 @@ def fetch_remote_usage_for_payload(payload: dict[str, Any]) -> RemoteUsageSnapsh
     rate_limit = data.get("rate_limit", {}) if isinstance(data, dict) else {}
     primary = rate_limit.get("primary_window", {}) if isinstance(rate_limit, dict) else {}
     secondary = rate_limit.get("secondary_window", {}) if isinstance(rate_limit, dict) else {}
+    if not isinstance(primary, dict):
+        primary = {}
+    if not isinstance(secondary, dict):
+        secondary = {}
     return RemoteUsageSnapshot(
         account_id=data.get("account_id") or data.get("user_id") or account_id,
         email=data.get("email") or normalized.get("email"),
@@ -4434,6 +4461,83 @@ def cmd_import_auth_file(args: argparse.Namespace) -> int:
         enabled=not getattr(args, "no_notify", False),
     )
     print(f"imported auth file into managed vault: {out}")
+    return 0
+
+
+def cmd_export_ready_auths(args: argparse.Namespace) -> int:
+    auto_discover_new_profiles(
+        args.source_dir,
+        args.managed_dir,
+        args.events_path,
+        refresh_missing_usage=False,
+        max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+    )
+    destination = Path(args.output_dir).expanduser()
+    destination.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "clean", True):
+        for stale in destination.glob("*.json"):
+            stale.unlink()
+        for stale in destination.glob("*.txt"):
+            stale.unlink()
+
+    ranked = rank_profiles(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
+    ready = [item for item in ranked if item["available"]]
+    manifest_accounts: list[dict[str, Any]] = []
+    for index, item in enumerate(ready, start=1):
+        summary: ProfileSummary = item["summary"]
+        normalized = normalize_source_payload(summary.path, read_json(summary.path), read_profile_metadata(summary.path))
+        email_or_id = summary.email or summary.account_id or summary.path.stem
+        safe = "".join(ch if ch.isalnum() or ch in ".@_-" else "_" for ch in email_or_id)
+        out = destination / f"{index:02d}-{safe}.auth.json"
+        write_json(out, convert_profile(normalized))
+        reset_label, reset_source = effective_reset_label_for_profile(summary.path, summary)
+        manifest_accounts.append(
+            {
+                "file": out.name,
+                "email": summary.email,
+                "account_id": summary.account_id,
+                "source_profile": str(summary.path),
+                "current": bool(item["is_current"]),
+                "reset_at": reset_label,
+                "reset_source": reset_source,
+            }
+        )
+
+    manifest = {
+        "generated_at": now_local().isoformat(),
+        "output_dir": str(destination),
+        "count": len(manifest_accounts),
+        "target_files": [
+            str(DEFAULT_CODEX_AUTH_PATH),
+            str(DEFAULT_CODEX_ROOT_AUTH_PATH),
+        ],
+        "accounts": manifest_accounts,
+    }
+    write_json(destination / "manifest.json", manifest)
+    (destination / "README.txt").write_text(
+        "\n".join(
+            [
+                "These files are native Codex auth.json files.",
+                "For emergency manual switch, copy one *.auth.json to both:",
+                f"  {DEFAULT_CODEX_AUTH_PATH}",
+                f"  {DEFAULT_CODEX_ROOT_AUTH_PATH}",
+                "Then fully restart Codex Desktop so the app reloads the auth state.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    append_event(
+        args.events_path,
+        "export_ready_auths",
+        output_dir=str(destination),
+        count=len(manifest_accounts),
+    )
+    print(f"exported ready auth files: {len(manifest_accounts)}")
+    print(f"output_dir={destination}")
+    for account in manifest_accounts:
+        marker = " current" if account["current"] else ""
+        print(f"  - {account['file']}: {account['email'] or account['account_id']}{marker}")
     return 0
 
 
@@ -6598,6 +6702,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit output path; default is under --export-dir",
     )
     export_parser.set_defaults(func=cmd_export)
+
+    export_ready_parser = subparsers.add_parser(
+        "export-ready-auths",
+        help="export all currently available accounts as native auth.json files for emergency manual switching",
+    )
+    export_ready_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path.home() / ".codex" / "ready-auths",
+        help="directory for ready-to-copy auth files (default: ~/.codex/ready-auths)",
+    )
+    export_ready_parser.add_argument(
+        "--no-clean",
+        action="store_false",
+        dest="clean",
+        default=True,
+        help="do not remove old exported JSON/TXT files from the output directory first",
+    )
+    export_ready_parser.set_defaults(func=cmd_export_ready_auths)
 
     apply_parser = subparsers.add_parser(
         "apply",

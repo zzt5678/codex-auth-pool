@@ -61,6 +61,8 @@
 - 内置防重入锁和短时间自动轮换节流，避免重复 tick 导致连续切号/重启。
 - 支持快照和恢复本地插件、配置、连接器缓存状态。
 - 环境快照会保存 Browser Use 的本地 Electron 浏览器状态，包括 `Cookies`、`Local Storage`、`Session Storage` 和 `Partitions/codex-browser-app`。
+- 自动切号重启时只恢复 Browser Use 需要的浏览器登录态，不再用旧快照覆盖 `~/.codex/plugins`，避免切号后插件被回滚、需要重新安装。
+- 可把当前可用账号导出到 `~/.codex/ready-auths/`，里面每个 `*.auth.json` 都是可以手动复制到 Codex `auth.json` 的原生格式。
 - 支持 macOS `launchd` 后台常驻。
 - 支持 Ubuntu/Linux `systemd --user` 后台常驻。
 
@@ -197,10 +199,19 @@ codex-auth-pool refresh-usage --force
 codex-auth-pool save-current --name my-official-1
 codex-auth-pool sync-cliproxy
 codex-auth-pool tick --dry-run
+codex-auth-pool export-ready-auths
 codex-auth-pool events --limit 10
 codex-auth-pool launchd-status
 codex-auth-pool systemd-status
 ```
+
+`export-ready-auths` 会把当前未过期、未冷却、未被真实额度窗口阻塞的账号导出到：
+
+```bash
+~/.codex/ready-auths/
+```
+
+紧急手动切换时，把其中一个 `*.auth.json` 复制到 `~/.codex/cache/auth.json` 和 `~/.codex/auth.json`，然后完整重启 Codex Desktop。
 
 ## 排序和轮换规则
 

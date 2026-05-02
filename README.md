@@ -61,6 +61,8 @@ when you need an emergency manual switch.
 - Built-in locks and a short automatic-rotation throttle prevent repeated ticks from causing restart loops.
 - Snapshot and restore local Codex plugin, config, and connector cache state.
 - Preserve Browser Use's local Electron browser state (`Cookies`, `Local Storage`, `Session Storage`, and `Partitions/codex-browser-app`) in environment snapshots.
+- During automatic account-switch restarts, restore only Browser Use's browser-login storage, not the historical `~/.codex/plugins` directory, so plugins installed after an older snapshot are not rolled back.
+- Export currently available accounts into `~/.codex/ready-auths/` as native `auth.json` files for emergency manual switching.
 - Run as a background `launchd` agent on macOS.
 - Run as a background `systemd --user` service on Ubuntu/Linux.
 
@@ -197,10 +199,19 @@ codex-auth-pool refresh-usage --force
 codex-auth-pool save-current --name my-official-1
 codex-auth-pool sync-cliproxy
 codex-auth-pool tick --dry-run
+codex-auth-pool export-ready-auths
 codex-auth-pool events --limit 10
 codex-auth-pool launchd-status
 codex-auth-pool systemd-status
 ```
+
+`export-ready-auths` writes all accounts that are not expired, not in cooldown, and not blocked by observed quota windows into:
+
+```bash
+~/.codex/ready-auths/
+```
+
+For an emergency manual switch, copy one `*.auth.json` to both `~/.codex/cache/auth.json` and `~/.codex/auth.json`, then fully restart Codex Desktop.
 
 ## Rotation Logic
 
