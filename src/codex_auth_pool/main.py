@@ -115,6 +115,7 @@ DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT = "继续。如果你刚才只发送了
 DEFAULT_RESUME_MODEL_CANDIDATES = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 RESUME_MODEL_NEGATIVE_CACHE_SECONDS = 24 * 60 * 60
 RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
+ACTIVE_SPAWNED_THREAD_IDLE_SECONDS = 30 * 60
 RESUME_VERIFY_DELAY_SECONDS = 60.0
 DEFAULT_HARD_ACTIVE_GRACE_SECONDS = 10 * 60
 BROWSER_USE_SESSION_MARKERS = (
@@ -1490,6 +1491,70 @@ def read_recent_desktop_sessions(
     return sessions
 
 
+def read_open_spawned_sessions(
+    *,
+    codex_state_db: Path,
+    max_age_seconds: int,
+    max_count: int,
+) -> list[tuple[InterruptedSession, dict[str, Any]]]:
+    if not codex_state_db.exists():
+        return []
+
+    cutoff = int(time.time()) - max_age_seconds
+    try:
+        with _connect_sqlite_readonly(codex_state_db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    t.id,
+                    t.title,
+                    t.cwd,
+                    t.source,
+                    t.model,
+                    t.rollout_path,
+                    t.updated_at,
+                    t.agent_nickname,
+                    t.agent_role,
+                    e.parent_thread_id,
+                    e.status AS spawn_status
+                FROM thread_spawn_edges e
+                JOIN threads t ON t.id = e.child_thread_id
+                WHERE
+                    t.archived = 0
+                    AND e.status NOT IN ('closed', 'complete', 'completed', 'done', 'failed', 'error', 'canceled', 'cancelled')
+                    AND t.updated_at >= ?
+                ORDER BY t.updated_at DESC
+                LIMIT ?
+                """,
+                (cutoff, max_count),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+
+    sessions: list[tuple[InterruptedSession, dict[str, Any]]] = []
+    for row in rows:
+        session = InterruptedSession(
+            id=str(row["id"]),
+            title=str(row["title"] or ""),
+            cwd=str(row["cwd"] or ""),
+            source=str(row["source"] or "") or "subagent",
+            model=str(row["model"] or "") or None,
+            rollout_path=str(row["rollout_path"] or ""),
+            updated_at=int(row["updated_at"] or 0),
+            last_log_at=None,
+            recent_log_count=0,
+        )
+        meta = {
+            "parent_thread_id": str(row["parent_thread_id"] or ""),
+            "spawn_status": str(row["spawn_status"] or ""),
+            "agent_nickname": str(row["agent_nickname"] or ""),
+            "agent_role": str(row["agent_role"] or ""),
+        }
+        sessions.append((session, meta))
+    return sessions
+
+
 def _session_event_kind(event: dict[str, Any]) -> str | None:
     event_type = event.get("type")
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -1846,6 +1911,21 @@ def session_was_in_progress_at(session: InterruptedSession, captured_at: datetim
     return False
 
 
+def spawned_session_was_active_at(
+    session: InterruptedSession,
+    captured_at: datetime,
+    *,
+    max_idle_seconds: int = ACTIVE_SPAWNED_THREAD_IDLE_SECONDS,
+) -> bool:
+    if pending_tool_calls_at(session, captured_at):
+        return True
+    if session.updated_at <= 0:
+        return False
+    if int(captured_at.timestamp()) - session.updated_at > max_idle_seconds:
+        return False
+    return session_was_in_progress_at(session, captured_at)
+
+
 def interrupted_session_record(session: InterruptedSession, captured_at: datetime) -> dict[str, Any]:
     record = session.__dict__.copy()
     pending_tools = pending_tool_calls_at(session, captured_at)
@@ -1857,6 +1937,18 @@ def interrupted_session_record(session: InterruptedSession, captured_at: datetim
     record["raw_interrupted_tool_count"] = len(pending_tools)
     record["desktop_plugin_resume_required"] = uses_desktop_browser
     record["desktop_plugin_resume_reason"] = "browser_use" if uses_desktop_browser else None
+    return record
+
+
+def spawned_session_record(
+    session: InterruptedSession,
+    meta: dict[str, Any],
+    captured_at: datetime,
+) -> dict[str, Any]:
+    record = interrupted_session_record(session, captured_at)
+    record.update(meta)
+    record["kind"] = "spawned_thread"
+    record["active_idle_seconds"] = max(0, int(captured_at.timestamp()) - int(session.updated_at or 0))
     return record
 
 
@@ -1886,6 +1978,16 @@ def capture_interrupted_sessions(
         for session in recent_sessions
         if session_was_in_progress_at(session, captured_at)
     ]
+    open_spawned_sessions = read_open_spawned_sessions(
+        codex_state_db=codex_state_db,
+        max_age_seconds=max_age_seconds,
+        max_count=max_count,
+    )
+    active_spawned_sessions = [
+        (session, meta)
+        for session, meta in open_spawned_sessions
+        if spawned_session_was_active_at(session, captured_at)
+    ]
     snapshot = {
         "captured_at": captured_at.isoformat(),
         "state_db": str(codex_state_db),
@@ -1895,6 +1997,12 @@ def capture_interrupted_sessions(
         "recent_candidates": len(recent_sessions),
         "filtered_terminal_sessions": max(0, len(recent_sessions) - len(sessions)),
         "sessions": [interrupted_session_record(session, captured_at) for session in sessions],
+        "open_spawned_candidates": len(open_spawned_sessions),
+        "filtered_inactive_spawned_sessions": max(0, len(open_spawned_sessions) - len(active_spawned_sessions)),
+        "active_spawned_sessions": [
+            spawned_session_record(session, meta, captured_at)
+            for session, meta in active_spawned_sessions
+        ],
     }
     path = interrupted_session_snapshot_path(session_recovery_dir)
     write_json(path, snapshot)
@@ -1905,9 +2013,13 @@ def capture_interrupted_sessions(
             "interrupted_sessions_captured",
             snapshot_path=str(path),
             session_count=len(sessions),
+            active_spawned_session_count=len(active_spawned_sessions),
             recent_candidates=len(recent_sessions),
             filtered_terminal_sessions=max(0, len(recent_sessions) - len(sessions)),
+            open_spawned_candidates=len(open_spawned_sessions),
+            filtered_inactive_spawned_sessions=max(0, len(open_spawned_sessions) - len(active_spawned_sessions)),
             session_ids=[session.id for session in sessions],
+            active_spawned_session_ids=[session.id for session, _meta in active_spawned_sessions],
         )
     return snapshot
 
@@ -2262,6 +2374,9 @@ def active_desktop_sessions_before_switch(args: argparse.Namespace) -> dict[str,
     )
     sessions = snapshot.get("sessions")
     if isinstance(sessions, list) and sessions:
+        return snapshot
+    spawned_sessions = snapshot.get("active_spawned_sessions")
+    if isinstance(spawned_sessions, list) and spawned_sessions:
         return snapshot
     return None
 
@@ -3984,7 +4099,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  cooldown_until: {pending_rotation.get('cooldown_until') or '-'}")
         print(f"  hard_grace_until: {pending_rotation.get('hard_grace_until') or '-'}")
         session_ids = pending_rotation.get("session_ids")
+        spawned_session_ids = pending_rotation.get("active_spawned_session_ids")
+        blocker_ids = pending_rotation.get("blocker_ids")
         print(f"  sessions: {len(session_ids) if isinstance(session_ids, list) else 0}")
+        print(f"  spawned_sessions: {len(spawned_session_ids) if isinstance(spawned_session_ids, list) else 0}")
+        print(f"  blockers: {len(blocker_ids) if isinstance(blocker_ids, list) else 0}")
     print("")
     print("Last Switch")
     last_apply = state.get("last_apply") if isinstance(state.get("last_apply"), dict) else None
@@ -5602,6 +5721,33 @@ def pending_rotation_session_ids(active_snapshot: dict[str, Any] | None) -> list
     ]
 
 
+def pending_rotation_spawned_session_ids(active_snapshot: dict[str, Any] | None) -> list[str]:
+    if active_snapshot is None:
+        return []
+    sessions = active_snapshot.get("active_spawned_sessions")
+    if not isinstance(sessions, list):
+        return []
+    return [
+        str(session.get("id") or "")
+        for session in sessions
+        if isinstance(session, dict) and session.get("id")
+    ]
+
+
+def pending_rotation_blocker_ids(active_snapshot: dict[str, Any] | None) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for item in pending_rotation_session_ids(active_snapshot) + pending_rotation_spawned_session_ids(active_snapshot):
+        if item and item not in seen:
+            seen.add(item)
+            ids.append(item)
+    return ids
+
+
+def active_snapshot_has_spawned_sessions(active_snapshot: dict[str, Any] | None) -> bool:
+    return bool(pending_rotation_spawned_session_ids(active_snapshot))
+
+
 def pending_rotation_record(
     *,
     account_id: str,
@@ -5628,6 +5774,8 @@ def pending_rotation_record(
         "hard_grace_until": hard_grace_until.isoformat() if hard_grace_until is not None else None,
         "snapshot_path": active_snapshot.get("path") if active_snapshot else None,
         "session_ids": pending_rotation_session_ids(active_snapshot),
+        "active_spawned_session_ids": pending_rotation_spawned_session_ids(active_snapshot),
+        "blocker_ids": pending_rotation_blocker_ids(active_snapshot),
         "primary_used_percent": primary_used_percent,
         "secondary_used_percent": secondary_used_percent,
     }
@@ -5835,8 +5983,15 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         active_snapshot = active_desktop_sessions_before_switch(args)
         pending_hard = bool(pending_rotation.get("hard"))
         grace_until = parse_dt(str(pending_rotation.get("hard_grace_until") or ""))
-        if active_snapshot is not None and (not pending_hard or (grace_until is not None and now_local() < grace_until)):
+        has_spawned_sessions = active_snapshot_has_spawned_sessions(active_snapshot)
+        if active_snapshot is not None and (
+            has_spawned_sessions
+            or not pending_hard
+            or (grace_until is not None and now_local() < grace_until)
+        ):
             session_ids = pending_rotation_session_ids(active_snapshot)
+            spawned_session_ids = pending_rotation_spawned_session_ids(active_snapshot)
+            blocker_ids = pending_rotation_blocker_ids(active_snapshot)
             append_event(
                 args.events_path,
                 "rotation_pending_waiting_active_sessions",
@@ -5847,9 +6002,16 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 hard_grace_until=grace_until.isoformat() if grace_until is not None else None,
                 snapshot_path=active_snapshot.get("path"),
                 session_count=len(session_ids),
+                active_spawned_session_count=len(spawned_session_ids),
+                blocker_count=len(blocker_ids),
                 session_ids=session_ids,
+                active_spawned_session_ids=spawned_session_ids,
+                blocker_ids=blocker_ids,
             )
-            print("rotation pending: active Codex Desktop session(s) are still running; will switch after they become idle")
+            if spawned_session_ids:
+                print("rotation pending: child agent session(s) are still running; will switch after they finish")
+            else:
+                print("rotation pending: active Codex Desktop session(s) are still running; will switch after they become idle")
             return 0
         append_event(
             args.events_path,
@@ -5941,8 +6103,10 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         active_snapshot = active_desktop_sessions_before_switch(args)
         if active_snapshot is not None:
             session_ids = pending_rotation_session_ids(active_snapshot)
+            spawned_session_ids = pending_rotation_spawned_session_ids(active_snapshot)
+            blocker_ids = pending_rotation_blocker_ids(active_snapshot)
             hard_active_grace_seconds = max(0, int(getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS)))
-            if hard_rotation and hard_active_grace_seconds <= 0:
+            if hard_rotation and hard_active_grace_seconds <= 0 and not spawned_session_ids:
                 append_event(
                     args.events_path,
                     "rotation_forced_hard_exhaustion",
@@ -5952,6 +6116,8 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                     primary_used_percent=trigger_primary_used,
                     secondary_used_percent=trigger_secondary_used,
                     active_session_count=len(session_ids),
+                    active_spawned_session_count=len(spawned_session_ids),
+                    blocker_count=len(blocker_ids),
                 )
             else:
                 pending_record = pending_rotation_record(
@@ -5977,9 +6143,18 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                     hard_grace_until=pending_record.get("hard_grace_until"),
                     snapshot_path=active_snapshot.get("path"),
                     session_count=len(session_ids),
+                    active_spawned_session_count=len(spawned_session_ids),
+                    blocker_count=len(blocker_ids),
                     session_ids=session_ids,
+                    active_spawned_session_ids=spawned_session_ids,
+                    blocker_ids=blocker_ids,
                 )
-                if hard_rotation:
+                if hard_rotation and spawned_session_ids:
+                    print(
+                        "rotation deferred: account is exhausted but child agent session(s) are still running; "
+                        "will switch after they finish"
+                    )
+                elif hard_rotation:
                     print(
                         "rotation deferred briefly: account is exhausted but active session(s) are still running; "
                         f"will switch after idle or after {hard_active_grace_seconds}s"
