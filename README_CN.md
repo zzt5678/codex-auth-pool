@@ -57,6 +57,7 @@
 - macOS 上切换后可自动重启 Codex Desktop。
 - 自动重启前会记录最近活跃的 Codex Desktop 会话，重启后通过 Codex app-server 协议对这些原 `threadId` 发送 `继续`。
 - 恢复会话使用 `thread/resume` + `turn/start`，不再另起一个 `codex exec resume` 后台代理会话。
+- 自动轮换切号后会检测 active goal 线程，并在 macOS Terminal 中执行 `codex resume <thread_id>`，让 CLI 长任务继续跑。
 - 后台守护只有在真实额度触发阈值时才会切换和重启；普通轮询不会打断当前工作。
 - 内置防重入锁和短时间自动轮换节流，避免重复 tick 导致连续切号/重启。
 - 支持快照和恢复本地插件、配置、连接器缓存状态。
@@ -183,6 +184,12 @@ codex-auth-pool launchd-install --hard-active-grace-seconds 600
 
 ```bash
 codex-auth-pool launchd-install --no-resume-interrupted-sessions
+```
+
+如果你不想在切号后自动恢复 active goal 对应的 CLI 会话：
+
+```bash
+codex-auth-pool launchd-install --no-resume-active-goals
 ```
 
 如果你明确只想切 auth、不想重启 Codex Desktop：

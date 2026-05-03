@@ -57,6 +57,7 @@ when you need an emergency manual switch.
 - Restart Codex Desktop automatically after switching on macOS.
 - Before an automatic restart, capture recently active Codex Desktop sessions; after restart, resume those interrupted thread IDs through the Codex app-server protocol with `继续`.
 - Recovery targets the original `threadId` with `thread/resume` + `turn/start` instead of creating a separate `codex exec resume` worker session.
+- After automatic rotation, detect active goal threads and open macOS Terminal with `codex resume <thread_id>` so long-running CLI goal work can continue under the new auth.
 - Background rotation switches and restarts only after a real quota threshold trigger; normal polling does not interrupt your work.
 - Built-in locks and a short automatic-rotation throttle prevent repeated ticks from causing restart loops.
 - Snapshot and restore local Codex plugin, config, and connector cache state.
@@ -183,6 +184,12 @@ If you only want the restart without auto-resuming interrupted sessions:
 
 ```bash
 codex-auth-pool launchd-install --no-resume-interrupted-sessions
+```
+
+If you do not want auth switches to auto-resume active CLI goal sessions:
+
+```bash
+codex-auth-pool launchd-install --no-resume-active-goals
 ```
 
 If you explicitly want auth switching without restarting Codex Desktop:

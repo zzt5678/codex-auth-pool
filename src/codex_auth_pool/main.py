@@ -112,10 +112,15 @@ DEFAULT_INTERRUPTED_SESSION_WINDOW_SECONDS = 24 * 60 * 60
 DEFAULT_INTERRUPTED_SESSION_MAX_COUNT = 30
 DEFAULT_INTERRUPTED_SESSION_PROMPT = "继续"
 DEFAULT_INTERRUPTED_SESSION_RETRY_PROMPT = "继续。如果你刚才只发送了确认文本，现在不要再确认，直接从上次中断点继续实际执行。"
+DEFAULT_ACTIVE_GOAL_RESUME_PROMPT = (
+    "继续。你是被 Codex Auth Pool 切换账号后自动恢复的原 goal 会话。"
+    "请基于本会话已有 goal 和上下文继续执行长任务，不要只回复确认。"
+)
 DEFAULT_RESUME_MODEL_CANDIDATES = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 RESUME_MODEL_NEGATIVE_CACHE_SECONDS = 24 * 60 * 60
 RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
 ACTIVE_SPAWNED_THREAD_IDLE_SECONDS = 30 * 60
+ACTIVE_GOAL_RESUME_THROTTLE_SECONDS = 10 * 60
 RESUME_VERIFY_DELAY_SECONDS = 60.0
 DEFAULT_HARD_ACTIVE_GRACE_SECONDS = 10 * 60
 BROWSER_USE_SESSION_MARKERS = (
@@ -2356,6 +2361,227 @@ def resume_interrupted_sessions(
     return []
 
 
+def read_active_goal_threads(
+    *,
+    codex_state_db: Path,
+    max_count: int = 5,
+) -> list[dict[str, Any]]:
+    if not codex_state_db.exists():
+        return []
+    try:
+        with _connect_sqlite_readonly(codex_state_db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    g.thread_id,
+                    g.goal_id,
+                    g.objective,
+                    g.status,
+                    g.token_budget,
+                    g.tokens_used AS goal_tokens_used,
+                    g.updated_at_ms AS goal_updated_at_ms,
+                    t.title,
+                    t.cwd,
+                    t.source,
+                    t.model,
+                    t.updated_at,
+                    t.rollout_path
+                FROM thread_goals g
+                JOIN threads t ON t.id = g.thread_id
+                WHERE
+                    g.status = 'active'
+                    AND t.archived = 0
+                ORDER BY g.updated_at_ms DESC
+                LIMIT ?
+                """,
+                (max_count,),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+
+    goals: list[dict[str, Any]] = []
+    for row in rows:
+        goals.append(
+            {
+                "thread_id": str(row["thread_id"] or ""),
+                "goal_id": str(row["goal_id"] or ""),
+                "objective": str(row["objective"] or ""),
+                "status": str(row["status"] or ""),
+                "token_budget": row["token_budget"],
+                "goal_tokens_used": int(row["goal_tokens_used"] or 0),
+                "goal_updated_at_ms": int(row["goal_updated_at_ms"] or 0),
+                "title": str(row["title"] or ""),
+                "cwd": str(row["cwd"] or ""),
+                "source": str(row["source"] or ""),
+                "model": str(row["model"] or "") or None,
+                "updated_at": int(row["updated_at"] or 0),
+                "rollout_path": str(row["rollout_path"] or ""),
+            }
+        )
+    return goals
+
+
+def _goal_resume_key(goal: dict[str, Any], account_id: str | None) -> str:
+    return f"{goal.get('thread_id') or ''}:{account_id or ''}"
+
+
+def _goal_resume_recently_started(
+    state: dict[str, Any],
+    goal: dict[str, Any],
+    *,
+    account_id: str | None,
+    now: datetime,
+) -> bool:
+    recent = state.get("last_goal_resumes")
+    if not isinstance(recent, dict):
+        return False
+    record = recent.get(_goal_resume_key(goal, account_id))
+    if not isinstance(record, dict):
+        return False
+    started_at = parse_dt(str(record.get("started_at") or ""))
+    if started_at is None:
+        return False
+    return (now - started_at).total_seconds() < ACTIVE_GOAL_RESUME_THROTTLE_SECONDS
+
+
+def _record_goal_resume_started(
+    state: dict[str, Any],
+    goal: dict[str, Any],
+    *,
+    account_id: str | None,
+    started_at: datetime,
+    pid: int | None,
+    mode: str,
+) -> None:
+    recent = state.setdefault("last_goal_resumes", {})
+    if not isinstance(recent, dict):
+        recent = {}
+        state["last_goal_resumes"] = recent
+    recent[_goal_resume_key(goal, account_id)] = {
+        "started_at": started_at.isoformat(),
+        "thread_id": goal.get("thread_id"),
+        "goal_id": goal.get("goal_id"),
+        "title": goal.get("title"),
+        "cwd": goal.get("cwd"),
+        "account_id": account_id,
+        "pid": pid,
+        "mode": mode,
+    }
+    # Keep the state file bounded.
+    if len(recent) > 20:
+        items = sorted(
+            recent.items(),
+            key=lambda item: str(item[1].get("started_at") if isinstance(item[1], dict) else ""),
+            reverse=True,
+        )
+        state["last_goal_resumes"] = dict(items[:20])
+
+
+def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path | None) -> dict[str, Any]:
+    thread_id = str(goal.get("thread_id") or "").strip()
+    cwd = Path(str(goal.get("cwd") or Path.home())).expanduser()
+    if not thread_id:
+        return {"ok": False, "error": "missing_thread_id"}
+    if not cwd.exists() or not cwd.is_dir():
+        cwd = Path.home()
+
+    if is_macos():
+        command = f"cd {shlex.quote(str(cwd))} && codex resume {shlex.quote(thread_id)} {shlex.quote(prompt)}"
+        script = f'tell application "Terminal" to do script {json.dumps(command)}'
+        completed = run_command(["osascript", "-e", script])
+        ok = completed.returncode == 0
+        result = {
+            "ok": ok,
+            "mode": "terminal_osascript",
+            "thread_id": thread_id,
+            "goal_id": goal.get("goal_id"),
+            "title": goal.get("title"),
+            "cwd": str(cwd),
+            "pid": None,
+            "error": None if ok else (completed.stderr or completed.stdout).strip()[:500],
+        }
+    else:
+        log_dir = DEFAULT_SESSION_RECOVERY_DIR
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"goal-resume-{thread_id}-{datetime.now().strftime(BACKUP_TIMESTAMP_FMT)}.log"
+        handle = log_path.open("ab")
+        try:
+            process = subprocess.Popen(
+                ["codex", "resume", thread_id, prompt],
+                cwd=str(cwd),
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            handle.close()
+        result = {
+            "ok": True,
+            "mode": "background_process",
+            "thread_id": thread_id,
+            "goal_id": goal.get("goal_id"),
+            "title": goal.get("title"),
+            "cwd": str(cwd),
+            "pid": process.pid,
+            "log_path": str(log_path),
+            "error": None,
+        }
+
+    if events_path is not None:
+        append_event(events_path, "active_goal_resume_started" if result["ok"] else "active_goal_resume_failed", **result)
+    return result
+
+
+def resume_active_goal_threads_after_switch(
+    *,
+    codex_state_db: Path,
+    events_path: Path | None,
+    state_path: Path | None,
+    account_id: str | None,
+    prompt: str = DEFAULT_ACTIVE_GOAL_RESUME_PROMPT,
+    max_count: int = 5,
+) -> list[dict[str, Any]]:
+    goals = read_active_goal_threads(codex_state_db=codex_state_db, max_count=max_count)
+    if not goals:
+        if events_path is not None:
+            append_event(events_path, "active_goal_resume_skipped", reason="no_active_goals")
+        return []
+
+    state = load_state(state_path) if state_path is not None else {}
+    now = now_local()
+    results: list[dict[str, Any]] = []
+    for goal in goals:
+        if _goal_resume_recently_started(state, goal, account_id=account_id, now=now):
+            result = {
+                "ok": True,
+                "skipped": True,
+                "reason": "recently_started",
+                "thread_id": goal.get("thread_id"),
+                "goal_id": goal.get("goal_id"),
+                "title": goal.get("title"),
+            }
+            if events_path is not None:
+                append_event(events_path, "active_goal_resume_skipped", **result)
+            results.append(result)
+            continue
+        result = launch_goal_resume(goal, prompt=prompt, events_path=events_path)
+        results.append(result)
+        if result.get("ok"):
+            _record_goal_resume_started(
+                state,
+                goal,
+                account_id=account_id,
+                started_at=now_local(),
+                pid=result.get("pid") if isinstance(result.get("pid"), int) else None,
+                mode=str(result.get("mode") or ""),
+            )
+    if state_path is not None:
+        save_state(state_path, state)
+    return results
+
+
 def active_desktop_sessions_before_switch(args: argparse.Namespace) -> dict[str, Any] | None:
     if not getattr(args, "defer_switch_while_active", True):
         return None
@@ -2739,6 +2965,7 @@ def write_launchd_plist(
     refresh_usage: bool,
     usage_max_age_minutes: int,
     resume_interrupted_sessions: bool,
+    resume_active_goals: bool,
     hard_active_grace_seconds: int,
 ) -> Path:
     plist_path = launchd_plist_path(label)
@@ -2776,7 +3003,8 @@ def write_launchd_plist(
         ]
         + (["--restart-after-switch"] if restart_after_switch else [])
         + (["--refresh-usage"] if refresh_usage else [])
-        + ([] if resume_interrupted_sessions else ["--no-resume-interrupted-sessions"]),
+        + ([] if resume_interrupted_sessions else ["--no-resume-interrupted-sessions"])
+        + ([] if resume_active_goals else ["--no-resume-active-goals"]),
         "WorkingDirectory": str(Path.home()),
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -2837,6 +3065,7 @@ def launchctl_status(label: str) -> dict[str, Any]:
         "restart_after_switch": None,
         "refresh_usage": None,
         "resume_interrupted_sessions": None,
+        "resume_active_goals": None,
         "defer_switch_while_active": None,
         "hard_active_grace_seconds": None,
     }
@@ -2851,6 +3080,7 @@ def launchctl_status(label: str) -> dict[str, Any]:
                 status["restart_after_switch"] = "--restart-after-switch" in args
                 status["refresh_usage"] = "--refresh-usage" in args
                 status["resume_interrupted_sessions"] = "--no-resume-interrupted-sessions" not in args
+                status["resume_active_goals"] = "--no-resume-active-goals" not in args
                 status["defer_switch_while_active"] = "--no-defer-switch-while-active" not in args
                 if "--hard-active-grace-seconds" in args:
                     index = args.index("--hard-active-grace-seconds")
@@ -2913,6 +3143,7 @@ def write_systemd_service(
     refresh_usage: bool,
     usage_max_age_minutes: int,
     resume_interrupted_sessions: bool,
+    resume_active_goals: bool,
     stdout_path: Path,
     stderr_path: Path,
     hard_active_grace_seconds: int,
@@ -2957,6 +3188,8 @@ def write_systemd_service(
         command.append("--refresh-usage")
     if not resume_interrupted_sessions:
         command.append("--no-resume-interrupted-sessions")
+    if not resume_active_goals:
+        command.append("--no-resume-active-goals")
 
     service_path.write_text(
         "\n".join(
@@ -2995,6 +3228,7 @@ def systemd_status(service_name: str) -> dict[str, Any]:
         "restart_after_switch": None,
         "refresh_usage": None,
         "resume_interrupted_sessions": None,
+        "resume_active_goals": None,
         "defer_switch_while_active": None,
         "hard_active_grace_seconds": None,
     }
@@ -3004,6 +3238,7 @@ def systemd_status(service_name: str) -> dict[str, Any]:
             status["restart_after_switch"] = "--restart-after-switch" in text
             status["refresh_usage"] = "--refresh-usage" in text
             status["resume_interrupted_sessions"] = "--no-resume-interrupted-sessions" not in text
+            status["resume_active_goals"] = "--no-resume-active-goals" not in text
             status["defer_switch_while_active"] = "--no-defer-switch-while-active" not in text
             match = re.search(r"--hard-active-grace-seconds\s+(\d+)", text)
             if match:
@@ -3039,6 +3274,7 @@ def background_service_status() -> dict[str, Any]:
             "restart_after_switch": status.get("restart_after_switch"),
             "refresh_usage": status.get("refresh_usage"),
             "resume_interrupted_sessions": status.get("resume_interrupted_sessions"),
+            "resume_active_goals": status.get("resume_active_goals"),
             "defer_switch_while_active": status.get("defer_switch_while_active"),
             "hard_active_grace_seconds": status.get("hard_active_grace_seconds"),
         }
@@ -3053,6 +3289,7 @@ def background_service_status() -> dict[str, Any]:
             "restart_after_switch": status.get("restart_after_switch"),
             "refresh_usage": status.get("refresh_usage"),
             "resume_interrupted_sessions": status.get("resume_interrupted_sessions"),
+            "resume_active_goals": status.get("resume_active_goals"),
             "defer_switch_while_active": status.get("defer_switch_while_active"),
             "hard_active_grace_seconds": status.get("hard_active_grace_seconds"),
         }
@@ -4363,6 +4600,22 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
         rotation_reason=rotation_reason,
         rotation_trigger_source=rotation_trigger_source,
     )
+    if apply_source == "auto_rotation" and not getattr(args, "no_resume_active_goals", False):
+        goal_resume_results = resume_active_goal_threads_after_switch(
+            codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+            events_path=getattr(args, "events_path", None),
+            state_path=getattr(args, "state_path", None),
+            account_id=normalized.get("account_id"),
+        )
+        launched = [result for result in goal_resume_results if result.get("ok") and not result.get("skipped")]
+        skipped = [result for result in goal_resume_results if result.get("skipped")]
+        failed = [result for result in goal_resume_results if not result.get("ok")]
+        if launched:
+            print(f"started active goal resume session(s): {len(launched)}")
+        if skipped:
+            print(f"skipped recently resumed active goal session(s): {len(skipped)}")
+        if failed:
+            print(f"failed to start active goal resume session(s): {len(failed)}")
     send_notification(
         "Codex Auth Pool",
         f"Switched to {normalized.get('email') or normalized.get('account_id')}",
@@ -6254,6 +6507,7 @@ def cmd_launchd_install(args: argparse.Namespace) -> int:
         refresh_usage=args.refresh_usage,
         usage_max_age_minutes=args.usage_max_age_minutes,
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
+        resume_active_goals=not getattr(args, "no_resume_active_goals", False),
         hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
     )
     launchctl_bootout(args.label)
@@ -6268,6 +6522,7 @@ def cmd_launchd_install(args: argparse.Namespace) -> int:
         restart_after_switch=args.restart_after_switch,
         refresh_usage=args.refresh_usage,
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
+        resume_active_goals=not getattr(args, "no_resume_active_goals", False),
         hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
     )
     print(json.dumps(status, ensure_ascii=False, indent=2))
@@ -6319,6 +6574,7 @@ def cmd_launchd_status(args: argparse.Namespace) -> int:
     print(f"  restart after switch: {'yes' if status.get('restart_after_switch') else 'no' if status.get('restart_after_switch') is False else '-'}")
     print(f"  refresh usage: {'yes' if status.get('refresh_usage') else 'no' if status.get('refresh_usage') is False else '-'}")
     print(f"  resume interrupted sessions: {'yes' if status.get('resume_interrupted_sessions') else 'no' if status.get('resume_interrupted_sessions') is False else '-'}")
+    print(f"  resume active goals: {'yes' if status.get('resume_active_goals') else 'no' if status.get('resume_active_goals') is False else '-'}")
     print(f"  defer switch while active: {'yes' if status.get('defer_switch_while_active') else 'no' if status.get('defer_switch_while_active') is False else '-'}")
     grace = status.get("hard_active_grace_seconds")
     print(f"  hard active grace: {grace}s" if grace is not None else "  hard active grace: -")
@@ -6354,6 +6610,7 @@ def cmd_systemd_install(args: argparse.Namespace) -> int:
         refresh_usage=args.refresh_usage,
         usage_max_age_minutes=args.usage_max_age_minutes,
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
+        resume_active_goals=not getattr(args, "no_resume_active_goals", False),
         stdout_path=args.stdout_path,
         stderr_path=args.stderr_path,
         hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
@@ -6371,6 +6628,7 @@ def cmd_systemd_install(args: argparse.Namespace) -> int:
         restart_after_switch=args.restart_after_switch,
         refresh_usage=args.refresh_usage,
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
+        resume_active_goals=not getattr(args, "no_resume_active_goals", False),
         hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
     )
     print(f"installed systemd user service at {service_path}")
@@ -6429,6 +6687,7 @@ def cmd_systemd_status(args: argparse.Namespace) -> int:
     print(f"  restart after switch: {'yes' if status.get('restart_after_switch') else 'no' if status.get('restart_after_switch') is False else '-'}")
     print(f"  refresh usage: {'yes' if status.get('refresh_usage') else 'no' if status.get('refresh_usage') is False else '-'}")
     print(f"  resume interrupted sessions: {'yes' if status.get('resume_interrupted_sessions') else 'no' if status.get('resume_interrupted_sessions') is False else '-'}")
+    print(f"  resume active goals: {'yes' if status.get('resume_active_goals') else 'no' if status.get('resume_active_goals') is False else '-'}")
     print(f"  defer switch while active: {'yes' if status.get('defer_switch_while_active') else 'no' if status.get('defer_switch_while_active') is False else '-'}")
     grace = status.get("hard_active_grace_seconds")
     print(f"  hard active grace: {grace}s" if grace is not None else "  hard active grace: -")
@@ -6665,6 +6924,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="when installing a background agent, do not auto-send '继续' after Codex restarts",
     )
     init_parser.add_argument(
+        "--no-resume-active-goals",
+        action="store_true",
+        help="when installing a background agent, do not auto-run `codex resume` for active goal threads after auth switches",
+    )
+    init_parser.add_argument(
         "--hard-active-grace-seconds",
         type=int,
         default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
@@ -6807,6 +7071,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="when installing a background agent, do not auto-send '继续' after Codex restarts",
     )
     setup_parser.add_argument(
+        "--no-resume-active-goals",
+        action="store_true",
+        help="when installing a background agent, do not auto-run `codex resume` for active goal threads after auth switches",
+    )
+    setup_parser.add_argument(
         "--hard-active-grace-seconds",
         type=int,
         default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
@@ -6922,6 +7191,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not send '继续' to recently active Codex Desktop sessions after restarting",
     )
+    apply_parser.add_argument(
+        "--no-resume-active-goals",
+        action="store_true",
+        help="do not auto-run `codex resume` for active goal threads after automatic auth switches",
+    )
     apply_parser.set_defaults(func=cmd_apply)
 
     apply_best_parser = subparsers.add_parser(
@@ -6947,6 +7221,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume-interrupted-sessions",
         action="store_true",
         help="do not send '继续' to recently active Codex Desktop sessions after restarting",
+    )
+    apply_best_parser.add_argument(
+        "--no-resume-active-goals",
+        action="store_true",
+        help="do not auto-run `codex resume` for active goal threads after automatic auth switches",
     )
     apply_best_parser.add_argument(
         "--usage-max-age-minutes",
@@ -7011,6 +7290,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume-interrupted-sessions",
         action="store_true",
         help="do not send '继续' to recently active Codex Desktop sessions after restarting",
+    )
+    tick_parser.add_argument(
+        "--no-resume-active-goals",
+        action="store_true",
+        help="do not auto-run `codex resume` for active goal threads after auth switches",
     )
     tick_parser.add_argument(
         "--no-defer-switch-while-active",
@@ -7094,6 +7378,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume-interrupted-sessions",
         action="store_true",
         help="do not send '继续' to recently active Codex Desktop sessions after restarting",
+    )
+    daemon_parser.add_argument(
+        "--no-resume-active-goals",
+        action="store_true",
+        help="do not auto-run `codex resume` for active goal threads after auth switches",
     )
     daemon_parser.add_argument(
         "--no-defer-switch-while-active",
@@ -7200,6 +7489,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not send '继续' to recently active Codex Desktop sessions after automatic restart",
     )
     launchd_install_parser.add_argument(
+        "--no-resume-active-goals",
+        action="store_true",
+        help="do not auto-run `codex resume` for active goal threads after auth switches",
+    )
+    launchd_install_parser.add_argument(
         "--hard-active-grace-seconds",
         type=int,
         default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
@@ -7273,6 +7567,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume-interrupted-sessions",
         action="store_true",
         help="do not send '继续' to recently active Codex Desktop sessions after automatic restart",
+    )
+    systemd_install_parser.add_argument(
+        "--no-resume-active-goals",
+        action="store_true",
+        help="do not auto-run `codex resume` for active goal threads after auth switches",
     )
     systemd_install_parser.add_argument(
         "--hard-active-grace-seconds",
