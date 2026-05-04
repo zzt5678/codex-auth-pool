@@ -171,7 +171,8 @@ codex-auth-pool events --limit 10
 - 如果检测到正在运行的子 agent / spawned thread，会继续等待子 agent 结束后再切换，不用 10 分钟宽限强制打断
 - 重启 Codex Desktop 前，从 `~/.codex/state_5.sqlite` 和 `~/.codex/logs_2.sqlite` 捕获最近活跃的 Desktop 会话
 - active goal 线程不会被当成 Desktop 会话阻塞切号；它会在切号成功后走独立的 `codex resume <thread_id>` 恢复流程
-- goal 恢复前会先看 rollout 是否仍在产生事件；最近仍有进展就延迟恢复，出现额度/认证错误或长时间无进展才执行 `codex resume`
+- goal 恢复前会先看 rollout 是否仍在产生事件；最近仍有进展会延迟恢复，只有出现明确额度/认证错误才执行 `codex resume`，单纯长时间无日志不会误开第二个长任务
+- goal 自动恢复成功后，只会终止同一个 `thread_id` 的旧 `codex resume` 进程树，避免旧终端任务继续卡在限额错误；不会关闭其他普通终端或 Desktop 会话
 - Codex Desktop 重新启动后，后台启动轻量恢复 helper，对每个捕获到的 `threadId` 执行 `thread/resume` 和 `turn/start`
 - 恢复只走原 Desktop 线程路径；不再降级到 `codex exec resume`，因为那可能创建单独 CLI 恢复，而不是继续原 Desktop 会话
 - 会话快照和恢复日志保存在 `~/.codex-auth-pool/session-recovery/`
@@ -199,6 +200,28 @@ codex-auth-pool launchd-install --no-resume-active-goals
 ```bash
 codex-auth-pool launchd-install --no-restart-after-switch
 ```
+
+## API 会话兼容 ChatGPT 登录
+
+如果以前通过 `cliproxyapi` 或其他 API provider 产生过本地会话，ChatGPT 官方登录模式下可能无法直接打开这些历史线程。可以先预览：
+
+```bash
+codex-auth-pool sessions-compat
+```
+
+确认要迁移某个线程时：
+
+```bash
+codex-auth-pool sessions-compat --apply --thread-id <thread_id>
+```
+
+如果你明确想一次性迁移全部匹配的 API-provider 本地线程：
+
+```bash
+codex-auth-pool sessions-compat --apply --all
+```
+
+这个命令只改 `~/.codex/state_5.sqlite` 里的本地索引，把 `model_provider` 改为 `openai`；不会修改 rollout 内容。执行前会自动备份数据库。
 
 ## 最常用命令
 

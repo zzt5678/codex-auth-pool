@@ -171,7 +171,8 @@ Background services installed with `launchd-install`, `systemd-install`, `setup 
 - if a running child agent / spawned thread is detected, rotation keeps waiting for that child agent to finish instead of using the 10-minute force-switch grace window
 - before quitting Codex Desktop, it captures recently active Desktop sessions from `~/.codex/state_5.sqlite` and `~/.codex/logs_2.sqlite`
 - active goal threads do not block Desktop-session rotation; after a successful auth switch they use the separate `codex resume <thread_id>` recovery path
-- goal recovery checks rollout progress first; recent progress defers recovery, while quota/auth errors or stale progress trigger `codex resume`
+- goal recovery checks rollout progress first; recent progress defers recovery, and only explicit quota/auth errors trigger `codex resume`; stale rollout silence alone will not start a duplicate long-running goal
+- after a goal resume starts successfully, it terminates only older `codex resume` process trees for the same `thread_id`, so the old quota-blocked terminal task stops without touching unrelated terminals or Desktop sessions
 - after Codex Desktop comes back up, it starts a lightweight recovery helper that calls `thread/resume` and `turn/start` for each captured `threadId`
 - recovery uses the original Desktop thread path only; it no longer falls back to `codex exec resume`, because that can create a separate CLI resume instead of continuing the original Desktop session
 - recovery snapshots and resume logs are written under `~/.codex-auth-pool/session-recovery/`
@@ -199,6 +200,28 @@ If you explicitly want auth switching without restarting Codex Desktop:
 ```bash
 codex-auth-pool launchd-install --no-restart-after-switch
 ```
+
+## API Sessions Under ChatGPT Login
+
+Sessions created while using `cliproxyapi` or another API provider may not open cleanly after switching back to official ChatGPT login. Preview locally stored API-provider sessions first:
+
+```bash
+codex-auth-pool sessions-compat
+```
+
+Convert one chosen thread:
+
+```bash
+codex-auth-pool sessions-compat --apply --thread-id <thread_id>
+```
+
+Convert every matched API-provider thread:
+
+```bash
+codex-auth-pool sessions-compat --apply --all
+```
+
+This only updates the local `model_provider` index in `~/.codex/state_5.sqlite` to `openai`; it does not rewrite rollout files. The command backs up the SQLite database before applying changes.
 
 ## Most Useful Commands
 

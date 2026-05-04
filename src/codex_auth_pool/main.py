@@ -20,6 +20,7 @@ import json
 import os
 import platform
 import re
+import signal
 import shlex
 import shutil as shutil_lib
 import shutil
@@ -96,6 +97,7 @@ DEFAULT_ARG_VALUES = {
     "codex_logs_db": DEFAULT_CODEX_LOGS_DB,
     "app_path": str(DEFAULT_CODEX_APP),
 }
+API_SESSION_COMPAT_PROVIDERS = ("cliproxyapi", "codex-multi-auth-runtime-proxy")
 REQUIRED_SOURCE_KEYS = (
     "access_token",
     "refresh_token",
@@ -2674,6 +2676,80 @@ def _remove_pending_goal_resume(state: dict[str, Any], thread_id: str) -> None:
         pending.pop(thread_id, None)
 
 
+def _process_table() -> list[dict[str, Any]]:
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw_line in completed.stdout.splitlines():
+        parts = raw_line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        rows.append({"pid": pid, "ppid": ppid, "command": parts[2]})
+    return rows
+
+
+def _codex_resume_pids_for_thread(thread_id: str) -> set[int]:
+    if not thread_id:
+        return set()
+    pids: set[int] = set()
+    for row in _process_table():
+        command = str(row.get("command") or "")
+        if thread_id in command and "codex" in command and "resume" in command:
+            pids.add(int(row["pid"]))
+    return pids
+
+
+def _process_tree_pids(root_pids: set[int]) -> list[int]:
+    if not root_pids:
+        return []
+    rows = _process_table()
+    children_by_ppid: dict[int, list[int]] = {}
+    for row in rows:
+        children_by_ppid.setdefault(int(row["ppid"]), []).append(int(row["pid"]))
+    seen: set[int] = set()
+    stack = list(root_pids)
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children_by_ppid.get(pid, []))
+    return sorted(seen, reverse=True)
+
+
+def terminate_goal_resume_processes(thread_id: str, root_pids: set[int]) -> list[int]:
+    """Stop older codex resume processes for one goal thread only."""
+    terminated: list[int] = []
+    current_pid = os.getpid()
+    for pid in _process_tree_pids(root_pids):
+        if pid == current_pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            terminated.append(pid)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+        except OSError:
+            continue
+    return terminated
+
+
 def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path | None) -> dict[str, Any]:
     thread_id = str(goal.get("thread_id") or "").strip()
     cwd = Path(str(goal.get("cwd") or Path.home())).expanduser()
@@ -2682,6 +2758,7 @@ def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path |
     if not cwd.exists() or not cwd.is_dir():
         cwd = Path.home()
 
+    old_resume_pids = _codex_resume_pids_for_thread(thread_id)
     if is_macos():
         command = f"cd {shlex.quote(str(cwd))} && codex resume {shlex.quote(thread_id)} {shlex.quote(prompt)}"
         script = f'tell application "Terminal" to do script {applescript_string(command)}'
@@ -2724,6 +2801,18 @@ def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path |
             "log_path": str(log_path),
             "error": None,
         }
+
+    if result.get("ok") and old_resume_pids:
+        terminated = terminate_goal_resume_processes(thread_id, old_resume_pids)
+        result["terminated_old_goal_resume_pids"] = terminated
+        if events_path is not None and terminated:
+            append_event(
+                events_path,
+                "active_goal_old_resume_terminated",
+                thread_id=thread_id,
+                goal_id=goal.get("goal_id"),
+                pids=terminated,
+            )
 
     if events_path is not None:
         append_event(events_path, "active_goal_resume_started" if result["ok"] else "active_goal_resume_failed", **result)
@@ -4766,6 +4855,106 @@ def cmd_rate_limits(args: argparse.Namespace) -> int:
     print(f"  weekly reset: {fmt_dt(snapshot.secondary_resets_at)}")
     print(f"  snapshot time: {snapshot.event_timestamp or '-'}")
     print(f"  source file: {snapshot.source_file}")
+    return 0
+
+
+def backup_sqlite_database(path: Path) -> Path:
+    ts = datetime.now().strftime(BACKUP_TIMESTAMP_FMT)
+    backup_path = path.with_name(f"{path.stem}.backup-{ts}{path.suffix}")
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0) as source:
+        with sqlite3.connect(backup_path, timeout=5.0) as target:
+            source.backup(target)
+    return backup_path
+
+
+def _session_compat_rows(
+    *,
+    codex_state_db: Path,
+    providers: list[str],
+    thread_ids: list[str],
+    include_archived: bool,
+    include_subagents: bool,
+    limit: int | None,
+) -> list[sqlite3.Row]:
+    if not codex_state_db.exists():
+        return []
+    where = ["model_provider IN (" + ",".join("?" for _ in providers) + ")"]
+    params: list[Any] = list(providers)
+    if thread_ids:
+        where.append("id IN (" + ",".join("?" for _ in thread_ids) + ")")
+        params.extend(thread_ids)
+    if not include_archived:
+        where.append("archived = 0")
+    if not include_subagents:
+        where.append("source NOT LIKE ?")
+        params.append('{"subagent"%')
+    sql = f"""
+        SELECT id, source, model_provider, model, title, cwd, updated_at, archived
+        FROM threads
+        WHERE {' AND '.join(where)}
+        ORDER BY updated_at DESC
+    """
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    with _connect_sqlite_readonly(codex_state_db) as conn:
+        conn.row_factory = sqlite3.Row
+        return list(conn.execute(sql, params).fetchall())
+
+
+def cmd_sessions_compat(args: argparse.Namespace) -> int:
+    providers = list(args.provider or API_SESSION_COMPAT_PROVIDERS)
+    thread_ids = [str(value).strip() for value in (args.thread_id or []) if str(value).strip()]
+    apply_all = bool(getattr(args, "all", False))
+    apply_changes = bool(getattr(args, "apply", False))
+    if apply_changes and not apply_all and not thread_ids:
+        print("refusing to modify sessions without --all or --thread-id; rerun without --apply to preview")
+        return 2
+
+    rows = _session_compat_rows(
+        codex_state_db=args.codex_state_db,
+        providers=providers,
+        thread_ids=thread_ids,
+        include_archived=bool(args.include_archived),
+        include_subagents=bool(args.include_subagents),
+        limit=None if apply_changes and apply_all else int(args.limit),
+    )
+    if not rows:
+        print("no API-provider sessions matched")
+        return 0
+
+    print("API Session Compatibility")
+    print(f"  database: {args.codex_state_db}")
+    print(f"  providers: {', '.join(providers)}")
+    print(f"  matched: {len(rows)}")
+    for row in rows[: int(args.limit)]:
+        updated = datetime.fromtimestamp(int(row["updated_at"])).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  - {row['id']} | {row['model_provider']} -> openai | {row['source']} | {updated} | {row['title']}")
+    if len(rows) > int(args.limit):
+        print(f"  ... {len(rows) - int(args.limit)} more hidden by --limit")
+
+    if not apply_changes:
+        print("dry-run: add --apply with --thread-id <id> or --all to make these sessions openai-compatible")
+        return 0
+
+    backup_path = backup_sqlite_database(args.codex_state_db)
+    ids = [str(row["id"]) for row in rows]
+    with sqlite3.connect(args.codex_state_db, timeout=5.0) as conn:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.executemany("UPDATE threads SET model_provider = 'openai' WHERE id = ?", [(thread_id,) for thread_id in ids])
+        conn.commit()
+    append_event(
+        args.events_path,
+        "sessions_compat_applied",
+        count=len(ids),
+        providers=providers,
+        thread_ids=ids[:50],
+        backup_path=str(backup_path),
+    )
+    print(f"applied: {len(ids)} session(s) now use model_provider=openai")
+    print(f"backup: {backup_path}")
+    print("next step: restart Codex Desktop if its history list is already open")
     return 0
 
 
@@ -7483,6 +7672,24 @@ def build_parser() -> argparse.ArgumentParser:
         "rate-limits", help="show the latest Codex rate-limit snapshot parsed from session logs"
     )
     rate_limits_parser.set_defaults(func=cmd_rate_limits)
+
+    sessions_compat_parser = subparsers.add_parser(
+        "sessions-compat",
+        help="preview or convert API-provider local sessions so ChatGPT login can open them",
+    )
+    sessions_compat_parser.add_argument(
+        "--provider",
+        action="append",
+        choices=list(API_SESSION_COMPAT_PROVIDERS),
+        help="API model_provider to convert; can be repeated (default: cliproxyapi and codex-multi-auth-runtime-proxy)",
+    )
+    sessions_compat_parser.add_argument("--thread-id", action="append", help="only convert this thread id; can be repeated")
+    sessions_compat_parser.add_argument("--all", action="store_true", help="with --apply, convert every matched session")
+    sessions_compat_parser.add_argument("--apply", action="store_true", help="apply changes; default is dry-run preview")
+    sessions_compat_parser.add_argument("--limit", type=int, default=30, help="maximum rows to display")
+    sessions_compat_parser.add_argument("--include-archived", action="store_true", help="include archived sessions")
+    sessions_compat_parser.add_argument("--include-subagents", action="store_true", help="include subagent child threads")
+    sessions_compat_parser.set_defaults(func=cmd_sessions_compat)
 
     preview_parser = subparsers.add_parser("preview", help="preview a converted auth payload")
     preview_parser.add_argument("profile", help="profile path, filename, or unique substring")
