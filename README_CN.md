@@ -165,6 +165,19 @@ codex-auth-pool events --limit 10
 `fix` 默认是 dry-run，只预览低风险修复；确认后用 `fix --apply` 同步 auth 文件、清理过期冷却或补齐缺失元数据。
 `events` 默认输出易读摘要；如果需要原始 JSONL，可以使用 `codex-auth-pool events --raw`。
 
+## Token 使用量和成本估算
+
+`token-usage` 会扫描本机 Codex rollout 日志，按账号、模型、线程，或账号/模型组合统计 token 消耗：
+
+```bash
+codex-auth-pool token-usage
+codex-auth-pool token-usage --by model --since 2026-05-01
+codex-auth-pool token-usage --by thread --limit 20
+codex-auth-pool token-usage --json
+```
+
+输出会包含输入 token、缓存输入 token、非缓存输入 token、输出 token、reasoning 输出 token、按 OpenAI API 标准价格估算的美元成本，以及按 Codex token-based rate card 估算的 Codex credits。这个结果来自本地日志，只适合看趋势和大致消耗，不是 ChatGPT Plus 的官方账单。
+
 ## 被重启打断的会话恢复
 
 通过 `launchd-install`、`systemd-install`、`setup --install-*` 或 `init --install-*` 安装后台服务时，默认会启用切号后重启。macOS 上自动轮换切号后，工具会做一个保守的恢复流程：
@@ -236,6 +249,7 @@ codex-auth-pool save-current --name my-official-1
 codex-auth-pool sync-cliproxy
 codex-auth-pool tick --dry-run
 codex-auth-pool export-ready-auths
+codex-auth-pool token-usage --by account
 codex-auth-pool events --limit 10
 codex-auth-pool launchd-status
 codex-auth-pool systemd-status

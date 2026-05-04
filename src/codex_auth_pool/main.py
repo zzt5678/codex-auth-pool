@@ -98,6 +98,25 @@ DEFAULT_ARG_VALUES = {
     "app_path": str(DEFAULT_CODEX_APP),
 }
 API_SESSION_COMPAT_PROVIDERS = ("cliproxyapi", "codex-multi-auth-runtime-proxy")
+OPENAI_API_PRICE_SOURCE = "https://openai.com/api/pricing/"
+OPENAI_CODEX_RATE_CARD_SOURCE = "https://help.openai.com/en/articles/20001106-codex-rate-card"
+MODEL_PRICES_PER_1M = {
+    "gpt-5.5": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.5-pro": {"input": 30.00, "cached_input": 0.00, "output": 180.00},
+    "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
+    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
+    "gpt-5": {"input": 1.25, "cached_input": 0.125, "output": 10.00},
+    "gpt-5-mini": {"input": 0.25, "cached_input": 0.025, "output": 2.00},
+    "gpt-5-nano": {"input": 0.05, "cached_input": 0.005, "output": 0.40},
+    "gpt-5-pro": {"input": 15.00, "cached_input": 0.00, "output": 120.00},
+}
+CODEX_CREDITS_PER_1M = {
+    "gpt-5.5": {"input": 125.0, "cached_input": 12.50, "output": 750.0},
+    "gpt-5.4": {"input": 62.50, "cached_input": 6.250, "output": 375.0},
+    "gpt-5.4-mini": {"input": 18.75, "cached_input": 1.875, "output": 113.0},
+    "gpt-5.3-codex": {"input": 43.75, "cached_input": 4.375, "output": 350.0},
+    "gpt-5.2": {"input": 43.75, "cached_input": 4.375, "output": 350.0},
+}
 REQUIRED_SOURCE_KEYS = (
     "access_token",
     "refresh_token",
@@ -4858,6 +4877,357 @@ def cmd_rate_limits(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_account_switch_timeline(events_path: Path) -> list[tuple[float, str, str]]:
+    if not events_path.exists():
+        return []
+    switches: list[tuple[float, str, str]] = []
+    for raw in events_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event_type") != "apply_profile":
+            continue
+        event_at = parse_dt(str(event.get("timestamp") or ""))
+        if event_at is None:
+            continue
+        account_id = str(event.get("account_id") or "")
+        label = str(event.get("email") or account_id or "unknown")
+        switches.append((event_at.astimezone(timezone.utc).timestamp(), account_id, label))
+    switches.sort(key=lambda item: item[0])
+    return switches
+
+
+def _account_for_timestamp(
+    switches: list[tuple[float, str, str]],
+    timestamp: datetime,
+) -> tuple[str, str]:
+    if not switches:
+        return "unknown", "unknown"
+    ts = timestamp.astimezone(timezone.utc).timestamp()
+    low = 0
+    high = len(switches)
+    while low < high:
+        mid = (low + high) // 2
+        if switches[mid][0] <= ts:
+            low = mid + 1
+        else:
+            high = mid
+    index = low - 1
+    if index < 0:
+        return "unknown_before_auth_pool", "unknown_before_auth_pool"
+    return switches[index][1], switches[index][2]
+
+
+def _thread_metadata(codex_state_db: Path) -> dict[str, dict[str, str]]:
+    if not codex_state_db.exists():
+        return {}
+    try:
+        with _connect_sqlite_readonly(codex_state_db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT id, title, model, model_provider, source FROM threads").fetchall()
+    except sqlite3.Error:
+        return {}
+    return {
+        str(row["id"]): {
+            "title": str(row["title"] or ""),
+            "model": str(row["model"] or ""),
+            "model_provider": str(row["model_provider"] or ""),
+            "source": str(row["source"] or ""),
+        }
+        for row in rows
+    }
+
+
+def _canonical_pricing_model(model: str) -> str | None:
+    lowered = (model or "").strip().lower()
+    if not lowered:
+        return None
+    aliases = {
+        "gpt-5.4 mini": "gpt-5.4-mini",
+        "gpt-5.4-mini": "gpt-5.4-mini",
+        "gpt-5.3 codex": "gpt-5.3-codex",
+        "gpt-5.3-codex": "gpt-5.3-codex",
+        "gpt-5.3-codex-high": "gpt-5.3-codex",
+        "gpt-5.3-codex-medium": "gpt-5.3-codex",
+        "gpt-5.3-codex-low": "gpt-5.3-codex",
+        "gpt-5.5-thinking": "gpt-5.5",
+        "gpt-5.5-fast": "gpt-5.5",
+        "gpt-5.4-thinking": "gpt-5.4",
+        "gpt-5.4-fast": "gpt-5.4",
+    }
+    if lowered in aliases:
+        return aliases[lowered]
+    if lowered in MODEL_PRICES_PER_1M or lowered in CODEX_CREDITS_PER_1M:
+        return lowered
+    if lowered.startswith("gpt-5.5-pro"):
+        return "gpt-5.5-pro"
+    if lowered.startswith("gpt-5.5"):
+        return "gpt-5.5"
+    if lowered.startswith("gpt-5.4-mini"):
+        return "gpt-5.4-mini"
+    if lowered.startswith("gpt-5.4"):
+        return "gpt-5.4"
+    if lowered.startswith("gpt-5.3-codex"):
+        return "gpt-5.3-codex"
+    if lowered.startswith("gpt-5-pro"):
+        return "gpt-5-pro"
+    if lowered.startswith("gpt-5-mini"):
+        return "gpt-5-mini"
+    if lowered.startswith("gpt-5-nano"):
+        return "gpt-5-nano"
+    if lowered.startswith("gpt-5"):
+        return "gpt-5"
+    return None
+
+
+def _empty_token_record() -> dict[str, Any]:
+    return {
+        "events": 0,
+        "threads": set(),
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "uncached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "estimated_cost_usd": 0.0,
+        "estimated_codex_credits": 0.0,
+        "unpriced_api_tokens": 0,
+        "unpriced_codex_credit_tokens": 0,
+    }
+
+
+def _add_usage_to_record(record: dict[str, Any], usage: dict[str, Any], *, thread_id: str, model: str) -> None:
+    input_tokens = int(usage.get("input_tokens") or 0)
+    cached_tokens = int(usage.get("cached_input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    reasoning_tokens = int(usage.get("reasoning_output_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
+    uncached_tokens = max(0, input_tokens - cached_tokens)
+    record["events"] += 1
+    record["threads"].add(thread_id)
+    record["input_tokens"] += input_tokens
+    record["cached_input_tokens"] += cached_tokens
+    record["uncached_input_tokens"] += uncached_tokens
+    record["output_tokens"] += output_tokens
+    record["reasoning_output_tokens"] += reasoning_tokens
+    record["total_tokens"] += total_tokens
+    priced_model = _canonical_pricing_model(model)
+    prices = MODEL_PRICES_PER_1M.get(priced_model or "")
+    if prices is None:
+        record["unpriced_api_tokens"] += total_tokens
+    else:
+        record["estimated_cost_usd"] += (
+            (uncached_tokens * prices["input"])
+            + (cached_tokens * prices["cached_input"])
+            + (output_tokens * prices["output"])
+        ) / 1_000_000
+    codex_credits = CODEX_CREDITS_PER_1M.get(priced_model or "")
+    if codex_credits is None:
+        record["unpriced_codex_credit_tokens"] += total_tokens
+    else:
+        record["estimated_codex_credits"] += (
+            (uncached_tokens * codex_credits["input"])
+            + (cached_tokens * codex_credits["cached_input"])
+            + (output_tokens * codex_credits["output"])
+        ) / 1_000_000
+
+
+def _finalize_token_record(record: dict[str, Any]) -> dict[str, Any]:
+    output = dict(record)
+    output["threads"] = len(record["threads"])
+    output["estimated_cost_usd"] = round(float(record["estimated_cost_usd"]), 6)
+    output["estimated_codex_credits"] = round(float(record["estimated_codex_credits"]), 6)
+    return output
+
+
+def _session_meta_from_rollout(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                event = json.loads(line)
+                if event.get("type") != "session_meta":
+                    continue
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                return {
+                    "id": str(payload.get("id") or ""),
+                    "model": str(payload.get("model") or ""),
+                    "model_provider": str(payload.get("model_provider") or ""),
+                    "source": str(payload.get("source") or ""),
+                }
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {}
+
+
+def collect_token_usage(args: argparse.Namespace) -> dict[str, Any]:
+    switches = _load_account_switch_timeline(args.events_path)
+    thread_meta = _thread_metadata(args.codex_state_db)
+    since = parse_dt(args.since) if getattr(args, "since", None) else None
+    until = parse_dt(args.until) if getattr(args, "until", None) else None
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=now_local().tzinfo)
+    if until is not None and until.tzinfo is None:
+        until = until.replace(tzinfo=now_local().tzinfo)
+
+    grouped: dict[str, dict[str, Any]] = {}
+    totals = _empty_token_record()
+    files_scanned = 0
+    token_events_with_usage = 0
+    token_events_without_usage = 0
+
+    for path in args.sessions_dir.rglob("*.jsonl") if args.sessions_dir.exists() else []:
+        if not path.is_file():
+            continue
+        files_scanned += 1
+        session_meta = _session_meta_from_rollout(path)
+        thread_id = session_meta.get("id") or path.stem.split("-")[-1]
+        db_meta = thread_meta.get(thread_id, {})
+        model = db_meta.get("model") or session_meta.get("model") or "unknown"
+        title = db_meta.get("title") or ""
+        try:
+            handle = path.open(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "event_msg":
+                    continue
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                if payload.get("type") != "token_count":
+                    continue
+                usage = ((payload.get("info") or {}).get("last_token_usage") or {})
+                if not usage:
+                    token_events_without_usage += 1
+                    continue
+                event_at = parse_dt(str(event.get("timestamp") or ""))
+                if event_at is None:
+                    continue
+                if since is not None and event_at < since:
+                    continue
+                if until is not None and event_at > until:
+                    continue
+                account_id, account_label = _account_for_timestamp(switches, event_at)
+                if not args.include_unknown and account_label.startswith("unknown"):
+                    continue
+                token_events_with_usage += 1
+                if args.by == "account":
+                    group_key = account_label
+                elif args.by == "model":
+                    group_key = model or "unknown"
+                elif args.by == "thread":
+                    compact_title = _truncate_one_line(title, 72)
+                    group_key = f"{thread_id} {compact_title}".strip()
+                elif args.by == "account-model":
+                    group_key = f"{account_label} | {model or 'unknown'}"
+                else:
+                    group_key = account_label
+                record = grouped.setdefault(group_key, _empty_token_record())
+                _add_usage_to_record(record, usage, thread_id=thread_id, model=model)
+                _add_usage_to_record(totals, usage, thread_id=thread_id, model=model)
+
+    rows = [
+        {"group": key, **_finalize_token_record(value)}
+        for key, value in grouped.items()
+    ]
+    rows.sort(key=lambda row: (float(row["estimated_cost_usd"]), int(row["total_tokens"])), reverse=True)
+    if args.limit and args.limit > 0:
+        rows = rows[: args.limit]
+    return {
+        "api_pricing_source": OPENAI_API_PRICE_SOURCE,
+        "codex_rate_card_source": OPENAI_CODEX_RATE_CARD_SOURCE,
+        "pricing_note": (
+            "Local estimate only. API USD uses OpenAI standard API pricing; Codex credits use the "
+            "token-based Codex rate card. ChatGPT Plus subscription usage is quota/credits based, "
+            "not an official bill from this command."
+        ),
+        "group_by": args.by,
+        "since": args.since,
+        "until": args.until,
+        "files_scanned": files_scanned,
+        "switch_events": len(switches),
+        "token_events_with_usage": token_events_with_usage,
+        "token_events_without_last_usage": token_events_without_usage,
+        "totals": _finalize_token_record(totals),
+        "rows": rows,
+    }
+
+
+def _fmt_int(value: Any) -> str:
+    return f"{int(value):,}"
+
+
+def _fmt_money(value: Any) -> str:
+    return f"${float(value):,.2f}"
+
+
+def _fmt_float(value: Any, *, decimals: int = 2) -> str:
+    return f"{float(value):,.{decimals}f}"
+
+
+def cmd_token_usage(args: argparse.Namespace) -> int:
+    report = collect_token_usage(args)
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    totals = report["totals"]
+    print("Token Usage")
+    print(f"  group by: {report['group_by']}")
+    print(f"  API pricing: {report['api_pricing_source']}")
+    print(f"  Codex rate card: {report['codex_rate_card_source']}")
+    print(f"  note: {report['pricing_note']}")
+    if report.get("since") or report.get("until"):
+        print(f"  window: {report.get('since') or '-'} -> {report.get('until') or '-'}")
+    print(f"  files scanned: {report['files_scanned']}")
+    print(f"  token events with usage: {report['token_events_with_usage']}")
+    print(f"  token events without last usage: {report['token_events_without_last_usage']}")
+    print("")
+    print("Totals")
+    print(f"  estimated API cost: {_fmt_money(totals['estimated_cost_usd'])}")
+    print(f"  estimated Codex credits: {_fmt_float(totals['estimated_codex_credits'])}")
+    print(f"  total tokens: {_fmt_int(totals['total_tokens'])}")
+    print(f"  input tokens: {_fmt_int(totals['input_tokens'])}")
+    print(f"  cached input tokens: {_fmt_int(totals['cached_input_tokens'])}")
+    print(f"  uncached input tokens: {_fmt_int(totals['uncached_input_tokens'])}")
+    print(f"  output tokens: {_fmt_int(totals['output_tokens'])}")
+    print(f"  reasoning output tokens: {_fmt_int(totals['reasoning_output_tokens'])}")
+    if totals["unpriced_api_tokens"]:
+        print(f"  unpriced API tokens: {_fmt_int(totals['unpriced_api_tokens'])}")
+    if totals["unpriced_codex_credit_tokens"]:
+        print(f"  unpriced Codex credit tokens: {_fmt_int(totals['unpriced_codex_credit_tokens'])}")
+    print("")
+    print("Rows")
+    header = (
+        f"{'group':42} {'api_usd':>10} {'credits':>10} {'total':>14} {'input':>14} "
+        f"{'cached':>14} {'uncached':>14} {'output':>12} {'reasoning':>12} {'events':>8} {'threads':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in report["rows"]:
+        group = _truncate_one_line(str(row["group"]), 42)
+        print(
+            f"{group:42} "
+            f"{_fmt_money(row['estimated_cost_usd']):>10} "
+            f"{_fmt_float(row['estimated_codex_credits']):>10} "
+            f"{_fmt_int(row['total_tokens']):>14} "
+            f"{_fmt_int(row['input_tokens']):>14} "
+            f"{_fmt_int(row['cached_input_tokens']):>14} "
+            f"{_fmt_int(row['uncached_input_tokens']):>14} "
+            f"{_fmt_int(row['output_tokens']):>12} "
+            f"{_fmt_int(row['reasoning_output_tokens']):>12} "
+            f"{_fmt_int(row['events']):>8} "
+            f"{_fmt_int(row['threads']):>8}"
+        )
+    return 0
+
+
 def backup_sqlite_database(path: Path) -> Path:
     ts = datetime.now().strftime(BACKUP_TIMESTAMP_FMT)
     backup_path = path.with_name(f"{path.stem}.backup-{ts}{path.suffix}")
@@ -7791,6 +8161,27 @@ def build_parser() -> argparse.ArgumentParser:
         "rate-limits", help="show the latest Codex rate-limit snapshot parsed from session logs"
     )
     rate_limits_parser.set_defaults(func=cmd_rate_limits)
+
+    token_usage_parser = subparsers.add_parser(
+        "token-usage",
+        help="summarize local Codex token usage and estimate API-standard cost by account, model, or thread",
+    )
+    token_usage_parser.add_argument(
+        "--by",
+        choices=["account", "model", "thread", "account-model"],
+        default="account",
+        help="aggregation dimension (default: account)",
+    )
+    token_usage_parser.add_argument("--since", help="start time, e.g. 2026-05-01 or 2026-05-01T00:00:00+08:00")
+    token_usage_parser.add_argument("--until", help="end time, e.g. 2026-05-05T12:00:00+08:00")
+    token_usage_parser.add_argument("--limit", type=int, default=30, help="maximum rows to display; 0 means all")
+    token_usage_parser.add_argument(
+        "--include-unknown",
+        action="store_true",
+        help="include usage before auth-pool had switch events for account attribution",
+    )
+    token_usage_parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    token_usage_parser.set_defaults(func=cmd_token_usage)
 
     sessions_compat_parser = subparsers.add_parser(
         "sessions-compat",

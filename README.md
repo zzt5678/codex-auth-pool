@@ -165,6 +165,19 @@ codex-auth-pool events --limit 10
 `fix` is dry-run by default and only previews low-risk repairs; use `fix --apply` to synchronize auth files, clear expired cooldowns, or create missing metadata.
 `events` prints a readable summary by default; use `codex-auth-pool events --raw` for raw JSONL.
 
+## Token Usage And Cost Estimate
+
+`token-usage` scans local Codex rollout logs and summarizes token consumption by account, model, thread, or account/model pair:
+
+```bash
+codex-auth-pool token-usage
+codex-auth-pool token-usage --by model --since 2026-05-01
+codex-auth-pool token-usage --by thread --limit 20
+codex-auth-pool token-usage --json
+```
+
+The command reports input tokens, cached input tokens, uncached input tokens, output tokens, reasoning output tokens, estimated API-standard USD cost, and estimated Codex credits. API cost uses OpenAI API standard pricing; Codex credits use the OpenAI Codex token-based rate card. This is a local estimate from logs, not an official ChatGPT Plus bill.
+
 ## Interrupted Session Recovery
 
 Background services installed with `launchd-install`, `systemd-install`, `setup --install-*`, or `init --install-*` now enable `--restart-after-switch` by default. On macOS, that means `codex-auth-pool` does a conservative recovery pass whenever automatic rotation switches accounts:
@@ -236,6 +249,7 @@ codex-auth-pool save-current --name my-official-1
 codex-auth-pool sync-cliproxy
 codex-auth-pool tick --dry-run
 codex-auth-pool export-ready-auths
+codex-auth-pool token-usage --by account
 codex-auth-pool events --limit 10
 codex-auth-pool launchd-status
 codex-auth-pool systemd-status
