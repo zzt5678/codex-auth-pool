@@ -2568,6 +2568,16 @@ def classify_active_goal_runtime(goal: dict[str, Any], *, now: datetime | None =
     }
 
 
+def _runtime_state_requires_goal_resume(runtime_state: dict[str, Any]) -> bool:
+    """Only confirmed quota/auth blockers are safe enough to auto-resume.
+
+    Lack of rollout activity can mean a long-running shell command, remote job,
+    or sub-agent is still doing work. Treat that as a watch state, not as proof
+    that the original goal session is dead.
+    """
+    return runtime_state.get("state") == "blocked" and bool(runtime_state.get("quota_blocked"))
+
+
 def _goal_resume_key(goal: dict[str, Any], account_id: str | None) -> str:
     return f"{goal.get('thread_id') or ''}:{account_id or ''}"
 
@@ -2743,7 +2753,7 @@ def resume_active_goal_threads_after_switch(
             results.append(result)
             continue
         runtime_state = classify_active_goal_runtime(goal, now=now)
-        if runtime_state.get("state") in {"busy", "waiting"}:
+        if not _runtime_state_requires_goal_resume(runtime_state):
             _record_pending_goal_resume(
                 state,
                 goal,
@@ -2753,7 +2763,7 @@ def resume_active_goal_threads_after_switch(
             result = {
                 "ok": True,
                 "skipped": True,
-                "reason": "goal_still_running",
+                "reason": "goal_not_confirmed_blocked",
                 "thread_id": goal.get("thread_id"),
                 "goal_id": goal.get("goal_id"),
                 "title": goal.get("title"),
@@ -2817,7 +2827,7 @@ def process_pending_goal_resumes(
             _remove_pending_goal_resume(state, str(thread_id))
             continue
         runtime_state = classify_active_goal_runtime(goal, now=now)
-        if runtime_state.get("state") in {"busy", "waiting"}:
+        if not _runtime_state_requires_goal_resume(runtime_state):
             record["next_check_at"] = (now + timedelta(seconds=ACTIVE_GOAL_RESUME_RECHECK_SECONDS)).isoformat()
             record["runtime_state"] = runtime_state
             if events_path is not None:
