@@ -4890,7 +4890,7 @@ def _session_compat_rows(
         where.append("source NOT LIKE ?")
         params.append('{"subagent"%')
     sql = f"""
-        SELECT id, source, model_provider, model, title, cwd, updated_at, archived
+        SELECT id, source, model_provider, model, title, cwd, rollout_path, updated_at, archived
         FROM threads
         WHERE {' AND '.join(where)}
         ORDER BY updated_at DESC
@@ -4910,6 +4910,41 @@ def _truncate_one_line(value: str, max_len: int = 96) -> str:
     return cleaned[: max_len - 1] + "…"
 
 
+def _rollout_session_meta(path: str | None) -> dict[str, str]:
+    if not path:
+        return {}
+    rollout_path = Path(path)
+    if not rollout_path.exists() or not rollout_path.is_file():
+        return {}
+    try:
+        with rollout_path.open(encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                event = json.loads(line)
+                if event.get("type") != "session_meta":
+                    continue
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                return {
+                    "originator": str(payload.get("originator") or ""),
+                    "source": str(payload.get("source") or ""),
+                    "model_provider": str(payload.get("model_provider") or ""),
+                }
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {}
+
+
+def _client_label(source: str, originator: str) -> str:
+    if originator:
+        return originator
+    if source == "vscode":
+        return "Codex Desktop"
+    if source == "cli":
+        return "Codex CLI"
+    if source == "exec":
+        return "Codex exec"
+    return source or "-"
+
+
 def cmd_sessions_compat(args: argparse.Namespace) -> int:
     providers = list(args.provider or API_SESSION_COMPAT_PROVIDERS)
     thread_ids = [str(value).strip() for value in (args.thread_id or []) if str(value).strip()]
@@ -4927,22 +4962,37 @@ def cmd_sessions_compat(args: argparse.Namespace) -> int:
         include_subagents=bool(args.include_subagents),
         limit=None,
     )
+    missing_rollout_count = sum(
+        1 for row in all_rows if not Path(str(row["rollout_path"] or "")).exists()
+    )
+    if not bool(getattr(args, "include_missing_rollout", False)):
+        all_rows = [
+            row for row in all_rows if Path(str(row["rollout_path"] or "")).exists()
+        ]
     if not all_rows:
         print("no API-provider sessions matched")
+        if missing_rollout_count:
+            print(f"skipped {missing_rollout_count} session(s) whose rollout file no longer exists")
         return 0
     rows = all_rows if apply_changes and apply_all else all_rows[: int(args.limit)]
 
     print("API Session Compatibility")
     print(f"  database: {args.codex_state_db}")
     print(f"  API providers matched: {', '.join(providers)}")
-    print("  note: client/source is where the session was opened, not the login type")
+    print("  note: app/source is where the session was opened, not the login type; Codex Desktop may store source=vscode internally")
     print(f"  total matched: {len(all_rows)}")
+    if missing_rollout_count and not bool(getattr(args, "include_missing_rollout", False)):
+        print(f"  skipped missing rollout files: {missing_rollout_count}")
     print(f"  displayed: {min(len(all_rows), int(args.limit))}")
     for row in rows[: int(args.limit)]:
         updated = datetime.fromtimestamp(int(row["updated_at"])).strftime("%Y-%m-%d %H:%M:%S")
+        meta = _rollout_session_meta(str(row["rollout_path"] or ""))
+        app_label = _client_label(str(row["source"] or ""), meta.get("originator", ""))
+        meta_provider = meta.get("model_provider") or "-"
         print(
             f"  - {row['id']} | provider={row['model_provider']} -> openai "
-            f"| client={row['source']} | {updated} | {_truncate_one_line(str(row['title'] or ''))}"
+            f"| app={app_label} | db_source={row['source']} | rollout_provider={meta_provider} "
+            f"| {updated} | {_truncate_one_line(str(row['title'] or ''))}"
         )
     if len(all_rows) > int(args.limit):
         print(f"  ... {len(all_rows) - int(args.limit)} more hidden by --limit")
@@ -7702,6 +7752,11 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_compat_parser.add_argument("--limit", type=int, default=30, help="maximum rows to display")
     sessions_compat_parser.add_argument("--include-archived", action="store_true", help="include archived sessions")
     sessions_compat_parser.add_argument("--include-subagents", action="store_true", help="include subagent child threads")
+    sessions_compat_parser.add_argument(
+        "--include-missing-rollout",
+        action="store_true",
+        help="include sessions whose rollout file is missing; these usually cannot be reopened",
+    )
     sessions_compat_parser.set_defaults(func=cmd_sessions_compat)
 
     preview_parser = subparsers.add_parser("preview", help="preview a converted auth payload")
