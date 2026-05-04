@@ -1471,6 +1471,13 @@ def read_recent_desktop_sessions(
                     archived = 0
                     AND source IN ('vscode', 'desktop', 'app')
                     AND updated_at >= ?
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM thread_goals g
+                        WHERE
+                            g.thread_id = threads.id
+                            AND g.status = 'active'
+                    )
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,

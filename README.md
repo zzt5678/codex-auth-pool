@@ -170,6 +170,7 @@ Background services installed with `launchd-install`, `systemd-install`, `setup 
 - hard exhaustion also waits for active work to finish; for normal top-level sessions it waits up to 10 minutes by default, switches immediately if the session becomes idle sooner, and then forces rotation after the grace window so a zero-quota account cannot deadlock the app forever
 - if a running child agent / spawned thread is detected, rotation keeps waiting for that child agent to finish instead of using the 10-minute force-switch grace window
 - before quitting Codex Desktop, it captures recently active Desktop sessions from `~/.codex/state_5.sqlite` and `~/.codex/logs_2.sqlite`
+- active goal threads do not block Desktop-session rotation; after a successful auth switch they use the separate `codex resume <thread_id>` recovery path
 - after Codex Desktop comes back up, it starts a lightweight recovery helper that calls `thread/resume` and `turn/start` for each captured `threadId`
 - recovery uses the original Desktop thread path only; it no longer falls back to `codex exec resume`, because that can create a separate CLI resume instead of continuing the original Desktop session
 - recovery snapshots and resume logs are written under `~/.codex-auth-pool/session-recovery/`
