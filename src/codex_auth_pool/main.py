@@ -467,6 +467,16 @@ def send_notification(title: str, message: str, enabled: bool = True) -> None:
         run_command(["notify-send", title, message])
 
 
+def applescript_string(value: str) -> str:
+    """Return a macOS AppleScript string literal.
+
+    json.dumps() escapes non-ASCII text as \\uXXXX by default, but AppleScript
+    does not treat that as a Unicode escape. Build the literal directly so
+    Chinese resume prompts can be sent to Terminal safely.
+    """
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def env_snapshot_items() -> list[tuple[str, Path]]:
     codex_app_support = Path.home() / "Library" / "Application Support" / "Codex"
     return [
@@ -2674,7 +2684,7 @@ def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path |
 
     if is_macos():
         command = f"cd {shlex.quote(str(cwd))} && codex resume {shlex.quote(thread_id)} {shlex.quote(prompt)}"
-        script = f'tell application "Terminal" to do script {json.dumps(command)}'
+        script = f'tell application "Terminal" to do script {applescript_string(command)}'
         completed = run_command(["osascript", "-e", script])
         ok = completed.returncode == 0
         result = {
