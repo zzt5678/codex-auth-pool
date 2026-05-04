@@ -46,6 +46,7 @@ when you need an emergency manual switch.
 ## Features
 
 - Preserve multiple official `codex login` sessions so later logins do not overwrite earlier ones.
+- Before background rotation or `apply-best` overwrites auth, check whether the current official login is already in the pool; if not, save it into the managed vault by `account_id`.
 - Import existing `cliproxyapi` accounts into the same pool.
 - Auto-detect newly added `cliproxyapi` Codex accounts during status checks, dashboard views, usage refreshes, picks, and rotations.
 - Automatically import new `cliproxyapi` accounts into the managed vault and fetch their first real usage snapshot.
@@ -137,6 +138,8 @@ This is the main command most people will care about. It shows:
 
 New `cliproxyapi` Codex accounts do not require a manual `sync-cliproxy`.
 The tool auto-imports and observes new accounts when you run `dashboard`, `status`, `pick`, `apply-best`, `refresh-usage`, or when the background daemon runs `tick`.
+
+If you temporarily sign in to a new account with official `codex login`, background rotation and `apply-best` automatically save that current login into the pool before replacing auth. The guard deduplicates by `account_id`, so the same account is not saved twice.
 
 ### 4. Refresh real usage windows
 

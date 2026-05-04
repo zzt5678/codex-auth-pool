@@ -5166,6 +5166,13 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
 
 
 def cmd_apply_best(args: argparse.Namespace) -> int:
+    current_account = reconcile_auth_files(
+        Path(args.target),
+        args.events_path,
+        quiet=getattr(args, "daemon_quiet", False),
+        state_path=args.state_path,
+    )
+    ensure_current_auth_saved_to_pool(args, current_account)
     auto_discover_new_profiles(
         args.source_dir,
         args.managed_dir,
@@ -5251,6 +5258,54 @@ def save_managed_profile_from_payload(
     out = destination_dir / managed_profile_name(normalized, explicit_name=name)
     write_json(out, convert_profile(normalized))
     write_json(meta_path_for_profile(out), metadata_for_profile(normalized, out))
+    return out
+
+
+def _profile_exists_for_account(source_dir: Path, managed_dir: Path, account_id: str | None) -> bool:
+    if not account_id:
+        return False
+    for path in discover_all_profiles(source_dir, managed_dir):
+        try:
+            if summarize_profile(path).account_id == account_id:
+                return True
+        except SystemExit:
+            continue
+    return False
+
+
+def _auto_saved_current_profile_name(payload: dict[str, Any], account_id: str) -> str:
+    normalized = normalize_source_payload(Path("<current-auth>"), payload)
+    email = str(normalized.get("email") or "").strip()
+    base = email or account_id
+    return f"official-current-{base}-{account_id[:8]}"
+
+
+def ensure_current_auth_saved_to_pool(args: argparse.Namespace, current_account_id: str | None) -> Path | None:
+    if not current_account_id:
+        return None
+    if _profile_exists_for_account(args.source_dir, args.managed_dir, current_account_id):
+        return None
+    source_path, payload = current_auth_payload(Path(args.target), DEFAULT_CODEX_ROOT_AUTH_PATH)
+    normalized = normalize_source_payload(source_path, payload)
+    if str(normalized.get("account_id") or "") != current_account_id:
+        return None
+    out = save_managed_profile_from_payload(
+        payload,
+        args.managed_dir,
+        _auto_saved_current_profile_name(payload, current_account_id),
+        source_kind="managed",
+        source_file=str(source_path),
+    )
+    append_event(
+        args.events_path,
+        "auto_save_current",
+        source_path=str(source_path),
+        output_path=str(out),
+        account_id=current_account_id,
+        email=normalized.get("email"),
+    )
+    if not getattr(args, "daemon_quiet", False):
+        print(f"auto-saved current Codex login into managed vault: {out.name}")
     return out
 
 
@@ -6737,6 +6792,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
     if current_account is None:
         print("no current Codex auth account detected")
         return 1
+    ensure_current_auth_saved_to_pool(args, current_account)
 
     current_usage_refresh_error = None
     if getattr(args, "refresh_usage", False):

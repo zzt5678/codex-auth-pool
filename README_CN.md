@@ -46,6 +46,7 @@
 ## 主要功能
 
 - 保存多个官方 `codex login` 登录态，避免后一次登录覆盖前一次。
+- 后台轮换或 `apply-best` 覆盖 auth 前，会先检查当前官方登录是否已在池子中；如果不在，会按 `account_id` 自动保存到 managed vault。
 - 导入现有的 `cliproxyapi` 账号。
 - 在查看状态、打开看板、刷新额度、选择账号和后台轮换时自动发现新加入的 `cliproxyapi` Codex 账号。
 - 自动把新 `cliproxyapi` 账号吸收到 managed vault，并补齐第一次真实额度观测。
@@ -137,6 +138,8 @@ codex-auth-pool dashboard
 
 新加入的 `cliproxyapi` Codex 账号不需要手动执行 `sync-cliproxy`。
 运行 `dashboard`、`status`、`pick`、`apply-best`、`refresh-usage`，或者后台守护执行 `tick` 时，工具都会自动吸收新账号并补齐初始额度观测。
+
+如果你通过官方 `codex login` 临时登录了一个新账号，后台轮换或 `apply-best` 在覆盖当前 auth 前会自动把这个当前登录态保存进池子，避免有效账号被下一个切号覆盖。这个保护按 `account_id` 去重，不会重复保存同一个账号。
 
 ### 4. 主动刷新真实额度
 
