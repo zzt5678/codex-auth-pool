@@ -4903,6 +4903,13 @@ def _session_compat_rows(
         return list(conn.execute(sql, params).fetchall())
 
 
+def _truncate_one_line(value: str, max_len: int = 96) -> str:
+    cleaned = " ".join(str(value or "").split())
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 1] + "…"
+
+
 def cmd_sessions_compat(args: argparse.Namespace) -> int:
     providers = list(args.provider or API_SESSION_COMPAT_PROVIDERS)
     thread_ids = [str(value).strip() for value in (args.thread_id or []) if str(value).strip()]
@@ -4912,27 +4919,33 @@ def cmd_sessions_compat(args: argparse.Namespace) -> int:
         print("refusing to modify sessions without --all or --thread-id; rerun without --apply to preview")
         return 2
 
-    rows = _session_compat_rows(
+    all_rows = _session_compat_rows(
         codex_state_db=args.codex_state_db,
         providers=providers,
         thread_ids=thread_ids,
         include_archived=bool(args.include_archived),
         include_subagents=bool(args.include_subagents),
-        limit=None if apply_changes and apply_all else int(args.limit),
+        limit=None,
     )
-    if not rows:
+    if not all_rows:
         print("no API-provider sessions matched")
         return 0
+    rows = all_rows if apply_changes and apply_all else all_rows[: int(args.limit)]
 
     print("API Session Compatibility")
     print(f"  database: {args.codex_state_db}")
-    print(f"  providers: {', '.join(providers)}")
-    print(f"  matched: {len(rows)}")
+    print(f"  API providers matched: {', '.join(providers)}")
+    print("  note: client/source is where the session was opened, not the login type")
+    print(f"  total matched: {len(all_rows)}")
+    print(f"  displayed: {min(len(all_rows), int(args.limit))}")
     for row in rows[: int(args.limit)]:
         updated = datetime.fromtimestamp(int(row["updated_at"])).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"  - {row['id']} | {row['model_provider']} -> openai | {row['source']} | {updated} | {row['title']}")
-    if len(rows) > int(args.limit):
-        print(f"  ... {len(rows) - int(args.limit)} more hidden by --limit")
+        print(
+            f"  - {row['id']} | provider={row['model_provider']} -> openai "
+            f"| client={row['source']} | {updated} | {_truncate_one_line(str(row['title'] or ''))}"
+        )
+    if len(all_rows) > int(args.limit):
+        print(f"  ... {len(all_rows) - int(args.limit)} more hidden by --limit")
 
     if not apply_changes:
         print("dry-run: add --apply with --thread-id <id> or --all to make these sessions openai-compatible")
