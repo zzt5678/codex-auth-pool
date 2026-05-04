@@ -6227,6 +6227,60 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         pending_until = parse_dt(str(pending_rotation.get("cooldown_until") or ""))
         if pending_until is None:
             pending_until = now_local() + timedelta(hours=5)
+        if now_local() >= pending_until and not usage_error_blocks_current_account(current_usage_refresh_error):
+            recovered_usage, recovered_note = current_profile_usage_snapshot(
+                args.source_dir,
+                args.managed_dir,
+                Path(args.target),
+                max_age_minutes=args.usage_max_age_minutes,
+            )
+            recovered_reason = None
+            recovered_until = None
+            if recovered_usage is not None:
+                recovered_reason, recovered_until = determine_rotation_trigger(
+                    recovered_usage,
+                    primary_used_percent=recovered_usage.primary_used_percent,
+                    primary_reset_at=recovered_usage.primary_reset_at,
+                    secondary_used_percent=recovered_usage.secondary_used_percent,
+                    secondary_reset_at=recovered_usage.secondary_reset_at,
+                    primary_threshold=args.primary_threshold,
+                    secondary_threshold=args.secondary_threshold,
+                )
+            if recovered_usage is not None and recovered_reason is None:
+                clear_pending_rotation(args.state_path, args.events_path, reason="quota_window_recovered")
+                append_event(
+                    args.events_path,
+                    "rotation_pending_recovered",
+                    account_id=current_account,
+                    pending_reason=pending_reason,
+                    pending_until=pending_until.isoformat(),
+                    primary_used_percent=recovered_usage.primary_used_percent,
+                    secondary_used_percent=recovered_usage.secondary_used_percent,
+                    usage_source=recovered_usage.source,
+                )
+                print(
+                    "cleared pending rotation: quota window recovered "
+                    f"(5h={fmt_percent(recovered_usage.primary_used_percent)}, "
+                    f"weekly={fmt_percent(recovered_usage.secondary_used_percent)})"
+                )
+                state = load_state(args.state_path)
+                pending_rotation = state.get("pending_rotation")
+            elif recovered_usage is None:
+                append_event(
+                    args.events_path,
+                    "rotation_pending_recovery_check_skipped",
+                    account_id=current_account,
+                    pending_reason=pending_reason,
+                    pending_until=pending_until.isoformat(),
+                    note=recovered_note,
+                )
+        if not (isinstance(pending_rotation, dict) and pending_rotation.get("account_id") == current_account):
+            pending_rotation = None
+    if isinstance(pending_rotation, dict) and pending_rotation.get("account_id") == current_account:
+        pending_reason = str(pending_rotation.get("reason") or "quota_limit")
+        pending_until = parse_dt(str(pending_rotation.get("cooldown_until") or ""))
+        if pending_until is None:
+            pending_until = now_local() + timedelta(hours=5)
         if getattr(args, "dry_run", False):
             print(
                 f"dry run: pending rotation for current account {current_account} "
