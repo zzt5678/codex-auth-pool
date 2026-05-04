@@ -171,6 +171,7 @@ codex-auth-pool events --limit 10
 - 如果检测到正在运行的子 agent / spawned thread，会继续等待子 agent 结束后再切换，不用 10 分钟宽限强制打断
 - 重启 Codex Desktop 前，从 `~/.codex/state_5.sqlite` 和 `~/.codex/logs_2.sqlite` 捕获最近活跃的 Desktop 会话
 - active goal 线程不会被当成 Desktop 会话阻塞切号；它会在切号成功后走独立的 `codex resume <thread_id>` 恢复流程
+- goal 恢复前会先看 rollout 是否仍在产生事件；最近仍有进展就延迟恢复，出现额度/认证错误或长时间无进展才执行 `codex resume`
 - Codex Desktop 重新启动后，后台启动轻量恢复 helper，对每个捕获到的 `threadId` 执行 `thread/resume` 和 `turn/start`
 - 恢复只走原 Desktop 线程路径；不再降级到 `codex exec resume`，因为那可能创建单独 CLI 恢复，而不是继续原 Desktop 会话
 - 会话快照和恢复日志保存在 `~/.codex-auth-pool/session-recovery/`

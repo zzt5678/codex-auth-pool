@@ -121,6 +121,9 @@ RESUME_MODEL_NEGATIVE_CACHE_SECONDS = 24 * 60 * 60
 RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
 ACTIVE_SPAWNED_THREAD_IDLE_SECONDS = 30 * 60
 ACTIVE_GOAL_RESUME_THROTTLE_SECONDS = 10 * 60
+ACTIVE_GOAL_BUSY_GRACE_SECONDS = 3 * 60
+ACTIVE_GOAL_STALE_SECONDS = 5 * 60
+ACTIVE_GOAL_RESUME_RECHECK_SECONDS = 2 * 60
 RESUME_VERIFY_DELAY_SECONDS = 60.0
 DEFAULT_HARD_ACTIVE_GRACE_SECONDS = 10 * 60
 BROWSER_USE_SESSION_MARKERS = (
@@ -2429,6 +2432,142 @@ def read_active_goal_threads(
     return goals
 
 
+def _tail_json_events(path: Path, *, max_bytes: int = 2_000_000, max_events: int = 240) -> list[dict[str, Any]]:
+    if not path.exists() or not path.is_file():
+        return []
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+                handle.readline()
+            data = handle.read()
+    except OSError:
+        return []
+    events: list[dict[str, Any]] = []
+    for raw in data.decode("utf-8", "ignore").splitlines():
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events[-max_events:]
+
+
+def _event_search_text(event: dict[str, Any]) -> str:
+    event_type = str(event.get("type") or "")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    payload_type = str(payload.get("type") or "")
+    parts = [event_type, payload_type]
+    for key in ("message", "output", "error", "last_error", "status", "formatted_output", "aggregated_output", "stderr", "stdout"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    if payload_type == "function_call":
+        for key in ("name", "arguments"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(parts).lower()
+
+
+def _event_has_quota_blocker(event: dict[str, Any]) -> bool:
+    text = _event_search_text(event)
+    markers = (
+        "primary_5h_limit",
+        "weekly_limit",
+        "usage limit",
+        "rate limit",
+        "limit reached",
+        "quota",
+        "exhausted",
+        "token_expired",
+        "authentication token is expired",
+        "access token could not be refreshed",
+        "temporarily unavailable for this runtime request",
+        "http 429",
+        "status 429",
+        "status=429",
+        "http 401",
+        "status 401",
+        "status=401",
+        "http 403",
+        "status 403",
+        "status=403",
+        "503 service unavailable",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _event_is_goal_progress(event: dict[str, Any]) -> bool:
+    event_type = event.get("type")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    payload_type = payload.get("type")
+    if event_type == "response_item" and payload_type in {
+        "function_call",
+        "function_call_output",
+        "message",
+        "reasoning",
+        "custom_tool_call",
+    }:
+        return True
+    if event_type == "event_msg" and payload_type in {
+        "agent_message",
+        "task_complete",
+        "exec_command_start",
+        "exec_command_end",
+        "token_count",
+    }:
+        return True
+    return False
+
+
+def classify_active_goal_runtime(goal: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    now = now or now_local()
+    rollout_path = Path(str(goal.get("rollout_path") or ""))
+    events = _tail_json_events(rollout_path)
+    last_event_at = None
+    last_progress_at = None
+    quota_blocked = False
+    for event in events:
+        event_at = parse_dt(str(event.get("timestamp") or ""))
+        if event_at is not None:
+            last_event_at = event_at if last_event_at is None or event_at > last_event_at else last_event_at
+        if _event_has_quota_blocker(event):
+            quota_blocked = True
+        if _event_is_goal_progress(event) and event_at is not None:
+            last_progress_at = event_at if last_progress_at is None or event_at > last_progress_at else last_progress_at
+    last_at = last_progress_at or last_event_at
+    idle_seconds = None
+    if last_at is not None:
+        idle_seconds = max(0, int((now - last_at).total_seconds()))
+    if quota_blocked:
+        state = "blocked"
+        reason = "quota_or_auth_error_seen"
+    elif idle_seconds is None:
+        state = "stale"
+        reason = "no_rollout_events"
+    elif idle_seconds <= ACTIVE_GOAL_BUSY_GRACE_SECONDS:
+        state = "busy"
+        reason = "recent_rollout_progress"
+    elif idle_seconds >= ACTIVE_GOAL_STALE_SECONDS:
+        state = "stale"
+        reason = "no_recent_rollout_progress"
+    else:
+        state = "waiting"
+        reason = "waiting_for_staleness_confirmation"
+    return {
+        "state": state,
+        "reason": reason,
+        "last_event_at": last_event_at.isoformat() if last_event_at is not None else None,
+        "last_progress_at": last_progress_at.isoformat() if last_progress_at is not None else None,
+        "idle_seconds": idle_seconds,
+        "quota_blocked": quota_blocked,
+        "rollout_path": str(rollout_path) if str(rollout_path) else None,
+    }
+
+
 def _goal_resume_key(goal: dict[str, Any], account_id: str | None) -> str:
     return f"{goal.get('thread_id') or ''}:{account_id or ''}"
 
@@ -2483,6 +2622,36 @@ def _record_goal_resume_started(
             reverse=True,
         )
         state["last_goal_resumes"] = dict(items[:20])
+
+
+def _record_pending_goal_resume(
+    state: dict[str, Any],
+    goal: dict[str, Any],
+    *,
+    account_id: str | None,
+    runtime_state: dict[str, Any],
+) -> None:
+    pending = state.setdefault("pending_goal_resumes", {})
+    if not isinstance(pending, dict):
+        pending = {}
+        state["pending_goal_resumes"] = pending
+    now = now_local()
+    pending[str(goal.get("thread_id") or "")] = {
+        "thread_id": goal.get("thread_id"),
+        "goal_id": goal.get("goal_id"),
+        "title": goal.get("title"),
+        "cwd": goal.get("cwd"),
+        "account_id": account_id,
+        "created_at": now.isoformat(),
+        "next_check_at": (now + timedelta(seconds=ACTIVE_GOAL_RESUME_RECHECK_SECONDS)).isoformat(),
+        "runtime_state": runtime_state,
+    }
+
+
+def _remove_pending_goal_resume(state: dict[str, Any], thread_id: str) -> None:
+    pending = state.get("pending_goal_resumes")
+    if isinstance(pending, dict):
+        pending.pop(thread_id, None)
 
 
 def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path | None) -> dict[str, Any]:
@@ -2573,6 +2742,27 @@ def resume_active_goal_threads_after_switch(
                 append_event(events_path, "active_goal_resume_skipped", **result)
             results.append(result)
             continue
+        runtime_state = classify_active_goal_runtime(goal, now=now)
+        if runtime_state.get("state") in {"busy", "waiting"}:
+            _record_pending_goal_resume(
+                state,
+                goal,
+                account_id=account_id,
+                runtime_state=runtime_state,
+            )
+            result = {
+                "ok": True,
+                "skipped": True,
+                "reason": "goal_still_running",
+                "thread_id": goal.get("thread_id"),
+                "goal_id": goal.get("goal_id"),
+                "title": goal.get("title"),
+                "runtime_state": runtime_state,
+            }
+            if events_path is not None:
+                append_event(events_path, "active_goal_resume_deferred", **result)
+            results.append(result)
+            continue
         result = launch_goal_resume(goal, prompt=prompt, events_path=events_path)
         results.append(result)
         if result.get("ok"):
@@ -2586,6 +2776,76 @@ def resume_active_goal_threads_after_switch(
             )
     if state_path is not None:
         save_state(state_path, state)
+    return results
+
+
+def process_pending_goal_resumes(
+    *,
+    codex_state_db: Path,
+    events_path: Path | None,
+    state_path: Path | None,
+    account_id: str | None,
+    prompt: str = DEFAULT_ACTIVE_GOAL_RESUME_PROMPT,
+) -> list[dict[str, Any]]:
+    if state_path is None:
+        return []
+    state = load_state(state_path)
+    pending = state.get("pending_goal_resumes")
+    if not isinstance(pending, dict) or not pending:
+        return []
+
+    active_goals = {
+        str(goal.get("thread_id") or ""): goal
+        for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=20)
+    }
+    now = now_local()
+    results: list[dict[str, Any]] = []
+    for thread_id, record in list(pending.items()):
+        if not isinstance(record, dict):
+            _remove_pending_goal_resume(state, str(thread_id))
+            continue
+        next_check_at = parse_dt(str(record.get("next_check_at") or ""))
+        if next_check_at is not None and now < next_check_at:
+            continue
+        goal = active_goals.get(str(thread_id))
+        if goal is None:
+            _remove_pending_goal_resume(state, str(thread_id))
+            if events_path is not None:
+                append_event(events_path, "active_goal_resume_pending_cleared", thread_id=thread_id, reason="goal_no_longer_active")
+            continue
+        if _goal_resume_recently_started(state, goal, account_id=account_id, now=now):
+            _remove_pending_goal_resume(state, str(thread_id))
+            continue
+        runtime_state = classify_active_goal_runtime(goal, now=now)
+        if runtime_state.get("state") in {"busy", "waiting"}:
+            record["next_check_at"] = (now + timedelta(seconds=ACTIVE_GOAL_RESUME_RECHECK_SECONDS)).isoformat()
+            record["runtime_state"] = runtime_state
+            if events_path is not None:
+                append_event(
+                    events_path,
+                    "active_goal_resume_pending_waiting",
+                    thread_id=thread_id,
+                    goal_id=goal.get("goal_id"),
+                    runtime_state=runtime_state,
+                )
+            continue
+        result = launch_goal_resume(goal, prompt=prompt, events_path=events_path)
+        results.append(result)
+        if result.get("ok"):
+            _record_goal_resume_started(
+                state,
+                goal,
+                account_id=account_id,
+                started_at=now_local(),
+                pid=result.get("pid") if isinstance(result.get("pid"), int) else None,
+                mode=str(result.get("mode") or ""),
+            )
+            _remove_pending_goal_resume(state, str(thread_id))
+        else:
+            record["next_check_at"] = (now + timedelta(seconds=ACTIVE_GOAL_RESUME_RECHECK_SECONDS)).isoformat()
+            record["runtime_state"] = runtime_state
+            record["last_error"] = result.get("error")
+    save_state(state_path, state)
     return results
 
 
@@ -6222,6 +6482,14 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             quiet=getattr(args, "daemon_quiet", False),
         )
         cmd_refresh_usage(refresh_args)
+
+    if not getattr(args, "no_resume_active_goals", False):
+        process_pending_goal_resumes(
+            codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+            events_path=getattr(args, "events_path", None),
+            state_path=getattr(args, "state_path", None),
+            account_id=current_account,
+        )
 
     state = load_state(args.state_path)
     pending_rotation = state.get("pending_rotation")
