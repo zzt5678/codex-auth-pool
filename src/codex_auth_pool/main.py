@@ -2465,14 +2465,19 @@ def read_active_goal_threads(
     *,
     codex_state_db: Path,
     max_count: int = 5,
+    statuses: tuple[str, ...] = ("active",),
 ) -> list[dict[str, Any]]:
     if not codex_state_db.exists():
         return []
+    safe_statuses = tuple(status for status in statuses if status)
+    if not safe_statuses:
+        safe_statuses = ("active",)
+    placeholders = ", ".join("?" for _ in safe_statuses)
     try:
         with _connect_sqlite_readonly(codex_state_db) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     g.thread_id,
                     g.goal_id,
@@ -2490,12 +2495,12 @@ def read_active_goal_threads(
                 FROM thread_goals g
                 JOIN threads t ON t.id = g.thread_id
                 WHERE
-                    g.status = 'active'
+                    g.status IN ({placeholders})
                     AND t.archived = 0
                 ORDER BY g.updated_at_ms DESC
                 LIMIT ?
                 """,
-                (max_count,),
+                (*safe_statuses, max_count),
             ).fetchall()
     except sqlite3.Error:
         return []
@@ -2670,6 +2675,17 @@ def _runtime_state_requires_goal_resume(runtime_state: dict[str, Any]) -> bool:
 
 def _goal_resume_key(goal: dict[str, Any], account_id: str | None) -> str:
     return f"{goal.get('thread_id') or ''}:{account_id or ''}"
+
+
+def _recent_goal_resume_thread_ids(state: dict[str, Any]) -> set[str]:
+    recent = state.get("last_goal_resumes")
+    if not isinstance(recent, dict):
+        return set()
+    ids: set[str] = set()
+    for record in recent.values():
+        if isinstance(record, dict) and record.get("thread_id"):
+            ids.add(str(record["thread_id"]))
+    return ids
 
 
 def _goal_resume_recently_started(
@@ -2906,13 +2922,18 @@ def resume_active_goal_threads_after_switch(
     prompt: str = DEFAULT_ACTIVE_GOAL_RESUME_PROMPT,
     max_count: int = 5,
 ) -> list[dict[str, Any]]:
-    goals = read_active_goal_threads(codex_state_db=codex_state_db, max_count=max_count)
+    state = load_state(state_path) if state_path is not None else {}
+    recently_resumed_thread_ids = _recent_goal_resume_thread_ids(state)
+    goals = [
+        goal
+        for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=max_count, statuses=("active", "paused"))
+        if goal.get("status") == "active" or str(goal.get("thread_id") or "") in recently_resumed_thread_ids
+    ]
     if not goals:
         if events_path is not None:
             append_event(events_path, "active_goal_resume_skipped", reason="no_active_goals")
         return []
 
-    state = load_state(state_path) if state_path is not None else {}
     now = now_local()
     results: list[dict[str, Any]] = []
     for goal in goals:
@@ -2983,7 +3004,7 @@ def process_pending_goal_resumes(
 
     active_goals = {
         str(goal.get("thread_id") or ""): goal
-        for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=20)
+        for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=20, statuses=("active", "paused"))
     }
     now = now_local()
     results: list[dict[str, Any]] = []
