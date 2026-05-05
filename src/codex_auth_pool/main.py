@@ -1623,7 +1623,7 @@ def _session_event_kind(event: dict[str, Any]) -> str | None:
     event_type = event.get("type")
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
     payload_type = payload.get("type")
-    if event_type == "event_msg" and payload_type == "task_complete":
+    if event_type == "event_msg" and payload_type in {"task_complete", "turn_aborted"}:
         return "task_complete"
     if event_type == "event_msg" and payload_type == "agent_message":
         return "active"
@@ -1968,10 +1968,38 @@ def session_was_in_progress_at(session: InterruptedSession, captured_at: datetim
         if kind == "task_complete":
             return False
         if kind == "active":
-            return True
+            if event_at is not None:
+                return (captured_at - event_at).total_seconds() <= RECENT_SESSION_ACTIVITY_GRACE_SECONDS
+            break
     captured_ts = int(captured_at.timestamp())
     if session.updated_at > 0 and captured_ts - session.updated_at <= RECENT_SESSION_ACTIVITY_GRACE_SECONDS:
         return True
+    return False
+
+
+def session_has_terminal_end_marker_at(session: InterruptedSession, captured_at: datetime) -> bool:
+    rollout_path = Path(session.rollout_path)
+    if not rollout_path.exists() or not rollout_path.is_file():
+        return False
+    try:
+        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return False
+    for raw_line in reversed(lines):
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_at = parse_dt(str(event.get("timestamp") or ""))
+        if event_at is not None and event_at > captured_at:
+            continue
+        kind = _session_event_kind(event)
+        if kind == "task_complete":
+            return True
+        if kind == "active":
+            return False
     return False
 
 
@@ -2047,7 +2075,7 @@ def capture_interrupted_sessions(
     for session in recent_sessions:
         if session.id in seen_session_ids:
             continue
-        if _codex_resume_pids_for_thread(session.id):
+        if _codex_resume_pids_for_thread(session.id) and not session_has_terminal_end_marker_at(session, captured_at):
             sessions.append(session)
             active_resume_process_sessions.append(session)
             seen_session_ids.add(session.id)
