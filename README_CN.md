@@ -183,21 +183,23 @@ codex-auth-pool token-usage --json
 通过 `launchd-install`、`systemd-install`、`setup --install-*` 或 `init --install-*` 安装后台服务时，默认会启用切号后重启。macOS 上自动轮换切号后，工具会做一个保守的恢复流程：
 
 - 软触发时，如果 Desktop 会话仍在执行，会把轮换写入 `pending_rotation`，等会话空闲后自动切换，不会丢掉这次切换信号
-- 硬耗尽时也会先等待活跃任务结束；普通主会话默认最多等 10 分钟，任务提前结束就立即切换，超过宽限期仍未结束则强制切换，避免额度已经为 0 后永久卡死
-- 如果检测到正在运行的子 agent / spawned thread，会继续等待子 agent 结束后再切换，不用 10 分钟宽限强制打断
+- 硬耗尽时也会先等待活跃 Desktop 任务结束；默认没有强制切换倒计时，只有活跃会话空闲后才切换账号
+- 如果检测到正在运行的子 agent / spawned thread，会继续等待子 agent 结束后再切换
 - 重启 Codex Desktop 前，从 `~/.codex/state_5.sqlite` 和 `~/.codex/logs_2.sqlite` 捕获最近活跃的 Desktop 会话
-- active goal 线程不会被当成 Desktop 会话阻塞切号；它会在切号成功后走独立的 `codex resume <thread_id>` 恢复流程
-- goal 恢复前会先看 rollout 是否仍在产生事件；最近仍有进展会延迟恢复，只有出现明确额度/认证错误才执行 `codex resume`，单纯长时间无日志不会误开第二个长任务
+- active goal 线程不会被当成 Desktop 会话阻塞切号；它只会在 goal 自己遇到额度/认证阻塞后，走独立的 `codex resume <thread_id>` 恢复流程
+- goal 恢复前会先看 rollout 是否仍在产生事件；最近仍有进展会延迟恢复，只有在最新进展之后出现明确额度/认证错误才执行 `codex resume`，单纯长时间无日志不会误开第二个长任务
 - goal 自动恢复成功后，只会终止同一个 `thread_id` 的旧 `codex resume` 进程树，避免旧终端任务继续卡在限额错误；不会关闭其他普通终端或 Desktop 会话
 - Codex Desktop 重新启动后，后台启动轻量恢复 helper，对每个捕获到的 `threadId` 执行 `thread/resume` 和 `turn/start`
 - 恢复只走原 Desktop 线程路径；不再降级到 `codex exec resume`，因为那可能创建单独 CLI 恢复，而不是继续原 Desktop 会话
 - 会话快照和恢复日志保存在 `~/.codex-auth-pool/session-recovery/`
 
-后台守护进程独立于当前 Codex 账号运行，所以即便当前账号额度已经归零、Codex App 不能继续回答，守护进程仍然可以读取 pending 状态、替换 auth，并重启 Codex。硬耗尽宽限期可调整：
+后台守护进程独立于当前 Codex 账号运行，所以即便当前账号额度已经归零、Codex App 不能继续回答，守护进程仍然可以读取 pending 状态，并在活跃 Desktop 任务空闲后替换 auth、重启 Codex。默认没有强制切换倒计时：
 
 ```bash
-codex-auth-pool launchd-install --hard-active-grace-seconds 600
+codex-auth-pool launchd-install --hard-active-grace-seconds 0
 ```
+
+如果你明确需要强制切换倒计时，把 `0` 换成对应秒数。
 
 如果你只想自动重启，不想自动对会话发送 `继续`：
 

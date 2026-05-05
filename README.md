@@ -183,21 +183,23 @@ The command reports input tokens, cached input tokens, uncached input tokens, ou
 Background services installed with `launchd-install`, `systemd-install`, `setup --install-*`, or `init --install-*` now enable `--restart-after-switch` by default. On macOS, that means `codex-auth-pool` does a conservative recovery pass whenever automatic rotation switches accounts:
 
 - soft quota triggers write a durable `pending_rotation` record while a Desktop session still appears active, then switch automatically once the session becomes idle
-- hard exhaustion also waits for active work to finish; for normal top-level sessions it waits up to 10 minutes by default, switches immediately if the session becomes idle sooner, and then forces rotation after the grace window so a zero-quota account cannot deadlock the app forever
-- if a running child agent / spawned thread is detected, rotation keeps waiting for that child agent to finish instead of using the 10-minute force-switch grace window
+- hard exhaustion also waits for active Desktop work to finish; by default there is no force-switch countdown for active Desktop sessions, so account switching happens after the active session becomes idle
+- if a running child agent / spawned thread is detected, rotation keeps waiting for that child agent to finish before switching
 - before quitting Codex Desktop, it captures recently active Desktop sessions from `~/.codex/state_5.sqlite` and `~/.codex/logs_2.sqlite`
-- active goal threads do not block Desktop-session rotation; after a successful auth switch they use the separate `codex resume <thread_id>` recovery path
-- goal recovery checks rollout progress first; recent progress defers recovery, and only explicit quota/auth errors trigger `codex resume`; stale rollout silence alone will not start a duplicate long-running goal
+- active goal threads do not block Desktop-session rotation; they use the separate `codex resume <thread_id>` recovery path only after the goal itself hits a quota/auth blocker
+- goal recovery checks rollout progress first; recent progress defers recovery, and only explicit quota/auth errors that occur after the latest progress trigger `codex resume`; stale rollout silence alone will not start a duplicate long-running goal
 - after a goal resume starts successfully, it terminates only older `codex resume` process trees for the same `thread_id`, so the old quota-blocked terminal task stops without touching unrelated terminals or Desktop sessions
 - after Codex Desktop comes back up, it starts a lightweight recovery helper that calls `thread/resume` and `turn/start` for each captured `threadId`
 - recovery uses the original Desktop thread path only; it no longer falls back to `codex exec resume`, because that can create a separate CLI resume instead of continuing the original Desktop session
 - recovery snapshots and resume logs are written under `~/.codex-auth-pool/session-recovery/`
 
-The daemon runs independently from the currently selected Codex account. Even if the active account has reached zero quota and Codex Desktop can no longer answer, the daemon can still observe the pending rotation, replace the auth file, and restart Codex. Adjust the hard-exhaustion grace window with:
+The daemon runs independently from the currently selected Codex account. Even if the active account has reached zero quota and Codex Desktop can no longer answer, the daemon can still observe the pending rotation, replace the auth file, and restart Codex after active Desktop work is idle. The default is no force-switch countdown:
 
 ```bash
-codex-auth-pool launchd-install --hard-active-grace-seconds 600
+codex-auth-pool launchd-install --hard-active-grace-seconds 0
 ```
+
+If you explicitly want a force-switch countdown, replace `0` with the number of seconds.
 
 If you only want the restart without auto-resuming interrupted sessions:
 

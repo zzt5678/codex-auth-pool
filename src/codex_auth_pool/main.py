@@ -149,7 +149,7 @@ ACTIVE_GOAL_BUSY_GRACE_SECONDS = 3 * 60
 ACTIVE_GOAL_STALE_SECONDS = 5 * 60
 ACTIVE_GOAL_RESUME_RECHECK_SECONDS = 2 * 60
 RESUME_VERIFY_DELAY_SECONDS = 60.0
-DEFAULT_HARD_ACTIVE_GRACE_SECONDS = 10 * 60
+DEFAULT_HARD_ACTIVE_GRACE_SECONDS = 0
 BROWSER_USE_SESSION_MARKERS = (
     "in app browser",
     "browser-use",
@@ -2514,6 +2514,66 @@ def read_active_goal_threads(
     return goals
 
 
+def read_goal_threads_by_ids(*, codex_state_db: Path, thread_ids: set[str]) -> dict[str, dict[str, Any]]:
+    if not codex_state_db.exists() or not thread_ids:
+        return {}
+    safe_ids = tuple(thread_id for thread_id in thread_ids if thread_id)
+    if not safe_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in safe_ids)
+    try:
+        with _connect_sqlite_readonly(codex_state_db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT
+                    g.thread_id,
+                    g.goal_id,
+                    g.objective,
+                    g.status,
+                    g.token_budget,
+                    g.tokens_used AS goal_tokens_used,
+                    g.updated_at_ms AS goal_updated_at_ms,
+                    t.title,
+                    t.cwd,
+                    t.source,
+                    t.model,
+                    t.updated_at,
+                    t.rollout_path
+                FROM thread_goals g
+                JOIN threads t ON t.id = g.thread_id
+                WHERE
+                    g.thread_id IN ({placeholders})
+                    AND t.archived = 0
+                """,
+                safe_ids,
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    goals: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        thread_id = str(row["thread_id"] or "")
+        if not thread_id:
+            continue
+        goals[thread_id] = {
+            "thread_id": thread_id,
+            "goal_id": str(row["goal_id"] or ""),
+            "objective": str(row["objective"] or ""),
+            "status": str(row["status"] or ""),
+            "token_budget": row["token_budget"],
+            "goal_tokens_used": int(row["goal_tokens_used"] or 0),
+            "goal_updated_at_ms": int(row["goal_updated_at_ms"] or 0),
+            "title": str(row["title"] or ""),
+            "cwd": str(row["cwd"] or ""),
+            "source": str(row["source"] or ""),
+            "model": str(row["model"] or "") or None,
+            "updated_at": int(row["updated_at"] or 0),
+            "rollout_path": str(row["rollout_path"] or ""),
+        }
+    return goals
+
+
 def _tail_json_events(path: Path, *, max_bytes: int = 2_000_000, max_events: int = 240) -> list[dict[str, Any]]:
     if not path.exists() or not path.is_file():
         return []
@@ -2611,15 +2671,22 @@ def classify_active_goal_runtime(goal: dict[str, Any], *, now: datetime | None =
     events = _tail_json_events(rollout_path)
     last_event_at = None
     last_progress_at = None
-    quota_blocked = False
+    last_quota_blocker_at = None
     for event in events:
         event_at = parse_dt(str(event.get("timestamp") or ""))
         if event_at is not None:
             last_event_at = event_at if last_event_at is None or event_at > last_event_at else last_event_at
-        if _event_has_quota_blocker(event):
-            quota_blocked = True
+        if _event_has_quota_blocker(event) and event_at is not None:
+            last_quota_blocker_at = (
+                event_at
+                if last_quota_blocker_at is None or event_at > last_quota_blocker_at
+                else last_quota_blocker_at
+            )
         if _event_is_goal_progress(event) and event_at is not None:
             last_progress_at = event_at if last_progress_at is None or event_at > last_progress_at else last_progress_at
+    quota_blocked = last_quota_blocker_at is not None and (
+        last_progress_at is None or last_quota_blocker_at >= last_progress_at
+    )
     last_at = last_progress_at or last_event_at
     idle_seconds = None
     if last_at is not None:
@@ -2644,6 +2711,7 @@ def classify_active_goal_runtime(goal: dict[str, Any], *, now: datetime | None =
         "reason": reason,
         "last_event_at": last_event_at.isoformat() if last_event_at is not None else None,
         "last_progress_at": last_progress_at.isoformat() if last_progress_at is not None else None,
+        "last_quota_blocker_at": last_quota_blocker_at.isoformat() if last_quota_blocker_at is not None else None,
         "idle_seconds": idle_seconds,
         "quota_blocked": quota_blocked,
         "rollout_path": str(rollout_path) if str(rollout_path) else None,
@@ -2713,6 +2781,7 @@ def _record_goal_resume_started(
         "goal_id": goal.get("goal_id"),
         "title": goal.get("title"),
         "cwd": goal.get("cwd"),
+        "rollout_path": goal.get("rollout_path"),
         "account_id": account_id,
         "pid": pid,
         "mode": mode,
@@ -2792,6 +2861,73 @@ def _codex_resume_pids_for_thread(thread_id: str) -> set[int]:
         if thread_id in command and "codex" in command and "resume" in command:
             pids.add(int(row["pid"]))
     return pids
+
+
+def _running_codex_resume_thread_ids() -> set[str]:
+    ids: set[str] = set()
+    pattern = re.compile(r"\bcodex(?:\s+\S+)?\s+resume\s+([0-9a-fA-F-]{20,})")
+    for row in _process_table():
+        command = str(row.get("command") or "")
+        if "codex" not in command or " resume " not in command:
+            continue
+        match = pattern.search(command)
+        if match:
+            ids.add(match.group(1))
+    return ids
+
+
+def _recent_goal_resume_thread_records(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    recent = state.get("last_goal_resumes")
+    if not isinstance(recent, dict):
+        return {}
+    records: dict[str, dict[str, Any]] = {}
+    for record in recent.values():
+        if not isinstance(record, dict):
+            continue
+        thread_id = str(record.get("thread_id") or "")
+        if thread_id and thread_id not in records:
+            records[thread_id] = record
+    return records
+
+
+def _fallback_goal_from_record(thread_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "thread_id": thread_id,
+        "goal_id": str(record.get("goal_id") or ""),
+        "objective": "",
+        "status": "active",
+        "token_budget": None,
+        "goal_tokens_used": 0,
+        "goal_updated_at_ms": 0,
+        "title": str(record.get("title") or ""),
+        "cwd": str(record.get("cwd") or ""),
+        "source": "",
+        "model": None,
+        "updated_at": 0,
+        "rollout_path": str(record.get("rollout_path") or ""),
+    }
+
+
+def discover_goal_threads_for_resume(
+    *,
+    codex_state_db: Path,
+    state: dict[str, Any],
+    max_count: int,
+) -> list[dict[str, Any]]:
+    goals: dict[str, dict[str, Any]] = {}
+    for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=max_count, statuses=("active", "paused")):
+        thread_id = str(goal.get("thread_id") or "")
+        if thread_id:
+            goals[thread_id] = goal
+
+    recent_records = _recent_goal_resume_thread_records(state)
+    candidate_ids = set(recent_records) | _running_codex_resume_thread_ids()
+    for thread_id, goal in read_goal_threads_by_ids(codex_state_db=codex_state_db, thread_ids=candidate_ids).items():
+        goals.setdefault(thread_id, goal)
+    for thread_id, record in recent_records.items():
+        goals.setdefault(thread_id, _fallback_goal_from_record(thread_id, record))
+
+    return list(goals.values())[:max_count]
 
 
 def _process_tree_pids(root_pids: set[int]) -> list[int]:
@@ -2910,15 +3046,16 @@ def resume_active_goal_threads_after_switch(
     max_count: int = 5,
 ) -> list[dict[str, Any]]:
     state = load_state(state_path) if state_path is not None else {}
-    recently_resumed_thread_ids = _recent_goal_resume_thread_ids(state)
-    goals = [
-        goal
-        for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=max_count, statuses=("active", "paused"))
-        if goal.get("status") == "active" or str(goal.get("thread_id") or "") in recently_resumed_thread_ids
-    ]
+    goals = discover_goal_threads_for_resume(codex_state_db=codex_state_db, state=state, max_count=max_count)
     if not goals:
         if events_path is not None:
-            append_event(events_path, "active_goal_resume_skipped", reason="no_active_goals")
+            append_event(
+                events_path,
+                "active_goal_resume_skipped",
+                reason="no_active_goals",
+                running_resume_threads=sorted(_running_codex_resume_thread_ids()),
+                recent_resume_threads=sorted(_recent_goal_resume_thread_ids(state)),
+            )
         return []
 
     now = now_local()
@@ -2959,6 +3096,7 @@ def resume_active_goal_threads_after_switch(
             results.append(result)
             continue
         result = launch_goal_resume(goal, prompt=prompt, events_path=events_path)
+        result["runtime_state_before_resume"] = runtime_state
         results.append(result)
         if result.get("ok"):
             _record_goal_resume_started(
@@ -7494,78 +7632,63 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             goal_session_ids = pending_rotation_goal_session_ids(active_snapshot)
             blocker_ids = pending_rotation_blocker_ids(active_snapshot)
             hard_active_grace_seconds = max(0, int(getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS)))
-            if hard_rotation and hard_active_grace_seconds <= 0 and not spawned_session_ids and not goal_session_ids:
-                append_event(
-                    args.events_path,
-                    "rotation_forced_hard_exhaustion",
-                    account_id=current_account,
-                    reason=triggered_reason,
-                    trigger_source=trigger_source,
-                    primary_used_percent=trigger_primary_used,
-                    secondary_used_percent=trigger_secondary_used,
-                    active_session_count=len(session_ids),
-                    active_spawned_session_count=len(spawned_session_ids),
-                    active_goal_session_count=len(goal_session_ids),
-                    blocker_count=len(blocker_ids),
+            pending_record = pending_rotation_record(
+                account_id=current_account,
+                reason=triggered_reason,
+                cooldown_until=triggered_until,
+                trigger_source=trigger_source,
+                hard=hard_rotation,
+                active_snapshot=active_snapshot,
+                hard_active_grace_seconds=hard_active_grace_seconds,
+                primary_used_percent=trigger_primary_used,
+                secondary_used_percent=trigger_secondary_used,
+            )
+            set_pending_rotation(args.state_path, pending_record, args.events_path)
+            event_type = "rotation_deferred_hard_active_sessions" if hard_rotation else "rotation_deferred_active_sessions"
+            append_event(
+                args.events_path,
+                event_type,
+                account_id=current_account,
+                reason=triggered_reason,
+                trigger_source=trigger_source,
+                cooldown_until=triggered_until.isoformat(),
+                hard_grace_until=pending_record.get("hard_grace_until"),
+                snapshot_path=active_snapshot.get("path"),
+                session_count=len(session_ids),
+                active_spawned_session_count=len(spawned_session_ids),
+                active_goal_session_count=len(goal_session_ids),
+                blocker_count=len(blocker_ids),
+                session_ids=session_ids,
+                active_spawned_session_ids=spawned_session_ids,
+                active_goal_session_ids=goal_session_ids,
+                blocker_ids=blocker_ids,
+            )
+            if hard_rotation and spawned_session_ids:
+                print(
+                    "rotation deferred: account is exhausted but child agent session(s) are still running; "
+                    "will switch after they finish"
+                )
+            elif hard_rotation and goal_session_ids:
+                print(
+                    "rotation deferred: account is exhausted but active goal session(s) are still running; "
+                    "will switch after quota/auth blocker"
+                )
+            elif goal_session_ids:
+                print(
+                    "rotation deferred: active goal session(s) are still running; "
+                    "will switch after quota/auth blocker"
+                )
+            elif hard_rotation:
+                print(
+                    "rotation deferred: account is exhausted but active Codex Desktop session(s) are still running; "
+                    "will switch after they become idle"
                 )
             else:
-                pending_record = pending_rotation_record(
-                    account_id=current_account,
-                    reason=triggered_reason,
-                    cooldown_until=triggered_until,
-                    trigger_source=trigger_source,
-                    hard=hard_rotation,
-                    active_snapshot=active_snapshot,
-                    hard_active_grace_seconds=hard_active_grace_seconds,
-                    primary_used_percent=trigger_primary_used,
-                    secondary_used_percent=trigger_secondary_used,
+                print(
+                    "rotation deferred: active Codex Desktop session(s) are still running; "
+                    "will switch after they become idle"
                 )
-                set_pending_rotation(args.state_path, pending_record, args.events_path)
-                event_type = "rotation_deferred_hard_active_sessions" if hard_rotation else "rotation_deferred_active_sessions"
-                append_event(
-                    args.events_path,
-                    event_type,
-                    account_id=current_account,
-                    reason=triggered_reason,
-                    trigger_source=trigger_source,
-                    cooldown_until=triggered_until.isoformat(),
-                    hard_grace_until=pending_record.get("hard_grace_until"),
-                    snapshot_path=active_snapshot.get("path"),
-                    session_count=len(session_ids),
-                    active_spawned_session_count=len(spawned_session_ids),
-                    active_goal_session_count=len(goal_session_ids),
-                    blocker_count=len(blocker_ids),
-                    session_ids=session_ids,
-                    active_spawned_session_ids=spawned_session_ids,
-                    active_goal_session_ids=goal_session_ids,
-                    blocker_ids=blocker_ids,
-                )
-                if hard_rotation and spawned_session_ids:
-                    print(
-                        "rotation deferred: account is exhausted but child agent session(s) are still running; "
-                        "will switch after they finish"
-                    )
-                elif hard_rotation and goal_session_ids:
-                    print(
-                        "rotation deferred: account is exhausted but active goal session(s) are still running; "
-                        "will switch after quota/auth blocker"
-                    )
-                elif goal_session_ids:
-                    print(
-                        "rotation deferred: active goal session(s) are still running; "
-                        "will switch after quota/auth blocker"
-                    )
-                elif hard_rotation:
-                    print(
-                        "rotation deferred briefly: account is exhausted but active session(s) are still running; "
-                        f"will switch after idle or after {hard_active_grace_seconds}s"
-                    )
-                else:
-                    print(
-                        "rotation deferred: active Codex Desktop session(s) are still running; "
-                        "will switch after they become idle"
-                    )
-                return 0
+            return 0
         if hard_rotation:
             append_event(
                 args.events_path,
