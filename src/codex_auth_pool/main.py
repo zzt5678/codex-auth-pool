@@ -82,6 +82,7 @@ ENV_VAR_MAP = {
     "codex_state_db": "CODEX_AUTH_POOL_CODEX_STATE_DB",
     "codex_logs_db": "CODEX_AUTH_POOL_CODEX_LOGS_DB",
     "app_path": "CODEX_AUTH_POOL_APP_PATH",
+    "active_goal_resume_prompt_file": "CODEX_AUTH_POOL_ACTIVE_GOAL_RESUME_PROMPT_FILE",
 }
 DEFAULT_ARG_VALUES = {
     "source_dir": DEFAULT_CLIPROXY_DIR,
@@ -96,6 +97,7 @@ DEFAULT_ARG_VALUES = {
     "codex_state_db": DEFAULT_CODEX_STATE_DB,
     "codex_logs_db": DEFAULT_CODEX_LOGS_DB,
     "app_path": str(DEFAULT_CODEX_APP),
+    "active_goal_resume_prompt_file": None,
 }
 API_SESSION_COMPAT_PROVIDERS = ("cliproxyapi", "codex-multi-auth-runtime-proxy")
 OPENAI_API_PRICE_SOURCE = "https://openai.com/api/pricing/"
@@ -389,6 +391,7 @@ def _coerce_arg_value(key: str, value: Any) -> Any:
         "sessions_dir",
         "codex_state_db",
         "codex_logs_db",
+        "active_goal_resume_prompt_file",
     }
     if key in path_keys:
         return Path(str(value)).expanduser()
@@ -418,6 +421,20 @@ def apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         elif config_value is not None:
             setattr(args, key, _coerce_arg_value(key, config_value))
     return args
+
+
+def active_goal_resume_prompt_from_args(args: argparse.Namespace) -> str:
+    prompt_file = getattr(args, "active_goal_resume_prompt_file", None)
+    if not prompt_file:
+        return DEFAULT_ACTIVE_GOAL_RESUME_PROMPT
+    path = Path(prompt_file).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise SystemExit(f"active goal resume prompt file not readable: {path}: {exc}") from exc
+    if not text:
+        raise SystemExit(f"active goal resume prompt file is empty: {path}")
+    return text
 
 
 def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -3361,6 +3378,7 @@ def write_launchd_plist(
     usage_max_age_minutes: int,
     resume_interrupted_sessions: bool,
     resume_active_goals: bool,
+    active_goal_resume_prompt_file: Path | None,
     hard_active_grace_seconds: int,
 ) -> Path:
     plist_path = launchd_plist_path(label)
@@ -3384,6 +3402,11 @@ def write_launchd_plist(
             str(managed_dir),
             "--app-path",
             str(app_path),
+            *(
+                ["--active-goal-resume-prompt-file", str(active_goal_resume_prompt_file)]
+                if active_goal_resume_prompt_file
+                else []
+            ),
             "daemon",
             "--interval-seconds",
             str(interval_seconds),
@@ -3539,6 +3562,7 @@ def write_systemd_service(
     usage_max_age_minutes: int,
     resume_interrupted_sessions: bool,
     resume_active_goals: bool,
+    active_goal_resume_prompt_file: Path | None,
     stdout_path: Path,
     stderr_path: Path,
     hard_active_grace_seconds: int,
@@ -3565,6 +3589,11 @@ def write_systemd_service(
         str(managed_dir),
         "--app-path",
         str(app_path),
+        *(
+            ["--active-goal-resume-prompt-file", str(active_goal_resume_prompt_file)]
+            if active_goal_resume_prompt_file
+            else []
+        ),
         "daemon",
         "--interval-seconds",
         str(interval_seconds),
@@ -5515,6 +5544,7 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
             events_path=getattr(args, "events_path", None),
             state_path=getattr(args, "state_path", None),
             account_id=normalized.get("account_id"),
+            prompt=active_goal_resume_prompt_from_args(args),
         )
         launched = [result for result in goal_resume_results if result.get("ok") and not result.get("skipped")]
         skipped = [result for result in goal_resume_results if result.get("skipped")]
@@ -7187,6 +7217,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             events_path=getattr(args, "events_path", None),
             state_path=getattr(args, "state_path", None),
             account_id=current_account,
+            prompt=active_goal_resume_prompt_from_args(args),
         )
 
     state = load_state(args.state_path)
@@ -7535,6 +7566,7 @@ def cmd_launchd_install(args: argparse.Namespace) -> int:
         usage_max_age_minutes=args.usage_max_age_minutes,
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
         resume_active_goals=not getattr(args, "no_resume_active_goals", False),
+        active_goal_resume_prompt_file=getattr(args, "active_goal_resume_prompt_file", None),
         hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
     )
     launchctl_bootout(args.label)
@@ -7638,6 +7670,7 @@ def cmd_systemd_install(args: argparse.Namespace) -> int:
         usage_max_age_minutes=args.usage_max_age_minutes,
         resume_interrupted_sessions=not getattr(args, "no_resume_interrupted_sessions", False),
         resume_active_goals=not getattr(args, "no_resume_active_goals", False),
+        active_goal_resume_prompt_file=getattr(args, "active_goal_resume_prompt_file", None),
         stdout_path=args.stdout_path,
         stderr_path=args.stderr_path,
         hard_active_grace_seconds=getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS),
@@ -7805,6 +7838,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--app-path",
         default=str(DEFAULT_CODEX_APP),
         help=f"Codex app path (default: {DEFAULT_CODEX_APP})",
+    )
+    parser.add_argument(
+        "--active-goal-resume-prompt-file",
+        type=Path,
+        default=None,
+        help="file used as the prompt when auto-resuming active goal CLI sessions after account switches",
     )
     parser.add_argument(
         "--no-notify",
@@ -8368,6 +8407,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not auto-run `codex resume` for active goal threads after auth switches",
     )
     tick_parser.add_argument(
+        "--active-goal-resume-prompt-file",
+        type=Path,
+        default=None,
+        help="file used as the prompt when auto-resuming active goal CLI sessions after account switches",
+    )
+    tick_parser.add_argument(
         "--no-defer-switch-while-active",
         action="store_false",
         dest="defer_switch_while_active",
@@ -8454,6 +8499,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume-active-goals",
         action="store_true",
         help="do not auto-run `codex resume` for active goal threads after auth switches",
+    )
+    daemon_parser.add_argument(
+        "--active-goal-resume-prompt-file",
+        type=Path,
+        default=None,
+        help="file used as the prompt when auto-resuming active goal CLI sessions after account switches",
     )
     daemon_parser.add_argument(
         "--no-defer-switch-while-active",
@@ -8565,6 +8616,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not auto-run `codex resume` for active goal threads after auth switches",
     )
     launchd_install_parser.add_argument(
+        "--active-goal-resume-prompt-file",
+        type=Path,
+        default=None,
+        help="file used as the prompt when auto-resuming active goal CLI sessions after account switches",
+    )
+    launchd_install_parser.add_argument(
         "--hard-active-grace-seconds",
         type=int,
         default=DEFAULT_HARD_ACTIVE_GRACE_SECONDS,
@@ -8643,6 +8700,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume-active-goals",
         action="store_true",
         help="do not auto-run `codex resume` for active goal threads after auth switches",
+    )
+    systemd_install_parser.add_argument(
+        "--active-goal-resume-prompt-file",
+        type=Path,
+        default=None,
+        help="file used as the prompt when auto-resuming active goal CLI sessions after account switches",
     )
     systemd_install_parser.add_argument(
         "--hard-active-grace-seconds",
