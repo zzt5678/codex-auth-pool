@@ -125,8 +125,9 @@ REQUIRED_SOURCE_KEYS = (
     "id_token",
     "account_id",
 )
-DEFAULT_PRIMARY_THRESHOLD = 90.0
-DEFAULT_SECONDARY_THRESHOLD = 97.0
+DEFAULT_PRIMARY_THRESHOLD = 101.0
+DEFAULT_SECONDARY_THRESHOLD = 101.0
+EXHAUSTED_USAGE_PERCENT = 99.5
 DEFAULT_USAGE_MAX_AGE_MINUTES = 30
 DEFAULT_USAGE_ERROR_BACKOFF_MINUTES = 30
 MIN_AUTO_RESTART_INTERVAL_SECONDS = 120
@@ -2041,6 +2042,15 @@ def capture_interrupted_sessions(
         for session in recent_sessions
         if session_was_in_progress_at(session, captured_at)
     ]
+    active_resume_process_sessions: list[InterruptedSession] = []
+    seen_session_ids = {session.id for session in sessions}
+    for session in recent_sessions:
+        if session.id in seen_session_ids:
+            continue
+        if _codex_resume_pids_for_thread(session.id):
+            sessions.append(session)
+            active_resume_process_sessions.append(session)
+            seen_session_ids.add(session.id)
     open_spawned_sessions = read_open_spawned_sessions(
         codex_state_db=codex_state_db,
         max_age_seconds=max_age_seconds,
@@ -2059,6 +2069,8 @@ def capture_interrupted_sessions(
         "max_count": max_count,
         "recent_candidates": len(recent_sessions),
         "filtered_terminal_sessions": max(0, len(recent_sessions) - len(sessions)),
+        "active_resume_process_session_count": len(active_resume_process_sessions),
+        "active_resume_process_session_ids": [session.id for session in active_resume_process_sessions],
         "sessions": [interrupted_session_record(session, captured_at) for session in sessions],
         "open_spawned_candidates": len(open_spawned_sessions),
         "filtered_inactive_spawned_sessions": max(0, len(open_spawned_sessions) - len(active_spawned_sessions)),
@@ -2079,9 +2091,11 @@ def capture_interrupted_sessions(
             active_spawned_session_count=len(active_spawned_sessions),
             recent_candidates=len(recent_sessions),
             filtered_terminal_sessions=max(0, len(recent_sessions) - len(sessions)),
+            active_resume_process_session_count=len(active_resume_process_sessions),
             open_spawned_candidates=len(open_spawned_sessions),
             filtered_inactive_spawned_sessions=max(0, len(open_spawned_sessions) - len(active_spawned_sessions)),
             session_ids=[session.id for session in sessions],
+            active_resume_process_session_ids=[session.id for session in active_resume_process_sessions],
             active_spawned_session_ids=[session.id for session, _meta in active_spawned_sessions],
         )
     return snapshot
@@ -3016,6 +3030,37 @@ def active_desktop_sessions_before_switch(args: argparse.Namespace) -> dict[str,
     spawned_sessions = snapshot.get("active_spawned_sessions")
     if isinstance(spawned_sessions, list) and spawned_sessions:
         return snapshot
+    goal_sessions: list[dict[str, Any]] = []
+    for goal in read_active_goal_threads(
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        max_count=20,
+    ):
+        runtime_state = classify_active_goal_runtime(goal)
+        # Only a confirmed quota/auth-blocked goal is safe to resume after
+        # switching. Busy/waiting/stale goals may still be running local,
+        # remote, or sub-agent work, so they must block app restarts.
+        if _runtime_state_requires_goal_resume(runtime_state):
+            continue
+        goal_sessions.append(
+            {
+                "thread_id": goal.get("thread_id"),
+                "goal_id": goal.get("goal_id"),
+                "title": goal.get("title"),
+                "cwd": goal.get("cwd"),
+                "runtime_state": runtime_state,
+            }
+        )
+    if goal_sessions:
+        snapshot["active_goal_sessions"] = goal_sessions
+        if getattr(args, "events_path", None) is not None:
+            append_event(
+                args.events_path,
+                "active_goal_sessions_block_rotation",
+                session_count=len(goal_sessions),
+                thread_ids=[str(goal.get("thread_id") or "") for goal in goal_sessions],
+                runtime_states=[goal.get("runtime_state") for goal in goal_sessions],
+            )
+        return snapshot
     return None
 
 
@@ -3170,20 +3215,16 @@ def determine_rotation_trigger(
     if usage is not None and (usage.limit_reached is True or usage.allowed is False):
         if (
             secondary_used_percent is not None
-            and secondary_used_percent >= secondary_threshold
+            and secondary_used_percent >= EXHAUSTED_USAGE_PERCENT
             and secondary_reset_at is not None
         ):
             return "weekly_limit", secondary_reset_at
         if (
-            primary_used_percent is not None
-            and primary_used_percent >= primary_threshold
-            and primary_reset_at is not None
+            primary_reset_at is not None
         ):
             return "primary_5h_limit", primary_reset_at
         if secondary_reset_at is not None:
             return "weekly_limit", secondary_reset_at
-        if primary_reset_at is not None:
-            return "primary_5h_limit", primary_reset_at
 
     if (
         secondary_used_percent is not None
@@ -6981,10 +7022,27 @@ def pending_rotation_spawned_session_ids(active_snapshot: dict[str, Any] | None)
     ]
 
 
+def pending_rotation_goal_session_ids(active_snapshot: dict[str, Any] | None) -> list[str]:
+    if active_snapshot is None:
+        return []
+    goals = active_snapshot.get("active_goal_sessions")
+    if not isinstance(goals, list):
+        return []
+    return [
+        str(goal.get("thread_id") or "")
+        for goal in goals
+        if isinstance(goal, dict) and goal.get("thread_id")
+    ]
+
+
 def pending_rotation_blocker_ids(active_snapshot: dict[str, Any] | None) -> list[str]:
     ids: list[str] = []
     seen: set[str] = set()
-    for item in pending_rotation_session_ids(active_snapshot) + pending_rotation_spawned_session_ids(active_snapshot):
+    for item in (
+        pending_rotation_session_ids(active_snapshot)
+        + pending_rotation_spawned_session_ids(active_snapshot)
+        + pending_rotation_goal_session_ids(active_snapshot)
+    ):
         if item and item not in seen:
             seen.add(item)
             ids.append(item)
@@ -6993,6 +7051,10 @@ def pending_rotation_blocker_ids(active_snapshot: dict[str, Any] | None) -> list
 
 def active_snapshot_has_spawned_sessions(active_snapshot: dict[str, Any] | None) -> bool:
     return bool(pending_rotation_spawned_session_ids(active_snapshot))
+
+
+def active_snapshot_has_goal_sessions(active_snapshot: dict[str, Any] | None) -> bool:
+    return bool(pending_rotation_goal_session_ids(active_snapshot))
 
 
 def pending_rotation_record(
@@ -7022,6 +7084,7 @@ def pending_rotation_record(
         "snapshot_path": active_snapshot.get("path") if active_snapshot else None,
         "session_ids": pending_rotation_session_ids(active_snapshot),
         "active_spawned_session_ids": pending_rotation_spawned_session_ids(active_snapshot),
+        "active_goal_session_ids": pending_rotation_goal_session_ids(active_snapshot),
         "blocker_ids": pending_rotation_blocker_ids(active_snapshot),
         "primary_used_percent": primary_used_percent,
         "secondary_used_percent": secondary_used_percent,
@@ -7295,13 +7358,16 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         pending_hard = bool(pending_rotation.get("hard"))
         grace_until = parse_dt(str(pending_rotation.get("hard_grace_until") or ""))
         has_spawned_sessions = active_snapshot_has_spawned_sessions(active_snapshot)
+        has_goal_sessions = active_snapshot_has_goal_sessions(active_snapshot)
         if active_snapshot is not None and (
             has_spawned_sessions
+            or has_goal_sessions
             or not pending_hard
             or (grace_until is not None and now_local() < grace_until)
         ):
             session_ids = pending_rotation_session_ids(active_snapshot)
             spawned_session_ids = pending_rotation_spawned_session_ids(active_snapshot)
+            goal_session_ids = pending_rotation_goal_session_ids(active_snapshot)
             blocker_ids = pending_rotation_blocker_ids(active_snapshot)
             append_event(
                 args.events_path,
@@ -7314,13 +7380,17 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 snapshot_path=active_snapshot.get("path"),
                 session_count=len(session_ids),
                 active_spawned_session_count=len(spawned_session_ids),
+                active_goal_session_count=len(goal_session_ids),
                 blocker_count=len(blocker_ids),
                 session_ids=session_ids,
                 active_spawned_session_ids=spawned_session_ids,
+                active_goal_session_ids=goal_session_ids,
                 blocker_ids=blocker_ids,
             )
             if spawned_session_ids:
                 print("rotation pending: child agent session(s) are still running; will switch after they finish")
+            elif goal_session_ids:
+                print("rotation pending: active goal session(s) are still running; will switch after quota/auth blocker")
             else:
                 print("rotation pending: active Codex Desktop session(s) are still running; will switch after they become idle")
             return 0
@@ -7415,9 +7485,10 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         if active_snapshot is not None:
             session_ids = pending_rotation_session_ids(active_snapshot)
             spawned_session_ids = pending_rotation_spawned_session_ids(active_snapshot)
+            goal_session_ids = pending_rotation_goal_session_ids(active_snapshot)
             blocker_ids = pending_rotation_blocker_ids(active_snapshot)
             hard_active_grace_seconds = max(0, int(getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS)))
-            if hard_rotation and hard_active_grace_seconds <= 0 and not spawned_session_ids:
+            if hard_rotation and hard_active_grace_seconds <= 0 and not spawned_session_ids and not goal_session_ids:
                 append_event(
                     args.events_path,
                     "rotation_forced_hard_exhaustion",
@@ -7428,6 +7499,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                     secondary_used_percent=trigger_secondary_used,
                     active_session_count=len(session_ids),
                     active_spawned_session_count=len(spawned_session_ids),
+                    active_goal_session_count=len(goal_session_ids),
                     blocker_count=len(blocker_ids),
                 )
             else:
@@ -7455,15 +7527,27 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                     snapshot_path=active_snapshot.get("path"),
                     session_count=len(session_ids),
                     active_spawned_session_count=len(spawned_session_ids),
+                    active_goal_session_count=len(goal_session_ids),
                     blocker_count=len(blocker_ids),
                     session_ids=session_ids,
                     active_spawned_session_ids=spawned_session_ids,
+                    active_goal_session_ids=goal_session_ids,
                     blocker_ids=blocker_ids,
                 )
                 if hard_rotation and spawned_session_ids:
                     print(
                         "rotation deferred: account is exhausted but child agent session(s) are still running; "
                         "will switch after they finish"
+                    )
+                elif hard_rotation and goal_session_ids:
+                    print(
+                        "rotation deferred: account is exhausted but active goal session(s) are still running; "
+                        "will switch after quota/auth blocker"
+                    )
+                elif goal_session_ids:
+                    print(
+                        "rotation deferred: active goal session(s) are still running; "
+                        "will switch after quota/auth blocker"
                     )
                 elif hard_rotation:
                     print(
