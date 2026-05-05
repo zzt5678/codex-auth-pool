@@ -7357,15 +7357,16 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         active_snapshot = active_desktop_sessions_before_switch(args)
         pending_hard = bool(pending_rotation.get("hard"))
         grace_until = parse_dt(str(pending_rotation.get("hard_grace_until") or ""))
+        session_ids = pending_rotation_session_ids(active_snapshot)
         has_spawned_sessions = active_snapshot_has_spawned_sessions(active_snapshot)
         has_goal_sessions = active_snapshot_has_goal_sessions(active_snapshot)
         if active_snapshot is not None and (
-            has_spawned_sessions
+            session_ids
+            or has_spawned_sessions
             or has_goal_sessions
             or not pending_hard
             or (grace_until is not None and now_local() < grace_until)
         ):
-            session_ids = pending_rotation_session_ids(active_snapshot)
             spawned_session_ids = pending_rotation_spawned_session_ids(active_snapshot)
             goal_session_ids = pending_rotation_goal_session_ids(active_snapshot)
             blocker_ids = pending_rotation_blocker_ids(active_snapshot)
