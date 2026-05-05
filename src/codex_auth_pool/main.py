@@ -2070,15 +2070,6 @@ def capture_interrupted_sessions(
         for session in recent_sessions
         if session_was_in_progress_at(session, captured_at)
     ]
-    active_resume_process_sessions: list[InterruptedSession] = []
-    seen_session_ids = {session.id for session in sessions}
-    for session in recent_sessions:
-        if session.id in seen_session_ids:
-            continue
-        if _codex_resume_pids_for_thread(session.id) and not session_has_terminal_end_marker_at(session, captured_at):
-            sessions.append(session)
-            active_resume_process_sessions.append(session)
-            seen_session_ids.add(session.id)
     open_spawned_sessions = read_open_spawned_sessions(
         codex_state_db=codex_state_db,
         max_age_seconds=max_age_seconds,
@@ -2097,8 +2088,6 @@ def capture_interrupted_sessions(
         "max_count": max_count,
         "recent_candidates": len(recent_sessions),
         "filtered_terminal_sessions": max(0, len(recent_sessions) - len(sessions)),
-        "active_resume_process_session_count": len(active_resume_process_sessions),
-        "active_resume_process_session_ids": [session.id for session in active_resume_process_sessions],
         "sessions": [interrupted_session_record(session, captured_at) for session in sessions],
         "open_spawned_candidates": len(open_spawned_sessions),
         "filtered_inactive_spawned_sessions": max(0, len(open_spawned_sessions) - len(active_spawned_sessions)),
@@ -2119,11 +2108,9 @@ def capture_interrupted_sessions(
             active_spawned_session_count=len(active_spawned_sessions),
             recent_candidates=len(recent_sessions),
             filtered_terminal_sessions=max(0, len(recent_sessions) - len(sessions)),
-            active_resume_process_session_count=len(active_resume_process_sessions),
             open_spawned_candidates=len(open_spawned_sessions),
             filtered_inactive_spawned_sessions=max(0, len(open_spawned_sessions) - len(active_spawned_sessions)),
             session_ids=[session.id for session in sessions],
-            active_resume_process_session_ids=[session.id for session in active_resume_process_sessions],
             active_spawned_session_ids=[session.id for session, _meta in active_spawned_sessions],
         )
     return snapshot
@@ -3078,37 +3065,6 @@ def active_desktop_sessions_before_switch(args: argparse.Namespace) -> dict[str,
         return snapshot
     spawned_sessions = snapshot.get("active_spawned_sessions")
     if isinstance(spawned_sessions, list) and spawned_sessions:
-        return snapshot
-    goal_sessions: list[dict[str, Any]] = []
-    for goal in read_active_goal_threads(
-        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
-        max_count=20,
-    ):
-        runtime_state = classify_active_goal_runtime(goal)
-        # Only a confirmed quota/auth-blocked goal is safe to resume after
-        # switching. Busy/waiting/stale goals may still be running local,
-        # remote, or sub-agent work, so they must block app restarts.
-        if _runtime_state_requires_goal_resume(runtime_state):
-            continue
-        goal_sessions.append(
-            {
-                "thread_id": goal.get("thread_id"),
-                "goal_id": goal.get("goal_id"),
-                "title": goal.get("title"),
-                "cwd": goal.get("cwd"),
-                "runtime_state": runtime_state,
-            }
-        )
-    if goal_sessions:
-        snapshot["active_goal_sessions"] = goal_sessions
-        if getattr(args, "events_path", None) is not None:
-            append_event(
-                args.events_path,
-                "active_goal_sessions_block_rotation",
-                session_count=len(goal_sessions),
-                thread_ids=[str(goal.get("thread_id") or "") for goal in goal_sessions],
-                runtime_states=[goal.get("runtime_state") for goal in goal_sessions],
-            )
         return snapshot
     return None
 
