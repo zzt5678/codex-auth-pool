@@ -5126,9 +5126,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  hard_grace_until: {pending_rotation.get('hard_grace_until') or '-'}")
         session_ids = pending_rotation.get("session_ids")
         spawned_session_ids = pending_rotation.get("active_spawned_session_ids")
+        goal_session_ids = pending_rotation.get("active_goal_session_ids")
         blocker_ids = pending_rotation.get("blocker_ids")
         print(f"  sessions: {len(session_ids) if isinstance(session_ids, list) else 0}")
         print(f"  spawned_sessions: {len(spawned_session_ids) if isinstance(spawned_session_ids, list) else 0}")
+        print(f"  goal_sessions: {len(goal_session_ids) if isinstance(goal_session_ids, list) else 0}")
         print(f"  blockers: {len(blocker_ids) if isinstance(blocker_ids, list) else 0}")
     print("")
     print("Last Switch")
@@ -7366,7 +7368,6 @@ def pending_rotation_blocker_ids(active_snapshot: dict[str, Any] | None) -> list
     for item in (
         pending_rotation_session_ids(active_snapshot)
         + pending_rotation_spawned_session_ids(active_snapshot)
-        + pending_rotation_goal_session_ids(active_snapshot)
     ):
         if item and item not in seen:
             seen.add(item)
@@ -7683,12 +7684,11 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         pending_hard = bool(pending_rotation.get("hard"))
         grace_until = parse_dt(str(pending_rotation.get("hard_grace_until") or ""))
         session_ids = pending_rotation_session_ids(active_snapshot)
-        has_spawned_sessions = active_snapshot_has_spawned_sessions(active_snapshot)
-        has_goal_sessions = active_snapshot_has_goal_sessions(active_snapshot)
-        if active_snapshot is not None and (
+        spawned_session_ids = pending_rotation_spawned_session_ids(active_snapshot)
+        has_app_blockers = bool(session_ids or spawned_session_ids)
+        if active_snapshot is not None and has_app_blockers and (
             session_ids
-            or has_spawned_sessions
-            or has_goal_sessions
+            or spawned_session_ids
             or not pending_hard
             or (grace_until is not None and now_local() < grace_until)
         ):
@@ -7715,8 +7715,6 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             )
             if spawned_session_ids:
                 print("rotation pending: child agent session(s) are still running; will switch after they finish")
-            elif goal_session_ids:
-                print("rotation pending: active goal session(s) are still running; will switch after quota/auth blocker")
             else:
                 print("rotation pending: active Codex Desktop session(s) are still running; will switch after they become idle")
             return 0
@@ -7873,16 +7871,6 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 print(
                     "rotation deferred: account is exhausted but child agent session(s) are still running; "
                     "will switch after they finish"
-                )
-            elif hard_rotation and goal_session_ids:
-                print(
-                    "rotation deferred: account is exhausted but active goal session(s) are still running; "
-                    "will switch after quota/auth blocker"
-                )
-            elif goal_session_ids:
-                print(
-                    "rotation deferred: active goal session(s) are still running; "
-                    "will switch after quota/auth blocker"
                 )
             elif hard_rotation:
                 print(
