@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Import cliproxyapi Codex auth files into Codex Desktop auth format.
+"""Manage a local pool of official Codex auth profiles.
 
-This script is intentionally conservative:
-- `list` shows available cliproxyapi auth profiles.
-- `preview` converts a profile and prints a redacted view.
-- `export` writes the converted auth payload to a chosen file.
-- `apply` backs up the current Codex auth file and then replaces it.
-
-The goal is to reuse existing Codex/ChatGPT login tokens without forcing a
-fresh login for every account.
+The tool keeps multiple Codex/ChatGPT login states in a managed vault, imports
+compatible cliproxyapi auth files when present, observes real quota windows, and
+rotates the active Codex auth file only after a confirmed quota/auth trigger.
+Desktop sessions and CLI goal sessions are handled separately so background
+rotation does not interrupt work that is still making progress.
 """
 
 from __future__ import annotations
@@ -143,6 +140,7 @@ DEFAULT_ACTIVE_GOAL_RESUME_PROMPT = (
 DEFAULT_RESUME_MODEL_CANDIDATES = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
 RESUME_MODEL_NEGATIVE_CACHE_SECONDS = 24 * 60 * 60
 RECENT_SESSION_ACTIVITY_GRACE_SECONDS = 180
+BROWSER_USE_ACTIVITY_GRACE_SECONDS = 15 * 60
 ACTIVE_SPAWNED_THREAD_IDLE_SECONDS = 30 * 60
 ACTIVE_GOAL_RESUME_THROTTLE_SECONDS = 10 * 60
 ACTIVE_GOAL_BUSY_GRACE_SECONDS = 3 * 60
@@ -158,6 +156,14 @@ BROWSER_USE_SESSION_MARKERS = (
     "mcp__browser",
     "current url:",
 )
+BROWSER_USE_SNAPSHOT_ITEM_NAMES = {
+    "app_support_cookies",
+    "app_support_local_storage",
+    "app_support_session_storage",
+    "app_support_browser_partition",
+    "app_support_preferences",
+    "app_support_trust_tokens",
+}
 
 
 @dataclass
@@ -975,6 +981,9 @@ def select_browser_use_snapshot(env_snapshots_dir: Path) -> Path | None:
     for snapshot in snapshots:
         if "browser-use" in snapshot.name.lower():
             return snapshot
+    for snapshot in snapshots:
+        if snapshot_item_names(snapshot) & BROWSER_USE_SNAPSHOT_ITEM_NAMES:
+            return snapshot
     return None
 
 
@@ -994,14 +1003,7 @@ def restore_browser_use_snapshot_if_available(env_snapshots_dir: Path, events_pa
     # installed after the snapshot and make users reinstall them after switches.
     restored = restore_env_snapshot(
         snapshot,
-        include_names={
-            "app_support_cookies",
-            "app_support_local_storage",
-            "app_support_session_storage",
-            "app_support_browser_partition",
-            "app_support_preferences",
-            "app_support_trust_tokens",
-        },
+        include_names=BROWSER_USE_SNAPSHOT_ITEM_NAMES,
     )
     if events_path is not None:
         append_event(
@@ -1959,6 +1961,12 @@ def session_was_in_progress_at(session: InterruptedSession, captured_at: datetim
     if pending_tool_calls_at(session, captured_at):
         return True
 
+    uses_desktop_browser = session_uses_desktop_browser(session, captured_at)
+    activity_grace_seconds = (
+        BROWSER_USE_ACTIVITY_GRACE_SECONDS
+        if uses_desktop_browser
+        else RECENT_SESSION_ACTIVITY_GRACE_SECONDS
+    )
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
         return False
@@ -1982,10 +1990,10 @@ def session_was_in_progress_at(session: InterruptedSession, captured_at: datetim
             return False
         if kind == "active":
             if event_at is not None:
-                return (captured_at - event_at).total_seconds() <= RECENT_SESSION_ACTIVITY_GRACE_SECONDS
+                return (captured_at - event_at).total_seconds() <= activity_grace_seconds
             break
     captured_ts = int(captured_at.timestamp())
-    if session.updated_at > 0 and captured_ts - session.updated_at <= RECENT_SESSION_ACTIVITY_GRACE_SECONDS:
+    if session.updated_at > 0 and captured_ts - session.updated_at <= activity_grace_seconds:
         return True
     return False
 
@@ -4009,10 +4017,15 @@ def observed_block_until_for_profile(path: Path, *, now: datetime | None = None)
     now = now or now_local()
     usage_error = str(read_profile_metadata(path).get("usage_error") or "")
     usage_error_checked_at = usage_error_checked_at_for_profile(path)
-    if usage_error and usage_error_checked_at is not None and usage_error_blocks_current_account(usage_error):
-        token_refresh_due = usage_error_checked_at + timedelta(hours=24)
-        if token_refresh_due > now:
-            return token_refresh_due, "auth_token_expired"
+    if usage_error and usage_error_checked_at is not None:
+        if usage_error_blocks_current_account(usage_error):
+            token_refresh_due = usage_error_checked_at + timedelta(hours=24)
+            if token_refresh_due > now:
+                return token_refresh_due, "auth_token_expired"
+        else:
+            retry_due = usage_error_checked_at + timedelta(minutes=DEFAULT_USAGE_ERROR_BACKOFF_MINUTES)
+            if retry_due > now:
+                return retry_due, "usage_refresh_failed"
 
     observed_secondary_used = observed_secondary_used_percent_for_profile(path)
     observed_secondary_reset = observed_secondary_reset_at_for_profile(path)
@@ -5907,13 +5920,26 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
         rotation_trigger_source=rotation_trigger_source,
     )
     if apply_source == "auto_rotation" and not getattr(args, "no_resume_active_goals", False):
-        goal_resume_results = resume_active_goal_threads_after_switch(
-            codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
-            events_path=getattr(args, "events_path", None),
-            state_path=getattr(args, "state_path", None),
-            account_id=normalized.get("account_id"),
-            prompt=active_goal_resume_prompt_from_args(args),
-        )
+        expected_account_id = str(normalized.get("account_id") or "")
+        active_account_id = active_auth_account_id(target_path)
+        if expected_account_id and active_account_id != expected_account_id:
+            append_event(
+                args.events_path,
+                "active_goal_resume_skipped",
+                reason="active_auth_not_verified",
+                expected_account_id=expected_account_id,
+                active_account_id=active_account_id,
+            )
+            goal_resume_results = []
+            print("skipped active goal resume: active auth did not verify after switch")
+        else:
+            goal_resume_results = resume_active_goal_threads_after_switch(
+                codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+                events_path=getattr(args, "events_path", None),
+                state_path=getattr(args, "state_path", None),
+                account_id=normalized.get("account_id"),
+                prompt=active_goal_resume_prompt_from_args(args),
+            )
         launched = [result for result in goal_resume_results if result.get("ok") and not result.get("skipped")]
         skipped = [result for result in goal_resume_results if result.get("skipped")]
         failed = [result for result in goal_resume_results if not result.get("ok")]
@@ -7620,6 +7646,13 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         pending_until = parse_dt(str(pending_rotation.get("cooldown_until") or ""))
         if pending_until is None:
             pending_until = now_local() + timedelta(hours=5)
+            append_event(
+                args.events_path,
+                "rotation_pending_missing_cooldown_until",
+                account_id=current_account,
+                reason=pending_reason,
+                fallback_until=pending_until.isoformat(),
+            )
         if now_local() >= pending_until and not usage_error_blocks_current_account(current_usage_refresh_error):
             recovered_usage, recovered_note = current_profile_usage_snapshot(
                 args.source_dir,
@@ -7674,6 +7707,13 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         pending_until = parse_dt(str(pending_rotation.get("cooldown_until") or ""))
         if pending_until is None:
             pending_until = now_local() + timedelta(hours=5)
+            append_event(
+                args.events_path,
+                "rotation_pending_missing_cooldown_until",
+                account_id=current_account,
+                reason=pending_reason,
+                fallback_until=pending_until.isoformat(),
+            )
         if getattr(args, "dry_run", False):
             print(
                 f"dry run: pending rotation for current account {current_account} "

@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from datetime import timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from codex_auth_pool import main as pool
+
+
+class RotationLogicTests(unittest.TestCase):
+    def test_default_thresholds_are_exhaustion_only(self) -> None:
+        now = pool.now_local()
+        reason, until = pool.determine_rotation_trigger(
+            None,
+            primary_used_percent=99.4,
+            primary_reset_at=now + timedelta(hours=5),
+            secondary_used_percent=20.0,
+            secondary_reset_at=now + timedelta(days=5),
+            primary_threshold=pool.DEFAULT_PRIMARY_THRESHOLD,
+            secondary_threshold=pool.DEFAULT_SECONDARY_THRESHOLD,
+        )
+        self.assertIsNone(reason)
+        self.assertIsNone(until)
+
+        reason, until = pool.determine_rotation_trigger(
+            None,
+            primary_used_percent=100.0,
+            primary_reset_at=now + timedelta(hours=5),
+            secondary_used_percent=20.0,
+            secondary_reset_at=now + timedelta(days=5),
+            primary_threshold=pool.DEFAULT_PRIMARY_THRESHOLD,
+            secondary_threshold=pool.DEFAULT_SECONDARY_THRESHOLD,
+        )
+        self.assertEqual(reason, "primary_5h_limit")
+        self.assertIsNotNone(until)
+
+    def test_runtime_usage_flags_override_low_percentage(self) -> None:
+        now = pool.now_local()
+        usage = pool.RemoteUsageSnapshot(
+            account_id="acct",
+            email="user@example.com",
+            plan_type="plus",
+            allowed=False,
+            limit_reached=False,
+            primary_used_percent=1.0,
+            primary_reset_at=now + timedelta(hours=5),
+            primary_window_seconds=5 * 60 * 60,
+            secondary_used_percent=10.0,
+            secondary_reset_at=now + timedelta(days=5),
+            secondary_window_seconds=7 * 24 * 60 * 60,
+            fetched_at=now,
+            source="test",
+        )
+        reason, until = pool.determine_rotation_trigger(
+            usage,
+            primary_used_percent=usage.primary_used_percent,
+            primary_reset_at=usage.primary_reset_at,
+            secondary_used_percent=usage.secondary_used_percent,
+            secondary_reset_at=usage.secondary_reset_at,
+            primary_threshold=pool.DEFAULT_PRIMARY_THRESHOLD,
+            secondary_threshold=pool.DEFAULT_SECONDARY_THRESHOLD,
+        )
+        self.assertEqual(reason, "primary_5h_limit")
+        self.assertEqual(until, usage.primary_reset_at)
+
+    def test_recent_usage_refresh_failure_blocks_candidate_temporarily(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile.json"
+            pool.write_json(
+                path,
+                {
+                    "tokens": {
+                        "access_token": "a",
+                        "refresh_token": "r",
+                        "id_token": "i",
+                        "account_id": "acct",
+                    }
+                },
+            )
+            pool.write_json(
+                pool.meta_path_for_profile(path),
+                {
+                    "usage_error": "temporary network failure",
+                    "usage_error_checked_at": pool.now_local().isoformat(),
+                },
+            )
+            until, reason = pool.observed_block_until_for_profile(path)
+            self.assertEqual(reason, "usage_refresh_failed")
+            self.assertIsNotNone(until)
+
+    def test_browser_use_session_uses_longer_activity_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            captured_at = pool.now_local()
+            active_at = captured_at - timedelta(seconds=pool.RECENT_SESSION_ACTIVITY_GRACE_SECONDS + 60)
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": active_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "agent_message",
+                            "message": "Browser Use current url: https://example.com",
+                        },
+                    }
+                )
+            )
+            session = pool.InterruptedSession(
+                id="desktop-thread",
+                title="Browser task",
+                cwd=str(Path(tmp)),
+                source="codex",
+                model="gpt-5.5",
+                rollout_path=str(rollout),
+                updated_at=int(active_at.timestamp()),
+                last_log_at=None,
+                recent_log_count=1,
+            )
+            self.assertTrue(pool.session_was_in_progress_at(session, captured_at))
+
+    def test_snapshot_selection_can_use_manifest_items_without_name_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = root / "manual-good-snapshot"
+            snapshot.mkdir()
+            pool.write_json(
+                pool.snapshot_manifest(snapshot),
+                {
+                    "items": [
+                        {
+                            "name": "app_support_browser_partition",
+                            "source_path": "/tmp/source",
+                            "stored_path": str(snapshot / "app_support_browser_partition"),
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(pool.select_browser_use_snapshot(root), snapshot)
+
+    def test_goal_runtime_ignores_stale_blocker_after_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            now = pool.now_local()
+            blocker_at = now - timedelta(minutes=5)
+            progress_at = now - timedelta(minutes=4)
+            rollout.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": blocker_at.isoformat(),
+                                "type": "event_msg",
+                                "payload": {"type": "error", "message": "You've hit your usage limit"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": progress_at.isoformat(),
+                                "type": "event_msg",
+                                "payload": {"type": "agent_message", "message": "continued progress"},
+                            }
+                        ),
+                    ]
+                )
+            )
+            state = pool.classify_active_goal_runtime({"rollout_path": str(rollout)}, now=now)
+            self.assertFalse(state["quota_blocked"])
+            self.assertNotEqual(state["state"], "blocked")
+
+
+if __name__ == "__main__":
+    unittest.main()

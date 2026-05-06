@@ -166,6 +166,14 @@ codex-auth-pool events --limit 10
 `fix` is dry-run by default and only previews low-risk repairs; use `fix --apply` to synchronize auth files, clear expired cooldowns, or create missing metadata.
 `events` prints a readable summary by default; use `codex-auth-pool events --raw` for raw JSONL.
 
+### 6. Run Local Tests
+
+```bash
+python -m unittest discover -s tests
+```
+
+The test suite covers the core rotation threshold rules, runtime quota signals, Browser Use active-session protection, temporary candidate cooldown after usage-refresh failures, and CLI goal blocker classification.
+
 ## Token Usage And Cost Estimate
 
 `token-usage` scans local Codex rollout logs and summarizes token consumption by account, model, thread, or account/model pair:
@@ -349,7 +357,8 @@ Important paths:
 - keeps local plugin and connector state out of the auth rotation path
 - for Browser Use, authorize once while it works, then run `codex-auth-pool snapshot-env --name browser-use-working-$(date +%Y%m%d-%H%M%S)`; automatic switch restarts restore that snapshot before relaunching Codex
 - `apply-best --restart-after-switch` is an immediate manual switch command; use `init --install-launchd` or `launchd-install` for background auto-rotation. Background services restart Codex after switches by default; pass `--no-restart-after-switch` only if you intentionally want auth changes without a Desktop restart.
-- background rotation defaults to preemptive thresholds of `90%` for the 5-hour window and `97%` for the weekly window, leaving margin before the account hard-stops
+- background rotation does not preemptively switch by percentage by default: both the 5-hour and weekly thresholds are `100%`; runtime limit signals from Codex sessions still count as real exhaustion even when the displayed percentage is not exactly 100%
+- while a Desktop task or spawned child agent is still active, auto-rotation records a pending switch and waits until that work becomes idle
 - when no alternate account is available, `status`, `dashboard`, and daemon events show blocked accounts and the earliest known unblock time
 
 ## Ubuntu Deployment

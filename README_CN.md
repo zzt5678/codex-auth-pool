@@ -166,6 +166,14 @@ codex-auth-pool events --limit 10
 `fix` 默认是 dry-run，只预览低风险修复；确认后用 `fix --apply` 同步 auth 文件、清理过期冷却或补齐缺失元数据。
 `events` 默认输出易读摘要；如果需要原始 JSONL，可以使用 `codex-auth-pool events --raw`。
 
+### 6. 运行本地测试
+
+```bash
+python -m unittest discover -s tests
+```
+
+测试覆盖核心轮换规则、运行时限额信号、Browser Use 活跃保护、候选账号短期失败冷却和 CLI goal 恢复判断。
+
 ## Token 使用量和成本估算
 
 `token-usage` 会扫描本机 Codex rollout 日志，按账号、模型、线程，或账号/模型组合统计 token 消耗：
@@ -349,10 +357,11 @@ codex-auth-pool restore-env baseline --restart-codex
 - 插件和连接器状态尽量与 auth 轮换解耦
 - Browser Use 可用时先授权一次，然后执行 `codex-auth-pool snapshot-env --name browser-use-working-$(date +%Y%m%d-%H%M%S)`；之后自动切号重启会在重新打开 Codex 前恢复这个快照
 - `apply-best --restart-after-switch` 是人工立即切换命令；后台自动切换请使用 `init --install-launchd` 或 `launchd-install`。后台服务默认会在切号后重启 Codex；只有明确需要“只切 auth 不重启”时才加 `--no-restart-after-switch`
-- 后台轮换默认是提前切换：
-  - 5 小时窗口默认阈值 `90%`
-  - 周窗口默认阈值 `97%`
-  - 留出余量，避免等到账号完全不可用才切换
+- 后台轮换默认不做百分比提前切换：
+  - 5 小时窗口默认阈值 `100%`
+  - 周窗口默认阈值 `100%`
+  - 如果 Codex 运行时已经返回限额信号，即使百分比没有显示 100%，也会按真实耗尽处理
+  - 活跃 Desktop 任务或子 agent 仍在运行时，只写入 pending，等空闲后再切换
 - 如果当前没有可切账号，`status`、`dashboard` 和后台事件会显示被阻塞账号的原因，以及最早可能恢复的时间
 
 ## Ubuntu 部署
