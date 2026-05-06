@@ -55,6 +55,7 @@ when you need an emergency manual switch.
 - Treat `~/.codex/auth.json` and `~/.codex/cache/auth.json` as one active login state; if they drift, the daemon reconciles them before quota checks.
 - Auto-cool down exhausted accounts and switch to the next available one.
 - Treat an expired current auth token (`HTTP 401 token_expired`) as an unusable account and rotate away instead of trusting stale quota snapshots.
+- Treat runtime limit signals from Codex session logs (`usage_limit_exceeded`, `rate_limit_reached_type`, or repeated `rate_limits=null`) as real exhaustion even when the displayed percentage is not exactly 100%.
 - Restart Codex Desktop automatically after switching on macOS.
 - Before an automatic restart, capture recently active Codex Desktop sessions; after restart, resume those interrupted thread IDs through the Codex app-server protocol with `继续`.
 - Recovery targets the original `threadId` with `thread/resume` + `turn/start` instead of creating a separate `codex exec resume` worker session.

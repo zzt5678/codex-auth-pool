@@ -55,6 +55,7 @@
 - 把 `~/.codex/auth.json` 和 `~/.codex/cache/auth.json` 视为同一个有效登录态；如果两者漂移，后台守护会先自动对齐，再判断额度。
 - 账号额度触顶后自动冷却，并切换到下一个可用账号。
 - 当前账号 auth token 过期时（`HTTP 401 token_expired`），会视为账号不可用并自动切走，不再继续相信旧额度快照。
+- 如果 Codex 会话日志已经出现运行时限额信号（`usage_limit_exceeded`、`rate_limit_reached_type`，或连续 `rate_limits=null`），即使界面百分比没有精确显示 100%，也会按真实耗尽处理。
 - macOS 上切换后可自动重启 Codex Desktop。
 - 自动重启前会记录最近活跃的 Codex Desktop 会话，重启后通过 Codex app-server 协议对这些原 `threadId` 发送 `继续`。
 - 恢复会话使用 `thread/resume` + `turn/start`，不再另起一个 `codex exec resume` 后台代理会话。

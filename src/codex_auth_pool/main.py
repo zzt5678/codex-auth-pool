@@ -181,8 +181,21 @@ class RateLimitSnapshot:
     secondary_resets_at: datetime | None
     secondary_window_minutes: int | None
     plan_type: str | None
+    rate_limit_reached_type: str | None
     source_file: Path
     event_timestamp: str | None
+
+
+@dataclass
+class RuntimeLimitSignal:
+    reason: str
+    cooldown_until: datetime | None
+    primary_used_percent: float | None
+    secondary_used_percent: float | None
+    source_file: Path
+    event_timestamp: str | None
+    source: str
+    detail: str | None
 
 
 @dataclass
@@ -4380,6 +4393,11 @@ def current_limits_for_display(
     *,
     max_age_minutes: int,
 ) -> dict[str, Any] | None:
+    runtime_limit_signal = latest_runtime_limit_signal(
+        sessions_dir,
+        state=state,
+        max_age_minutes=max_age_minutes,
+    )
     current_usage, usage_note = current_profile_usage_snapshot(
         source_dir,
         managed_dir,
@@ -4387,6 +4405,22 @@ def current_limits_for_display(
         max_age_minutes=max_age_minutes,
     )
     if current_usage is not None:
+        if runtime_limit_signal is not None:
+            return {
+                "primary_used_percent": current_usage.primary_used_percent,
+                "primary_reset_at": current_usage.primary_reset_at,
+                "secondary_used_percent": current_usage.secondary_used_percent,
+                "secondary_reset_at": current_usage.secondary_reset_at,
+                "source": (
+                    f"{runtime_limit_signal.source}:"
+                    f"{runtime_limit_signal.source_file.name}"
+                ),
+                "timestamp": runtime_limit_signal.event_timestamp,
+                "note": (
+                    f"runtime limit signal: {runtime_limit_signal.detail or runtime_limit_signal.reason}; "
+                    f"profile_usage={current_usage.source}"
+                ),
+            }
         return {
             "primary_used_percent": current_usage.primary_used_percent,
             "primary_reset_at": current_usage.primary_reset_at,
@@ -4542,19 +4576,24 @@ def latest_rate_limit_snapshot(sessions_dir: Path) -> RateLimitSnapshot | None:
                 secondary_resets_at=parse_unix_ts(secondary.get("resets_at")),
                 secondary_window_minutes=_safe_int(secondary.get("window_minutes")),
                 plan_type=rate_limits.get("plan_type"),
+                rate_limit_reached_type=(
+                    str(rate_limits.get("rate_limit_reached_type"))
+                    if rate_limits.get("rate_limit_reached_type") not in (None, "")
+                    else None
+                ),
                 source_file=path,
                 event_timestamp=event.get("timestamp"),
             )
     return None
 
 
-def rate_limit_snapshot_is_usable(
-    snapshot: RateLimitSnapshot,
+def session_event_is_usable(
+    event_timestamp: str | None,
     *,
     state: dict[str, Any],
     max_age_minutes: int,
 ) -> bool:
-    event_at = parse_dt(snapshot.event_timestamp)
+    event_at = parse_dt(event_timestamp)
     if event_at is None:
         return False
     if now_local() - event_at.astimezone() > timedelta(minutes=max_age_minutes):
@@ -4564,6 +4603,148 @@ def rate_limit_snapshot_is_usable(
     if last_apply_at is not None and event_at < last_apply_at:
         return False
     return True
+
+
+def rate_limit_snapshot_is_usable(
+    snapshot: RateLimitSnapshot,
+    *,
+    state: dict[str, Any],
+    max_age_minutes: int,
+) -> bool:
+    return session_event_is_usable(
+        snapshot.event_timestamp,
+        state=state,
+        max_age_minutes=max_age_minutes,
+    )
+
+
+def runtime_limit_reason_from_text(value: str | None) -> str:
+    text = (value or "").lower()
+    if "weekly" in text or "secondary" in text or "week" in text:
+        return "weekly_limit"
+    return "primary_5h_limit"
+
+
+def latest_runtime_limit_signal(
+    sessions_dir: Path,
+    *,
+    state: dict[str, Any],
+    max_age_minutes: int,
+) -> RuntimeLimitSignal | None:
+    newest: tuple[datetime, RuntimeLimitSignal] | None = None
+    for path in iter_recent_session_files(sessions_dir):
+        try:
+            lines = path.read_text().splitlines()
+        except UnicodeDecodeError:
+            continue
+        null_token_count_run = 0
+        file_signal: RuntimeLimitSignal | None = None
+        for raw in reversed(lines):
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_timestamp = event.get("timestamp")
+            if not session_event_is_usable(
+                event_timestamp,
+                state=state,
+                max_age_minutes=max_age_minutes,
+            ):
+                continue
+            payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            payload_type = payload.get("type")
+            if payload_type == "error":
+                codex_error_info = str(payload.get("codex_error_info") or "")
+                message = str(payload.get("message") or "")
+                if codex_error_info == "usage_limit_exceeded" or re.search(
+                    r"(usage limit|rate limit|limit reached|try again at)",
+                    message,
+                    flags=re.IGNORECASE,
+                ):
+                    file_signal = RuntimeLimitSignal(
+                        reason=runtime_limit_reason_from_text(message),
+                        cooldown_until=None,
+                        primary_used_percent=None,
+                        secondary_used_percent=None,
+                        source_file=path,
+                        event_timestamp=event_timestamp,
+                        source="session_error",
+                        detail=codex_error_info or message[:160],
+                    )
+                    break
+            if payload_type != "token_count":
+                continue
+            rate_limits = payload.get("rate_limits", {})
+            if rate_limits is None:
+                null_token_count_run += 1
+                if null_token_count_run >= 2:
+                    file_signal = RuntimeLimitSignal(
+                        reason="primary_5h_limit",
+                        cooldown_until=None,
+                        primary_used_percent=None,
+                        secondary_used_percent=None,
+                        source_file=path,
+                        event_timestamp=event_timestamp,
+                        source="session_rate_limits_null",
+                        detail="consecutive token_count events had rate_limits=null",
+                    )
+                    break
+                continue
+            null_token_count_run = 0
+            if not isinstance(rate_limits, dict):
+                continue
+            primary = rate_limits.get("primary", {})
+            secondary = rate_limits.get("secondary", {})
+            if not isinstance(primary, dict):
+                primary = {}
+            if not isinstance(secondary, dict):
+                secondary = {}
+            reached_type = rate_limits.get("rate_limit_reached_type")
+            if reached_type not in (None, ""):
+                file_signal = RuntimeLimitSignal(
+                    reason=runtime_limit_reason_from_text(str(reached_type)),
+                    cooldown_until=None,
+                    primary_used_percent=_safe_float(primary.get("used_percent")),
+                    secondary_used_percent=_safe_float(secondary.get("used_percent")),
+                    source_file=path,
+                    event_timestamp=event_timestamp,
+                    source="session_rate_limit_reached_type",
+                    detail=str(reached_type),
+                )
+            break
+        if file_signal is None:
+            continue
+        event_at = parse_dt(file_signal.event_timestamp)
+        if event_at is None:
+            continue
+        if newest is None or event_at > newest[0]:
+            newest = (event_at, file_signal)
+    return newest[1] if newest is not None else None
+
+
+def runtime_limit_cooldown_until(
+    signal: RuntimeLimitSignal,
+    *,
+    usage: RemoteUsageSnapshot | None,
+    snapshot: RateLimitSnapshot | None,
+) -> datetime:
+    if signal.cooldown_until is not None:
+        return signal.cooldown_until
+    if signal.reason == "weekly_limit":
+        return (
+            (usage.secondary_reset_at if usage is not None else None)
+            or (snapshot.secondary_resets_at if snapshot is not None else None)
+            or (now_local() + timedelta(days=7))
+        )
+    return (
+        (usage.primary_reset_at if usage is not None else None)
+        or (snapshot.primary_resets_at if snapshot is not None else None)
+        or (now_local() + timedelta(hours=5))
+    )
 
 
 def _safe_float(value: Any) -> float | None:
@@ -5085,6 +5266,7 @@ def cmd_rate_limits(args: argparse.Namespace) -> int:
     print(f"  5h reset: {fmt_dt(snapshot.primary_resets_at)}")
     print(f"  weekly window: {fmt_percent(snapshot.secondary_used_percent)} used")
     print(f"  weekly reset: {fmt_dt(snapshot.secondary_resets_at)}")
+    print(f"  reached type: {snapshot.rate_limit_reached_type or '-'}")
     print(f"  snapshot time: {snapshot.event_timestamp or '-'}")
     print(f"  source file: {snapshot.source_file}")
     return 0
@@ -7559,6 +7741,11 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         )
 
     snapshot = latest_rate_limit_snapshot(args.sessions_dir)
+    runtime_limit_signal = latest_runtime_limit_signal(
+        args.sessions_dir,
+        state=state,
+        max_age_minutes=args.usage_max_age_minutes,
+    )
     current_usage, usage_note = current_profile_usage_snapshot(
         args.source_dir,
         args.managed_dir,
@@ -7594,10 +7781,29 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         trigger_secondary_used = snapshot.secondary_used_percent
         trigger_secondary_reset = snapshot.secondary_resets_at
         trigger_source = f"session_snapshot:{snapshot.source_file.name}"
+    elif runtime_limit_signal is not None:
+        trigger_source = (
+            f"{runtime_limit_signal.source}:{runtime_limit_signal.source_file.name}"
+        )
     else:
         note = usage_note or "no current-account usage snapshot available"
         print(f"no safe rotation signal; skipping auto-rotation ({note})")
         return 0
+
+    if forced_trigger_reason is None and runtime_limit_signal is not None:
+        forced_trigger_reason = runtime_limit_signal.reason
+        forced_trigger_until = runtime_limit_cooldown_until(
+            runtime_limit_signal,
+            usage=current_usage,
+            snapshot=snapshot,
+        )
+        if runtime_limit_signal.primary_used_percent is not None:
+            trigger_primary_used = runtime_limit_signal.primary_used_percent
+        if runtime_limit_signal.secondary_used_percent is not None:
+            trigger_secondary_used = runtime_limit_signal.secondary_used_percent
+        trigger_source = (
+            f"{runtime_limit_signal.source}:{runtime_limit_signal.source_file.name}"
+        )
 
     if forced_trigger_reason and forced_trigger_until:
         triggered_reason, triggered_until = forced_trigger_reason, forced_trigger_until
