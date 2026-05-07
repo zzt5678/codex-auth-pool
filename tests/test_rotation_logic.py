@@ -13,6 +13,39 @@ from codex_auth_pool import main as pool
 
 
 class RotationLogicTests(unittest.TestCase):
+    def write_profile(
+        self,
+        root: Path,
+        *,
+        name: str,
+        account_id: str,
+        email: str,
+        plan_type: str,
+        disabled: bool = False,
+    ) -> Path:
+        path = root / f"{name}.json"
+        pool.write_json(
+            path,
+            {
+                "tokens": {
+                    "access_token": f"a-{account_id}",
+                    "refresh_token": f"r-{account_id}",
+                    "id_token": "i",
+                    "account_id": account_id,
+                }
+            },
+        )
+        pool.write_json(
+            pool.meta_path_for_profile(path),
+            {
+                "email": email,
+                "account_id": account_id,
+                "observed_plan_type": plan_type,
+                "disabled": disabled,
+            },
+        )
+        return path
+
     def test_default_thresholds_are_exhaustion_only(self) -> None:
         now = pool.now_local()
         reason, until = pool.determine_rotation_trigger(
@@ -258,6 +291,69 @@ class RotationLogicTests(unittest.TestCase):
             self.assertFalse(ranked[0]["available"])
             self.assertTrue(ranked[0]["permanent_auth_failure"])
             self.assertEqual(pool.profile_health(ranked[0]), "auth-invalidated")
+
+    def test_app_policy_prefers_pro_before_plus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_profile(root, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
+            self.write_profile(root, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+
+            ranked = pool.rank_profiles(
+                root / "missing-source",
+                root,
+                {},
+                root / "auth.json",
+                account_policy=pool.ACCOUNT_POLICY_APP,
+            )
+            available_emails = [item["summary"].email for item in ranked if item["available"]]
+            self.assertEqual(available_emails, ["pro@example.com", "plus@example.com"])
+
+    def test_app_policy_falls_back_to_plus_when_pro_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_profile(root, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
+            self.write_profile(
+                root,
+                name="pro",
+                account_id="pro-acct",
+                email="pro@example.com",
+                plan_type="pro",
+                disabled=True,
+            )
+
+            ranked = pool.rank_profiles(
+                root / "missing-source",
+                root,
+                {},
+                root / "auth.json",
+                account_policy=pool.ACCOUNT_POLICY_APP,
+            )
+            next_item = next(item for item in ranked if item["available"])
+            self.assertEqual(next_item["summary"].email, "plus@example.com")
+
+    def test_cli_policy_allows_plus_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_profile(root, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
+            self.write_profile(root, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+
+            ranked = pool.rank_profiles(
+                root / "missing-source",
+                root,
+                {},
+                root / "auth.json",
+                account_policy=pool.ACCOUNT_POLICY_CLI,
+            )
+            plus = next(item for item in ranked if item["summary"].account_id == "plus-acct")
+            pro = next(item for item in ranked if item["summary"].account_id == "pro-acct")
+            self.assertTrue(plus["available"])
+            self.assertFalse(pro["available"])
+            self.assertEqual(pool.profile_health(pro), "policy-excluded-pro")
+
+            allowed, tier, reason = pool.account_allows_cli_goal_resume(root / "missing-source", root, "pro-acct")
+            self.assertFalse(allowed)
+            self.assertEqual(tier, "pro")
+            self.assertEqual(reason, "cli_goal_resume_requires_plus")
 
 
 if __name__ == "__main__":

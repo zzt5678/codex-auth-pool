@@ -148,6 +148,10 @@ ACTIVE_GOAL_STALE_SECONDS = 5 * 60
 ACTIVE_GOAL_RESUME_RECHECK_SECONDS = 2 * 60
 RESUME_VERIFY_DELAY_SECONDS = 60.0
 DEFAULT_HARD_ACTIVE_GRACE_SECONDS = 0
+ACCOUNT_POLICY_DEFAULT = "default"
+ACCOUNT_POLICY_APP = "app"
+ACCOUNT_POLICY_CLI = "cli"
+ACCOUNT_POLICIES = (ACCOUNT_POLICY_DEFAULT, ACCOUNT_POLICY_APP, ACCOUNT_POLICY_CLI)
 BROWSER_USE_SESSION_MARKERS = (
     "in app browser",
     "browser-use",
@@ -172,6 +176,7 @@ class ProfileSummary:
     source_kind: str
     email: str
     account_id: str
+    plan_type: str
     weekly_reset_at: str | None
     last_refresh: str | None
     expired: str | None
@@ -864,11 +869,27 @@ def current_account_summary(target_path: Path, source_dir: Path, managed_dir: Pa
     current_account = active_auth_account_id(target_path)
     if not current_account:
         return None
+    return account_summary_by_id(source_dir, managed_dir, current_account)
+
+
+def account_summary_by_id(source_dir: Path, managed_dir: Path, account_id: str | None) -> ProfileSummary | None:
+    if not account_id:
+        return None
     for path in discover_all_profiles(source_dir, managed_dir):
         summary = summarize_profile(path)
-        if summary.account_id == current_account:
+        if summary.account_id == account_id:
             return summary
     return None
+
+
+def account_allows_cli_goal_resume(source_dir: Path, managed_dir: Path, account_id: str | None) -> tuple[bool, str, str]:
+    summary = account_summary_by_id(source_dir, managed_dir, account_id)
+    if summary is None:
+        return False, "unknown", "account_not_found"
+    tier = plan_tier(summary.plan_type)
+    if tier != "plus":
+        return False, tier, "cli_goal_resume_requires_plus"
+    return True, tier, "plus"
 
 
 def list_env_snapshots(env_snapshots_dir: Path) -> list[Path]:
@@ -1147,6 +1168,30 @@ def source_rank(source_kind: str) -> int:
     return ranks.get(source_kind, 9)
 
 
+def plan_tier(plan_type: str | None) -> str:
+    lowered = str(plan_type or "").strip().lower()
+    if "pro" in lowered:
+        return "pro"
+    if "plus" in lowered:
+        return "plus"
+    return "unknown"
+
+
+def account_policy_rank(summary: ProfileSummary, account_policy: str) -> int:
+    tier = plan_tier(summary.plan_type)
+    if account_policy == ACCOUNT_POLICY_APP:
+        return {"pro": 0, "plus": 1, "unknown": 2}.get(tier, 9)
+    if account_policy == ACCOUNT_POLICY_CLI:
+        return 0 if tier == "plus" else 9
+    return 0
+
+
+def account_policy_allows(summary: ProfileSummary, account_policy: str) -> bool:
+    if account_policy == ACCOUNT_POLICY_CLI:
+        return plan_tier(summary.plan_type) == "plus"
+    return True
+
+
 def managed_profile_name(payload: dict[str, Any], explicit_name: str | None = None) -> str:
     if explicit_name:
         base = explicit_name.strip()
@@ -1161,12 +1206,14 @@ def managed_profile_name(payload: dict[str, Any], explicit_name: str | None = No
 
 
 def summarize_profile(path: Path) -> ProfileSummary:
-    payload = normalize_source_payload(path, read_json(path), read_profile_metadata(path))
+    metadata = read_profile_metadata(path)
+    payload = normalize_source_payload(path, read_json(path), metadata)
     return ProfileSummary(
         path=path,
         source_kind=str(payload.get("source_kind", "unknown")),
         email=str(payload.get("email", "")),
         account_id=str(payload.get("account_id", "")),
+        plan_type=str(metadata.get("observed_plan_type") or payload.get("plan_type") or ""),
         weekly_reset_at=payload.get("weekly_reset_at"),
         last_refresh=payload.get("last_refresh"),
         expired=payload.get("expired"),
@@ -4911,6 +4958,8 @@ def rank_profiles(
     managed_dir: Path,
     state: dict[str, Any],
     target_path: Path,
+    *,
+    account_policy: str = ACCOUNT_POLICY_DEFAULT,
 ) -> list[dict[str, Any]]:
     now = now_local()
     current_account = active_auth_account_id(target_path)
@@ -4926,9 +4975,11 @@ def rank_profiles(
         permanent_auth_failure = usage_error_is_permanent_auth_failure(
             str(read_profile_metadata(path).get("usage_error") or "")
         )
+        policy_allowed = account_policy_allows(summary, account_policy)
         available = (
             not summary.disabled
             and not permanent_auth_failure
+            and policy_allowed
             and (expired is None or expired > now)
             and (cd_until is None or cd_until <= now)
             and (limit_reset is None or limit_reset <= now)
@@ -4945,6 +4996,9 @@ def rank_profiles(
             "remote_block_until": remote_block_until,
             "remote_block_reason": remote_block_reason,
             "permanent_auth_failure": permanent_auth_failure,
+            "policy_allowed": policy_allowed,
+            "account_policy": account_policy,
+            "plan_tier": plan_tier(summary.plan_type),
             "is_current": summary.account_id == current_account,
             "is_preferred_next": summary.account_id == preferred_next,
             "weekly_sort": weekly,
@@ -4973,6 +5027,7 @@ def rank_profiles(
         key=lambda item: (
             0 if item["available"] else 1,
             0 if item["is_preferred_next"] else 1,
+            account_policy_rank(item["summary"], account_policy),
             item["weekly_sort"],
             parse_dt(item["summary"].last_refresh) or datetime(1, 1, 1, tzinfo=timezone.utc),
             source_rank(item["summary"].source_kind),
@@ -4987,8 +5042,10 @@ def choose_best_profile(
     managed_dir: Path,
     state: dict[str, Any],
     target_path: Path,
+    *,
+    account_policy: str = ACCOUNT_POLICY_DEFAULT,
 ) -> dict[str, Any] | None:
-    ranked = rank_profiles(source_dir, managed_dir, state, target_path)
+    ranked = rank_profiles(source_dir, managed_dir, state, target_path, account_policy=account_policy)
     for item in ranked:
         if item["available"]:
             return item
@@ -5003,6 +5060,8 @@ def profile_block_reasons(item: dict[str, Any], *, now: datetime | None = None) 
         reasons.append("source disabled")
     if item.get("permanent_auth_failure"):
         reasons.append("auth invalidated; re-login required")
+    if item.get("policy_allowed") is False:
+        reasons.append(f"{item.get('account_policy') or 'policy'} excludes {item.get('plan_tier') or 'unknown'} plan")
     expired = parse_dt(summary.expired)
     if expired is not None and expired <= now:
         reasons.append(f"auth expired at {fmt_dt(expired)}")
@@ -5054,6 +5113,8 @@ def profile_health(item: dict[str, Any]) -> str:
         return "disabled"
     if item.get("permanent_auth_failure"):
         return "auth-invalidated"
+    if item.get("policy_allowed") is False:
+        return f"policy-excluded-{item.get('plan_tier') or 'unknown'}"
     expired = parse_dt(summary.expired)
     if expired is not None and expired <= now:
         return "auth-expired"
@@ -5089,6 +5150,8 @@ def ranked_item_report(item: dict[str, Any]) -> dict[str, Any]:
         "account_id": summary.account_id,
         "profile": str(summary.path),
         "source_kind": summary.source_kind,
+        "plan_type": summary.plan_type,
+        "plan_tier": plan_tier(summary.plan_type),
         "health": profile_health(item),
         "available": bool(item["available"]),
         "current": bool(item["is_current"]),
@@ -5112,7 +5175,7 @@ def build_pool_report(args: argparse.Namespace, *, discover: bool = True) -> dic
 
     state = load_state(args.state_path)
     target_path = Path(args.target)
-    ranked = rank_profiles(args.source_dir, args.managed_dir, state, target_path)
+    ranked = rank_profiles(args.source_dir, args.managed_dir, state, target_path, account_policy=ACCOUNT_POLICY_APP)
     current_summary = current_account_summary(target_path, args.source_dir, args.managed_dir)
     excluded_goal_rollouts = active_goal_rollout_paths(
         codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
@@ -5150,6 +5213,7 @@ def build_pool_report(args: argparse.Namespace, *, discover: bool = True) -> dic
             "health": "unknown",
         },
         "limits": jsonable(limits),
+        "selection_policy": ACCOUNT_POLICY_APP,
         "next": ranked_item_report(next_item) if next_item is not None else None,
         "next_unblock": next_unblock_hint(ranked),
         "accounts": [ranked_item_report(item) for item in ranked],
@@ -5185,6 +5249,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             f"    source_kind={meta.source_kind}\n"
             f"    email={meta.email or '-'}\n"
             f"    account_id={meta.account_id or '-'}\n"
+            f"    plan={meta.plan_type or '-'} ({plan_tier(meta.plan_type)})\n"
             f"    weekly_reset_at={weekly}\n"
             f"    last_refresh={last_refresh}\n"
             f"    expired={expired}\n"
@@ -5202,7 +5267,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
     )
     state = load_state(args.state_path)
-    ranked = rank_profiles(args.source_dir, args.managed_dir, state, Path(args.target))
+    ranked = rank_profiles(args.source_dir, args.managed_dir, state, Path(args.target), account_policy=ACCOUNT_POLICY_APP)
     if not ranked:
         print(f"no auth profiles found in {args.source_dir} or {args.managed_dir}")
         return 0
@@ -5225,9 +5290,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     next_item = next((item for item in ranked if item["available"] and not item["is_current"]), None)
 
     print("Current")
+    current_plan_type = current_summary.plan_type if current_summary else ""
     print(f"  account: {current_summary.email if current_summary else '-'}")
     print(f"  profile: {current_summary.path.name if current_summary else '-'}")
     print(f"  account_id: {current_summary.account_id if current_summary else '-'}")
+    print(f"  plan: {current_plan_type or '-'} ({plan_tier(current_plan_type)})")
     print(f"  cooldown: {fmt_dt(current_item['cooldown_until']) if current_item else '-'}")
     print(f"  preferred_next: {'yes' if current_item and current_item['is_preferred_next'] else 'no'}")
     if current_summary:
@@ -5249,7 +5316,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if limits.get("note"):
             print(f"  note: {limits['note']}")
     print("")
-    print("Next")
+    print(f"Next ({ACCOUNT_POLICY_APP}: Pro > Plus fallback)")
     if next_item is None:
         print("  next account: no alternate available account right now")
         hint = next_unblock_hint(ranked)
@@ -5264,6 +5331,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         reset_label, reset_source = effective_reset_label_for_profile(summary.path, summary)
         print(f"  next account: {summary.email or summary.account_id}")
         print(f"  profile: {summary.path.name}")
+        print(f"  plan: {summary.plan_type or '-'} ({plan_tier(summary.plan_type)})")
         print(f"  reset_at: {reset_label}")
         print(f"  reset_source: {reset_source}")
     if discovery["synced"] or discovery["refreshed"] or discovery["failed"]:
@@ -5391,6 +5459,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         weekly, weekly_source = effective_reset_label_for_profile(summary.path, summary)
         print(f"  {index:02d}. {summary.email or summary.path.name}")
         print(f"      file: {summary.path.name}")
+        print(f"      plan: {summary.plan_type or '-'} ({plan_tier(summary.plan_type)})")
         print(f"      reset_at: {weekly}")
         print(f"      reset_source: {weekly_source}")
         print(f"      flags: {', '.join(flags)}")
@@ -5406,7 +5475,7 @@ def cmd_pick(args: argparse.Namespace) -> int:
         max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
     )
     state = load_state(args.state_path)
-    picked = choose_best_profile(args.source_dir, args.managed_dir, state, Path(args.target))
+    picked = choose_best_profile(args.source_dir, args.managed_dir, state, Path(args.target), account_policy=ACCOUNT_POLICY_APP)
     if picked is None:
         print("no currently available profile")
         return 1
@@ -5415,6 +5484,7 @@ def cmd_pick(args: argparse.Namespace) -> int:
     print(f"source_kind={summary.source_kind}")
     print(f"email={summary.email}")
     print(f"account_id={summary.account_id}")
+    print(f"plan={summary.plan_type or '-'} ({plan_tier(summary.plan_type)})")
     print(f"weekly_reset_at={summary.weekly_reset_at or '-'}")
     return 0
 
@@ -5992,6 +6062,7 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
     )
     if not validation_ok:
         raise SystemExit(f"refusing to apply unusable profile {profile_path.name}: {validation_error}")
+    selected_summary = summarize_profile(profile_path)
     payload = convert_profile(normalized)
     target_path = Path(args.target).expanduser()
 
@@ -6044,6 +6115,8 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
             "profile": str(profile_path),
             "email": normalized.get("email"),
             "account_id": normalized.get("account_id"),
+            "plan_type": selected_summary.plan_type,
+            "plan_tier": plan_tier(selected_summary.plan_type),
             "apply_source": apply_source,
             "rotation_reason": rotation_reason,
             "rotation_trigger_source": rotation_trigger_source,
@@ -6061,6 +6134,8 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
         source_kind=normalized.get("source_kind"),
         email=normalized.get("email"),
         account_id=normalized.get("account_id"),
+        plan_type=selected_summary.plan_type,
+        plan_tier=plan_tier(selected_summary.plan_type),
         restart_after_switch=restart_requested,
         restart_performed=restart_performed,
         restart_skipped_reason=restart_skipped_reason,
@@ -6071,7 +6146,22 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
     if apply_source == "auto_rotation" and not getattr(args, "no_resume_active_goals", False):
         expected_account_id = str(normalized.get("account_id") or "")
         active_account_id = active_auth_account_id(target_path)
-        if expected_account_id and active_account_id != expected_account_id:
+        cli_allowed, switched_plan_tier, cli_block_reason = account_allows_cli_goal_resume(
+            args.source_dir,
+            args.managed_dir,
+            expected_account_id,
+        )
+        if not cli_allowed:
+            append_event(
+                args.events_path,
+                "active_goal_resume_skipped",
+                reason=cli_block_reason,
+                account_id=expected_account_id,
+                plan_tier=switched_plan_tier,
+            )
+            goal_resume_results = []
+            print(f"skipped active goal resume: CLI goal recovery only runs on Plus accounts (current plan={switched_plan_tier})")
+        elif expected_account_id and active_account_id != expected_account_id:
             append_event(
                 args.events_path,
                 "active_goal_resume_skipped",
@@ -6125,7 +6215,13 @@ def cmd_apply_best(args: argparse.Namespace) -> int:
     )
     state = load_state(args.state_path)
     picked = None
-    for candidate in rank_profiles(args.source_dir, args.managed_dir, state, Path(args.target)):
+    for candidate in rank_profiles(
+        args.source_dir,
+        args.managed_dir,
+        state,
+        Path(args.target),
+        account_policy=getattr(args, "account_policy", ACCOUNT_POLICY_APP),
+    ):
         if not candidate["available"]:
             continue
         validation_ok, validation_error = validate_profile_before_apply(
@@ -6820,7 +6916,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
         exclude_rollout_paths=excluded_goal_rollouts,
     )
-    ranked = rank_profiles(args.source_dir, args.managed_dir, state_payload, Path(args.target))
+    ranked = rank_profiles(args.source_dir, args.managed_dir, state_payload, Path(args.target), account_policy=ACCOUNT_POLICY_APP)
     next_profile = next((item for item in ranked if item["available"] and not item["is_current"]), None)
     recent_event = read_recent_event(args.events_path)
     preferred_next = preferred_next_account_id(state_payload)
@@ -7053,7 +7149,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     state = load_state(args.state_path)
     target_path = Path(args.target)
     current_summary = current_account_summary(target_path, args.source_dir, args.managed_dir)
-    ranked = rank_profiles(args.source_dir, args.managed_dir, state, target_path)
+    ranked = rank_profiles(args.source_dir, args.managed_dir, state, target_path, account_policy=ACCOUNT_POLICY_APP)
     current_item = next((item for item in ranked if item["is_current"]), None)
     next_item = next((item for item in ranked if item["available"] and not item["is_current"]), None)
     excluded_goal_rollouts = active_goal_rollout_paths(
@@ -7712,6 +7808,7 @@ def apply_auto_rotation_from_trigger(
         args.managed_dir,
         load_state(args.state_path),
         Path(args.target),
+        account_policy=ACCOUNT_POLICY_APP,
     )
     for candidate in ranked_candidates:
         if not candidate["available"] or candidate["summary"].account_id == current_account:
@@ -7748,7 +7845,13 @@ def apply_auto_rotation_from_trigger(
         clear_pending_rotation(args.state_path, args.events_path, reason="applied")
         return result
 
-    ranked_after_cooldown = rank_profiles(args.source_dir, args.managed_dir, load_state(args.state_path), Path(args.target))
+    ranked_after_cooldown = rank_profiles(
+        args.source_dir,
+        args.managed_dir,
+        load_state(args.state_path),
+        Path(args.target),
+        account_policy=ACCOUNT_POLICY_APP,
+    )
     hint = next_unblock_hint(ranked_after_cooldown)
     blocked_examples = [
         {
@@ -7820,13 +7923,30 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         cmd_refresh_usage(refresh_args)
 
     if not getattr(args, "no_resume_active_goals", False):
-        process_pending_goal_resumes(
-            codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
-            events_path=getattr(args, "events_path", None),
-            state_path=getattr(args, "state_path", None),
-            account_id=current_account,
-            prompt=active_goal_resume_prompt_from_args(args),
+        goal_resume_state = load_state(args.state_path)
+        pending_goal_resumes = goal_resume_state.get("pending_goal_resumes")
+        has_pending_goal_resumes = isinstance(pending_goal_resumes, dict) and bool(pending_goal_resumes)
+        cli_allowed, current_plan_tier, cli_block_reason = account_allows_cli_goal_resume(
+            args.source_dir,
+            args.managed_dir,
+            current_account,
         )
+        if not cli_allowed and has_pending_goal_resumes:
+            append_event(
+                args.events_path,
+                "active_goal_resume_skipped",
+                reason=cli_block_reason,
+                account_id=current_account,
+                plan_tier=current_plan_tier,
+            )
+        elif cli_allowed:
+            process_pending_goal_resumes(
+                codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+                events_path=getattr(args, "events_path", None),
+                state_path=getattr(args, "state_path", None),
+                account_id=current_account,
+                prompt=active_goal_resume_prompt_from_args(args),
+            )
 
     state = load_state(args.state_path)
     excluded_goal_rollouts = active_goal_rollout_paths(
@@ -8997,6 +9117,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_USAGE_MAX_AGE_MINUTES,
         help="avoid retrying failed initial usage observations newer than this many minutes",
+    )
+    apply_best_parser.add_argument(
+        "--account-policy",
+        choices=ACCOUNT_POLICIES,
+        default=ACCOUNT_POLICY_APP,
+        help="selection policy: app prefers Pro then Plus; cli allows Plus only; default: app",
     )
     apply_best_parser.set_defaults(func=cmd_apply_best)
 
