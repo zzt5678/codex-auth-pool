@@ -172,6 +172,93 @@ class RotationLogicTests(unittest.TestCase):
             self.assertFalse(state["quota_blocked"])
             self.assertNotEqual(state["state"], "blocked")
 
+    def test_runtime_limit_signal_can_exclude_active_goal_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = Path(tmp)
+            goal_rollout = sessions / "goal.jsonl"
+            desktop_rollout = sessions / "desktop.jsonl"
+            now = pool.now_local()
+            goal_rollout.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": now.isoformat(),
+                                "type": "event_msg",
+                                "payload": {"type": "token_count", "rate_limits": None},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": now.isoformat(),
+                                "type": "event_msg",
+                                "payload": {"type": "token_count", "rate_limits": None},
+                            }
+                        ),
+                    ]
+                )
+            )
+            desktop_rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": now.isoformat(),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "rate_limits": {
+                                "primary": {"used_percent": 20, "resets_at": now.timestamp()},
+                                "secondary": {"used_percent": 5, "resets_at": now.timestamp()},
+                            },
+                        },
+                    }
+                )
+            )
+
+            signal = pool.latest_runtime_limit_signal(
+                sessions,
+                state={},
+                max_age_minutes=30,
+                exclude_rollout_paths={goal_rollout},
+            )
+            self.assertIsNone(signal)
+            snapshot = pool.latest_rate_limit_snapshot(
+                sessions,
+                exclude_rollout_paths={goal_rollout},
+            )
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot.source_file, desktop_rollout)
+
+    def test_permanent_auth_failure_blocks_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = root / "profile.json"
+            pool.write_json(
+                profile,
+                {
+                    "tokens": {
+                        "access_token": "a",
+                        "refresh_token": "r",
+                        "id_token": "i",
+                        "account_id": "acct",
+                    }
+                },
+            )
+            pool.write_json(
+                pool.meta_path_for_profile(profile),
+                {
+                    "email": "bad@example.com",
+                    "account_id": "acct",
+                    "usage_error": "usage fetch failed with HTTP 401: Your authentication token has been invalidated. Please try signing in again.",
+                    "usage_error_checked_at": pool.now_local().isoformat(),
+                },
+            )
+
+            ranked = pool.rank_profiles(root / "missing-source", root, {}, root / "auth.json")
+            self.assertEqual(len(ranked), 1)
+            self.assertFalse(ranked[0]["available"])
+            self.assertTrue(ranked[0]["permanent_auth_failure"])
+            self.assertEqual(pool.profile_health(ranked[0]), "auth-invalidated")
+
 
 if __name__ == "__main__":
     unittest.main()

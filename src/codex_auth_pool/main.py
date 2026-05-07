@@ -2595,6 +2595,77 @@ def read_goal_threads_by_ids(*, codex_state_db: Path, thread_ids: set[str]) -> d
     return goals
 
 
+def _path_match_key(path: Path) -> str:
+    try:
+        return str(path.expanduser().resolve())
+    except OSError:
+        return str(path.expanduser().absolute())
+
+
+def _rollout_path_from_value(value: Any) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return Path(text)
+
+
+def _exclude_rollout_path_keys(paths: set[Path] | None) -> set[str]:
+    if not paths:
+        return set()
+    return {_path_match_key(path) for path in paths}
+
+
+def _session_file_is_excluded(path: Path, excluded_keys: set[str]) -> bool:
+    return bool(excluded_keys) and _path_match_key(path) in excluded_keys
+
+
+def active_goal_rollout_paths(
+    *,
+    codex_state_db: Path,
+    state: dict[str, Any] | None = None,
+    max_count: int = 20,
+) -> set[Path]:
+    """Rollouts owned by active CLI goals must not drive Desktop auth rotation."""
+    paths: set[Path] = set()
+    for goal in read_active_goal_threads(
+        codex_state_db=codex_state_db,
+        max_count=max_count,
+        statuses=("active", "paused"),
+    ):
+        rollout_path = _rollout_path_from_value(goal.get("rollout_path"))
+        if rollout_path is not None:
+            paths.add(rollout_path)
+
+    if isinstance(state, dict):
+        pending = state.get("pending_goal_resumes")
+        if isinstance(pending, dict):
+            for record in pending.values():
+                if not isinstance(record, dict):
+                    continue
+                runtime_state = record.get("runtime_state")
+                if isinstance(runtime_state, dict):
+                    rollout_path = _rollout_path_from_value(runtime_state.get("rollout_path"))
+                    if rollout_path is not None:
+                        paths.add(rollout_path)
+    return paths
+
+
+def trigger_source_matches_excluded_rollout(
+    trigger_source: str | None,
+    excluded_rollout_paths: set[Path] | None,
+) -> bool:
+    if not trigger_source or not excluded_rollout_paths:
+        return False
+    source_tail = str(trigger_source).rsplit(":", 1)[-1]
+    if not source_tail:
+        return False
+    excluded_names = {path.name for path in excluded_rollout_paths}
+    if source_tail in excluded_names:
+        return True
+    source_path = _rollout_path_from_value(source_tail)
+    return source_path is not None and _path_match_key(source_path) in _exclude_rollout_path_keys(excluded_rollout_paths)
+
+
 def _tail_json_events(path: Path, *, max_bytes: int = 2_000_000, max_events: int = 240) -> list[dict[str, Any]]:
     if not path.exists() or not path.is_file():
         return []
@@ -4163,12 +4234,21 @@ def auto_discover_new_profiles(
                 refresh_profile_usage(path)
                 refreshed.append(str(path))
             except SystemExit as exc:
-                failed.append({"profile": str(path), "error": str(exc)[:300]})
-                update_profile_metadata(
-                    path,
-                    usage_error_checked_at=now_local().isoformat(),
-                    usage_error=str(exc)[:300],
-                )
+                error = str(exc)
+                failed.append({"profile": str(path), "error": error[:300]})
+                metadata_updates: dict[str, Any] = {
+                    "usage_error_checked_at": now_local().isoformat(),
+                    "usage_error": error[:300],
+                }
+                if usage_error_is_permanent_auth_failure(error):
+                    metadata_updates.update(
+                        {
+                            "disabled": True,
+                            "disabled_reason": "auth_invalidated_relogin_required",
+                            "disabled_at": now_local().isoformat(),
+                        }
+                    )
+                update_profile_metadata(path, **metadata_updates)
 
     if synced or refreshed or failed:
         append_event(
@@ -4212,6 +4292,21 @@ def usage_error_blocks_current_account(error: str | None) -> bool:
         return False
     lowered = error.lower()
     return "token_expired" in lowered or "http 401" in lowered or "authentication token is expired" in lowered
+
+
+def usage_error_is_permanent_auth_failure(error: str | None) -> bool:
+    if not usage_error_blocks_current_account(error):
+        return False
+    lowered = str(error or "").lower()
+    permanent_markers = (
+        "token has been invalidated",
+        "please try signing in again",
+        "please log out and sign in again",
+        "refresh token was already used",
+        "sign in again",
+        "signing in again",
+    )
+    return any(marker in lowered for marker in permanent_markers)
 
 
 def clear_auth_token_expired_cooldown(state_path: Path, account_id: str | None, events_path: Path | None = None) -> bool:
@@ -4349,11 +4444,19 @@ def validate_profile_before_apply(
         clear_auth_token_expired_cooldown(state_path, refreshed_summary.account_id, events_path)
     except SystemExit as exc:
         error = str(exc)
-        update_profile_metadata(
-            profile_path,
-            usage_error_checked_at=now_local().isoformat(),
-            usage_error=error[:300],
-        )
+        metadata_updates: dict[str, Any] = {
+            "usage_error_checked_at": now_local().isoformat(),
+            "usage_error": error[:300],
+        }
+        if usage_error_is_permanent_auth_failure(error):
+            metadata_updates.update(
+                {
+                    "disabled": True,
+                    "disabled_reason": "auth_invalidated_relogin_required",
+                    "disabled_at": now_local().isoformat(),
+                }
+            )
+        update_profile_metadata(profile_path, **metadata_updates)
         reason = "auth_token_expired" if usage_error_blocks_current_account(error) else "usage_refresh_failed"
         if reason == "auth_token_expired" and summary.account_id:
             set_cooldown_by_account_id(
@@ -4405,11 +4508,13 @@ def current_limits_for_display(
     state: dict[str, Any],
     *,
     max_age_minutes: int,
+    exclude_rollout_paths: set[Path] | None = None,
 ) -> dict[str, Any] | None:
     runtime_limit_signal = latest_runtime_limit_signal(
         sessions_dir,
         state=state,
         max_age_minutes=max_age_minutes,
+        exclude_rollout_paths=exclude_rollout_paths,
     )
     current_usage, usage_note = current_profile_usage_snapshot(
         source_dir,
@@ -4444,7 +4549,10 @@ def current_limits_for_display(
             "note": None,
         }
 
-    snapshot = latest_rate_limit_snapshot(sessions_dir)
+    snapshot = latest_rate_limit_snapshot(
+        sessions_dir,
+        exclude_rollout_paths=exclude_rollout_paths,
+    )
     if snapshot is not None and rate_limit_snapshot_is_usable(
         snapshot,
         state=state,
@@ -4525,6 +4633,7 @@ def fetch_remote_usage_for_payload(payload: dict[str, Any]) -> RemoteUsageSnapsh
 
 def refresh_profile_usage(path: Path) -> dict[str, Any]:
     payload = read_json(path)
+    existing_meta = read_profile_metadata(path)
     snapshot = fetch_remote_usage_for_payload(payload)
     updates = {
         "observed_account_id": snapshot.account_id,
@@ -4543,6 +4652,14 @@ def refresh_profile_usage(path: Path) -> dict[str, Any]:
         "usage_error_checked_at": None,
         "usage_error": None,
     }
+    if existing_meta.get("disabled_reason") == "auth_invalidated_relogin_required":
+        updates.update(
+            {
+                "disabled": None,
+                "disabled_reason": None,
+                "disabled_at": None,
+            }
+        )
     return update_profile_metadata(path, **updates)
 
 
@@ -4554,8 +4671,15 @@ def iter_recent_session_files(sessions_dir: Path, limit: int = 30) -> list[Path]
     return files[:limit]
 
 
-def latest_rate_limit_snapshot(sessions_dir: Path) -> RateLimitSnapshot | None:
+def latest_rate_limit_snapshot(
+    sessions_dir: Path,
+    *,
+    exclude_rollout_paths: set[Path] | None = None,
+) -> RateLimitSnapshot | None:
+    excluded_keys = _exclude_rollout_path_keys(exclude_rollout_paths)
     for path in iter_recent_session_files(sessions_dir):
+        if _session_file_is_excluded(path, excluded_keys):
+            continue
         try:
             lines = path.read_text().splitlines()
         except UnicodeDecodeError:
@@ -4643,9 +4767,13 @@ def latest_runtime_limit_signal(
     *,
     state: dict[str, Any],
     max_age_minutes: int,
+    exclude_rollout_paths: set[Path] | None = None,
 ) -> RuntimeLimitSignal | None:
+    excluded_keys = _exclude_rollout_path_keys(exclude_rollout_paths)
     newest: tuple[datetime, RuntimeLimitSignal] | None = None
     for path in iter_recent_session_files(sessions_dir):
+        if _session_file_is_excluded(path, excluded_keys):
+            continue
         try:
             lines = path.read_text().splitlines()
         except UnicodeDecodeError:
@@ -4795,8 +4923,12 @@ def rank_profiles(
         expired = parse_dt(summary.expired)
         weekly = effective_reset_at_for_profile(path, summary)
         remote_block_until, remote_block_reason = observed_block_until_for_profile(path, now=now)
+        permanent_auth_failure = usage_error_is_permanent_auth_failure(
+            str(read_profile_metadata(path).get("usage_error") or "")
+        )
         available = (
             not summary.disabled
+            and not permanent_auth_failure
             and (expired is None or expired > now)
             and (cd_until is None or cd_until <= now)
             and (limit_reset is None or limit_reset <= now)
@@ -4812,6 +4944,7 @@ def rank_profiles(
             "limit_reason": limit_reason_for_profile(path),
             "remote_block_until": remote_block_until,
             "remote_block_reason": remote_block_reason,
+            "permanent_auth_failure": permanent_auth_failure,
             "is_current": summary.account_id == current_account,
             "is_preferred_next": summary.account_id == preferred_next,
             "weekly_sort": weekly,
@@ -4868,6 +5001,8 @@ def profile_block_reasons(item: dict[str, Any], *, now: datetime | None = None) 
     reasons: list[str] = []
     if summary.disabled:
         reasons.append("source disabled")
+    if item.get("permanent_auth_failure"):
+        reasons.append("auth invalidated; re-login required")
     expired = parse_dt(summary.expired)
     if expired is not None and expired <= now:
         reasons.append(f"auth expired at {fmt_dt(expired)}")
@@ -4894,7 +5029,7 @@ def next_unblock_hint(ranked: list[dict[str, Any]], *, exclude_current: bool = T
             continue
         summary: ProfileSummary = item["summary"]
         expired = parse_dt(summary.expired)
-        if summary.disabled or (expired is not None and expired <= now):
+        if summary.disabled or item.get("permanent_auth_failure") or (expired is not None and expired <= now):
             continue
         times = [
             item.get("cooldown_until"),
@@ -4917,6 +5052,8 @@ def profile_health(item: dict[str, Any]) -> str:
     now = now_local()
     if summary.disabled:
         return "disabled"
+    if item.get("permanent_auth_failure"):
+        return "auth-invalidated"
     expired = parse_dt(summary.expired)
     if expired is not None and expired <= now:
         return "auth-expired"
@@ -4977,6 +5114,10 @@ def build_pool_report(args: argparse.Namespace, *, discover: bool = True) -> dic
     target_path = Path(args.target)
     ranked = rank_profiles(args.source_dir, args.managed_dir, state, target_path)
     current_summary = current_account_summary(target_path, args.source_dir, args.managed_dir)
+    excluded_goal_rollouts = active_goal_rollout_paths(
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        state=state,
+    )
     limits = current_limits_for_display(
         args.source_dir,
         args.managed_dir,
@@ -4984,6 +5125,7 @@ def build_pool_report(args: argparse.Namespace, *, discover: bool = True) -> dic
         args.sessions_dir,
         state,
         max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+        exclude_rollout_paths=excluded_goal_rollouts,
     )
     current_item = next((item for item in ranked if item["is_current"]), None)
     next_item = next((item for item in ranked if item["available"] and not item["is_current"]), None)
@@ -5065,6 +5207,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"no auth profiles found in {args.source_dir} or {args.managed_dir}")
         return 0
 
+    excluded_goal_rollouts = active_goal_rollout_paths(
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        state=state,
+    )
     limits = current_limits_for_display(
         args.source_dir,
         args.managed_dir,
@@ -5072,6 +5218,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         args.sessions_dir,
         state,
         max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+        exclude_rollout_paths=excluded_goal_rollouts,
     )
     current_summary = current_account_summary(Path(args.target), args.source_dir, args.managed_dir)
     current_item = next((item for item in ranked if item["is_current"]), None)
@@ -5226,6 +5373,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             flags.append("current")
         if summary.disabled:
             flags.append("source-disabled")
+        if item.get("permanent_auth_failure"):
+            flags.append("auth-invalidated")
         active_cooldown = item["cooldown_until"] is not None and item["cooldown_until"] > now_local()
         if active_cooldown:
             flags.append(f"cooldown_until={item['cooldown_until'].isoformat()}")
@@ -6658,6 +6807,10 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     current_summary = current_account_summary(Path(args.target), args.source_dir, args.managed_dir)
     state_payload = load_state(args.state_path)
+    excluded_goal_rollouts = active_goal_rollout_paths(
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        state=state_payload,
+    )
     limits = current_limits_for_display(
         args.source_dir,
         args.managed_dir,
@@ -6665,6 +6818,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         args.sessions_dir,
         state_payload,
         max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+        exclude_rollout_paths=excluded_goal_rollouts,
     )
     ranked = rank_profiles(args.source_dir, args.managed_dir, state_payload, Path(args.target))
     next_profile = next((item for item in ranked if item["available"] and not item["is_current"]), None)
@@ -6789,6 +6943,23 @@ def collect_fix_actions(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "profiles": missing_meta,
             }
         )
+
+    invalid_profiles = []
+    for path in discover_managed_profiles(args.managed_dir):
+        summary = summarize_profile(path)
+        if summary.disabled:
+            continue
+        usage_error = str(read_profile_metadata(path).get("usage_error") or "")
+        if usage_error_is_permanent_auth_failure(usage_error):
+            invalid_profiles.append(str(path))
+    if invalid_profiles:
+        actions.append(
+            {
+                "type": "disable-invalid-auth-profiles",
+                "description": "Disable managed profiles whose auth token was invalidated and requires re-login",
+                "profiles": invalid_profiles,
+            }
+        )
     return actions
 
 
@@ -6828,6 +6999,23 @@ def apply_fix_actions(args: argparse.Namespace, actions: list[dict[str, Any]]) -
                 write_json(meta_path_for_profile(path), metadata_for_profile(normalized, path))
                 created.append(str(path))
             applied.append({**action, "created": created})
+        elif action_type == "disable-invalid-auth-profiles":
+            disabled: list[str] = []
+            for profile in action.get("profiles", []):
+                path = Path(str(profile))
+                if not path.exists():
+                    continue
+                usage_error = str(read_profile_metadata(path).get("usage_error") or "")
+                if not usage_error_is_permanent_auth_failure(usage_error):
+                    continue
+                update_profile_metadata(
+                    path,
+                    disabled=True,
+                    disabled_reason="auth_invalidated_relogin_required",
+                    disabled_at=now_local().isoformat(),
+                )
+                disabled.append(str(path))
+            applied.append({**action, "disabled": disabled})
     if applied:
         append_event(args.events_path, "fix_apply", applied_count=len(applied), actions=applied)
     return applied
@@ -6868,6 +7056,10 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     ranked = rank_profiles(args.source_dir, args.managed_dir, state, target_path)
     current_item = next((item for item in ranked if item["is_current"]), None)
     next_item = next((item for item in ranked if item["available"] and not item["is_current"]), None)
+    excluded_goal_rollouts = active_goal_rollout_paths(
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        state=state,
+    )
     limits = current_limits_for_display(
         args.source_dir,
         args.managed_dir,
@@ -6875,6 +7067,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         args.sessions_dir,
         state,
         max_age_minutes=DEFAULT_USAGE_MAX_AGE_MINUTES,
+        exclude_rollout_paths=excluded_goal_rollouts,
     )
     auth_state = active_auth_file_state(target_path)
     background = background_service_status()
@@ -7636,9 +7829,20 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         )
 
     state = load_state(args.state_path)
+    excluded_goal_rollouts = active_goal_rollout_paths(
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        state=state,
+    )
     pending_rotation = state.get("pending_rotation")
     if isinstance(pending_rotation, dict) and pending_rotation.get("account_id") and pending_rotation.get("account_id") != current_account:
         clear_pending_rotation(args.state_path, args.events_path, reason="current_account_changed")
+        state = load_state(args.state_path)
+        pending_rotation = state.get("pending_rotation")
+    if isinstance(pending_rotation, dict) and trigger_source_matches_excluded_rollout(
+        str(pending_rotation.get("trigger_source") or ""),
+        excluded_goal_rollouts,
+    ):
+        clear_pending_rotation(args.state_path, args.events_path, reason="excluded_active_goal_signal")
         state = load_state(args.state_path)
         pending_rotation = state.get("pending_rotation")
     if isinstance(pending_rotation, dict) and pending_rotation.get("account_id") == current_account:
@@ -7778,11 +7982,15 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             pending=True,
         )
 
-    snapshot = latest_rate_limit_snapshot(args.sessions_dir)
+    snapshot = latest_rate_limit_snapshot(
+        args.sessions_dir,
+        exclude_rollout_paths=excluded_goal_rollouts,
+    )
     runtime_limit_signal = latest_runtime_limit_signal(
         args.sessions_dir,
         state=state,
         max_age_minutes=args.usage_max_age_minutes,
+        exclude_rollout_paths=excluded_goal_rollouts,
     )
     current_usage, usage_note = current_profile_usage_snapshot(
         args.source_dir,
