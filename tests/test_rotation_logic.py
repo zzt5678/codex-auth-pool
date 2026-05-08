@@ -263,6 +263,37 @@ class RotationLogicTests(unittest.TestCase):
             self.assertIsNotNone(snapshot)
             self.assertEqual(snapshot.source_file, desktop_rollout)
 
+    def test_large_rollout_scan_uses_tail_and_finds_recent_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = Path(tmp)
+            rollout = sessions / "large.jsonl"
+            now = pool.now_local()
+            with rollout.open("w", encoding="utf-8") as handle:
+                handle.write("x" * (pool.DEFAULT_ROLLOUT_TAIL_BYTES + 1024))
+                handle.write("\n")
+                handle.write(
+                    json.dumps(
+                        {
+                            "timestamp": now.isoformat(),
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "rate_limits": {
+                                    "primary": {"used_percent": 12, "resets_at": now.timestamp()},
+                                    "secondary": {"used_percent": 34, "resets_at": now.timestamp()},
+                                },
+                            },
+                        }
+                    )
+                )
+                handle.write("\n")
+
+            lines = pool.read_tail_lines(rollout, max_bytes=2048)
+            self.assertLess(sum(len(line) for line in lines), 4096)
+            snapshot = pool.latest_rate_limit_snapshot(sessions)
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot.primary_used_percent, 12.0)
+
     def test_permanent_auth_failure_blocks_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

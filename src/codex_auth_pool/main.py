@@ -59,6 +59,7 @@ DEFAULT_ENV_SNAPSHOTS_DIR = Path.home() / ".codex-auth-pool" / "env-snapshots"
 DEFAULT_SESSION_RECOVERY_DIR = Path.home() / ".codex-auth-pool" / "session-recovery"
 DEFAULT_TICK_LOCK_PATH = Path.home() / ".codex-auth-pool" / "run" / "tick.lock"
 DEFAULT_APPLY_LOCK_PATH = Path.home() / ".codex-auth-pool" / "run" / "apply.lock"
+DEFAULT_ROLLOUT_TAIL_BYTES = 2 * 1024 * 1024
 DEFAULT_CODEX_APP = Path("/Applications/Codex.app") if platform.system() == "Darwin" else Path("")
 DEFAULT_LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 DEFAULT_LAUNCHD_LABEL = "ai.codex.auth.pool"
@@ -286,6 +287,29 @@ def read_json(path: Path) -> dict[str, Any]:
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def read_tail_lines(path: Path, *, max_bytes: int = DEFAULT_ROLLOUT_TAIL_BYTES) -> list[str]:
+    """Read only the tail of large jsonl/log files.
+
+    Codex rollout logs can grow to hundreds of MB. The daemon only needs recent
+    events for quota/session decisions, so reading the whole file makes the
+    background agent unnecessarily heavy.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(-max_bytes, os.SEEK_END)
+                data = handle.read(max_bytes)
+                first_newline = data.find(b"\n")
+                if first_newline >= 0:
+                    data = data[first_newline + 1 :]
+            else:
+                data = handle.read()
+    except OSError:
+        return []
+    return data.decode("utf-8", errors="ignore").splitlines()
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -816,7 +840,7 @@ def recent_interrupted_capture_summary(events_path: Path) -> dict[str, Any] | No
 def read_recent_log_line(path: Path) -> str | None:
     if not path.exists():
         return None
-    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    lines = read_tail_lines(path, max_bytes=64 * 1024)
     for line in reversed(lines):
         stripped = line.strip()
         if stripped:
@@ -1846,10 +1870,7 @@ def pending_tool_calls_at(session: InterruptedSession, captured_at: datetime) ->
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
         return []
-    try:
-        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return []
+    lines = read_tail_lines(rollout_path)
 
     pending: dict[str, dict[str, Any]] = {}
     call_summaries: dict[str, dict[str, Any]] = {}
@@ -1939,10 +1960,7 @@ def session_uses_desktop_browser(session: InterruptedSession, captured_at: datet
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
         return False
-    try:
-        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return False
+    lines = read_tail_lines(rollout_path)
 
     for raw_line in reversed(lines):
         try:
@@ -1964,10 +1982,7 @@ def recent_rollout_context(session: InterruptedSession, captured_at: datetime, l
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
         return []
-    try:
-        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return []
+    lines = read_tail_lines(rollout_path)
 
     context_lines: list[str] = []
     for raw_line in reversed(lines):
@@ -2022,10 +2037,7 @@ def session_was_in_progress_at(session: InterruptedSession, captured_at: datetim
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
         return False
-    try:
-        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return False
+    lines = read_tail_lines(rollout_path)
 
     for raw_line in reversed(lines):
         try:
@@ -2054,10 +2066,7 @@ def session_has_terminal_end_marker_at(session: InterruptedSession, captured_at:
     rollout_path = Path(session.rollout_path)
     if not rollout_path.exists() or not rollout_path.is_file():
         return False
-    try:
-        lines = rollout_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return False
+    lines = read_tail_lines(rollout_path)
     for raw_line in reversed(lines):
         try:
             event = json.loads(raw_line)
@@ -3391,10 +3400,7 @@ def _resume_log_has_activity(text: str) -> bool:
 def _rollout_has_activity_since(path: Path, started_at: datetime) -> bool:
     if not path.exists() or not path.is_file():
         return False
-    try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return False
+    lines = read_tail_lines(path)
     for raw in reversed(lines):
         try:
             event = json.loads(raw)
@@ -3735,9 +3741,7 @@ def write_launchd_plist(
                 if active_goal_resume_prompt_file
                 else []
             ),
-            "daemon",
-            "--interval-seconds",
-            str(interval_seconds),
+            "tick",
             "--primary-threshold",
             str(primary_threshold),
             "--secondary-threshold",
@@ -3753,7 +3757,7 @@ def write_launchd_plist(
         + ([] if resume_active_goals else ["--no-resume-active-goals"]),
         "WorkingDirectory": str(Path.home()),
         "RunAtLoad": True,
-        "KeepAlive": True,
+        "StartInterval": max(15, int(interval_seconds)),
         "ProcessType": "Background",
         "ThrottleInterval": 10,
         "StandardOutPath": str(stdout_path),
@@ -4732,10 +4736,7 @@ def latest_rate_limit_snapshot(
     for path in iter_recent_session_files(sessions_dir):
         if _session_file_is_excluded(path, excluded_keys):
             continue
-        try:
-            lines = path.read_text().splitlines()
-        except UnicodeDecodeError:
-            continue
+        lines = read_tail_lines(path)
         for raw in reversed(lines):
             try:
                 event = json.loads(raw)
@@ -4826,10 +4827,7 @@ def latest_runtime_limit_signal(
     for path in iter_recent_session_files(sessions_dir):
         if _session_file_is_excluded(path, excluded_keys):
             continue
-        try:
-            lines = path.read_text().splitlines()
-        except UnicodeDecodeError:
-            continue
+        lines = read_tail_lines(path)
         null_token_count_run = 0
         file_signal: RuntimeLimitSignal | None = None
         for raw in reversed(lines):
