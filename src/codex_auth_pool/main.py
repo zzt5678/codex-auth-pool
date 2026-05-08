@@ -41,11 +41,14 @@ except ImportError:  # pragma: no cover - Windows fallback
 
 
 DEFAULT_CLIPROXY_DIR = Path.home() / ".cli-proxy-api"
+DEFAULT_CODEX_HOME = Path.home() / ".codex"
 DEFAULT_CODEX_AUTH_PATH = Path.home() / ".codex" / "cache" / "auth.json"
 DEFAULT_CODEX_ROOT_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DEFAULT_CODEX_STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
 DEFAULT_CODEX_LOGS_DB = Path.home() / ".codex" / "logs_2.sqlite"
+DEFAULT_CLI_PLUS_HOME = Path.home() / ".codex-auth-pool" / "cli-plus-home"
+DEFAULT_CLI_PLUS_BIN = Path.home() / ".local" / "bin" / "codex-plus"
 DEFAULT_EXPORT_DIR = Path.home() / ".codex-auth-pool" / "exports"
 DEFAULT_MANAGED_DIR = Path.home() / ".codex-auth-pool" / "profiles"
 DEFAULT_SOURCE_META_DIR = Path.home() / ".codex-auth-pool" / "source-meta"
@@ -76,6 +79,7 @@ ENV_VAR_MAP = {
     "session_recovery_dir": "CODEX_AUTH_POOL_SESSION_RECOVERY_DIR",
     "target": "CODEX_AUTH_POOL_TARGET",
     "sessions_dir": "CODEX_AUTH_POOL_SESSIONS_DIR",
+    "cli_plus_home": "CODEX_AUTH_POOL_CLI_PLUS_HOME",
     "codex_state_db": "CODEX_AUTH_POOL_CODEX_STATE_DB",
     "codex_logs_db": "CODEX_AUTH_POOL_CODEX_LOGS_DB",
     "app_path": "CODEX_AUTH_POOL_APP_PATH",
@@ -91,6 +95,7 @@ DEFAULT_ARG_VALUES = {
     "session_recovery_dir": DEFAULT_SESSION_RECOVERY_DIR,
     "target": str(DEFAULT_CODEX_AUTH_PATH),
     "sessions_dir": DEFAULT_CODEX_SESSIONS_DIR,
+    "cli_plus_home": DEFAULT_CLI_PLUS_HOME,
     "codex_state_db": DEFAULT_CODEX_STATE_DB,
     "codex_logs_db": DEFAULT_CODEX_LOGS_DB,
     "app_path": str(DEFAULT_CODEX_APP),
@@ -6241,6 +6246,166 @@ def cmd_apply_best(args: argparse.Namespace) -> int:
     return cmd_apply(args)
 
 
+CLI_PLUS_SHARED_NAMES = (
+    "AGENTS.md",
+    "RTK.md",
+    "config.toml",
+    "history.jsonl",
+    "installation_id",
+    "keybindings.json",
+    "logs_2.sqlite",
+    "logs_2.sqlite-shm",
+    "logs_2.sqlite-wal",
+    "models_cache.json",
+    "session_index.jsonl",
+    "state_5.sqlite",
+    "state_5.sqlite-shm",
+    "state_5.sqlite-wal",
+    "version.json",
+    "archived_sessions",
+    "automations",
+    "memories",
+    "plugins",
+    "rules",
+    "sessions",
+    "skills",
+)
+
+
+def cli_plus_auth_paths(cli_home: Path) -> list[Path]:
+    root = cli_home.expanduser()
+    return [root / "auth.json", root / "cache" / "auth.json"]
+
+
+def _symlink_points_to(path: Path, target: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        return path.resolve() == target.resolve()
+    except FileNotFoundError:
+        return False
+
+
+def sync_cli_plus_shared_state(
+    *,
+    cli_home: Path,
+    source_codex_home: Path = DEFAULT_CODEX_HOME,
+) -> list[str]:
+    cli_home = cli_home.expanduser()
+    source_codex_home = source_codex_home.expanduser()
+    cli_home.mkdir(parents=True, exist_ok=True)
+    linked: list[str] = []
+    for name in CLI_PLUS_SHARED_NAMES:
+        source = source_codex_home / name
+        dest = cli_home / name
+        if not source.exists() and not source.is_symlink():
+            continue
+        if dest.exists() or dest.is_symlink():
+            if _symlink_points_to(dest, source):
+                linked.append(name)
+            continue
+        dest.symlink_to(source, target_is_directory=source.is_dir())
+        linked.append(name)
+    return linked
+
+
+def select_cli_plus_profile(args: argparse.Namespace) -> tuple[Path, ProfileSummary]:
+    auto_discover_new_profiles(
+        args.source_dir,
+        args.managed_dir,
+        args.events_path,
+        refresh_missing_usage=True,
+        max_age_minutes=getattr(args, "usage_max_age_minutes", DEFAULT_USAGE_MAX_AGE_MINUTES),
+    )
+    state = load_state(args.state_path)
+    for candidate in rank_profiles(
+        args.source_dir,
+        args.managed_dir,
+        state,
+        Path(args.target),
+        account_policy=ACCOUNT_POLICY_CLI,
+    ):
+        if not candidate["available"]:
+            continue
+        validation_ok, validation_error = validate_profile_before_apply(
+            args,
+            candidate["path"],
+            apply_source="cli",
+        )
+        if validation_ok:
+            return candidate["path"], candidate["summary"]
+        print(f"skipped CLI candidate {candidate['summary'].email or candidate['summary'].account_id}: {validation_error}")
+    raise SystemExit("no currently available Plus profile for CLI")
+
+
+def prepare_cli_plus_home(args: argparse.Namespace) -> tuple[Path, ProfileSummary, Path, list[Path], list[str]]:
+    profile_path, summary = select_cli_plus_profile(args)
+    normalized = normalize_source_payload(profile_path, read_json(profile_path))
+    payload = convert_profile(normalized)
+    cli_home = Path(getattr(args, "cli_plus_home", DEFAULT_CLI_PLUS_HOME)).expanduser()
+    auth_paths = cli_plus_auth_paths(cli_home)
+    for auth_path in auth_paths:
+        write_json(auth_path, payload)
+    linked = sync_cli_plus_shared_state(
+        cli_home=cli_home,
+        source_codex_home=Path(getattr(args, "source_codex_home", DEFAULT_CODEX_HOME)).expanduser(),
+    )
+    append_event(
+        args.events_path,
+        "cli_plus_home_prepared",
+        cli_home=str(cli_home),
+        profile=str(profile_path),
+        email=summary.email,
+        account_id=summary.account_id,
+        plan_type=summary.plan_type,
+        auth_paths=[str(path) for path in auth_paths],
+        linked=linked,
+    )
+    return profile_path, summary, cli_home, auth_paths, linked
+
+
+def cmd_cli_prepare(args: argparse.Namespace) -> int:
+    profile_path, summary, cli_home, auth_paths, linked = prepare_cli_plus_home(args)
+    print("prepared Plus-only Codex CLI home")
+    print(f"  profile: {profile_path.name}")
+    print(f"  account: {summary.email or summary.account_id}")
+    print(f"  plan: {summary.plan_type or 'unknown'}")
+    print(f"  CODEX_HOME: {cli_home}")
+    for auth_path in auth_paths:
+        print(f"  auth: {auth_path}")
+    print(f"  shared state links: {len(linked)}")
+    print("run CLI with: codex-plus")
+    return 0
+
+
+def cmd_cli_run(args: argparse.Namespace) -> int:
+    _, summary, cli_home, _, _ = prepare_cli_plus_home(args)
+    codex_args = list(getattr(args, "codex_args", []) or [])
+    if codex_args and codex_args[0] == "--":
+        codex_args = codex_args[1:]
+    codex_bin = shutil.which("codex")
+    if codex_bin is None:
+        raise SystemExit("codex command not found in PATH")
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(cli_home)
+    env.setdefault("CODEX_AUTH_POOL_CLI_ACCOUNT", summary.account_id)
+    return subprocess.call([codex_bin, *codex_args], env=env)
+
+
+def cmd_install_cli_wrapper(args: argparse.Namespace) -> int:
+    bin_path = Path(getattr(args, "bin_path", DEFAULT_CLI_PLUS_BIN)).expanduser()
+    bin_path.parent.mkdir(parents=True, exist_ok=True)
+    bin_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'exec "${CODEX_AUTH_POOL_BIN:-codex-auth-pool}" cli-run -- "$@"\n'
+    )
+    bin_path.chmod(0o755)
+    print(f"installed Plus-only CLI wrapper: {bin_path}")
+    print("use it with: codex-plus")
+    return 0
+
+
 def cmd_cooldown(args: argparse.Namespace) -> int:
     profile_path = pick_profile(args.source_dir, args.managed_dir, args.profile)
     summary = summarize_profile(profile_path)
@@ -8598,6 +8763,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Codex sessions directory (default: {DEFAULT_CODEX_SESSIONS_DIR})",
     )
     parser.add_argument(
+        "--cli-plus-home",
+        type=Path,
+        default=DEFAULT_CLI_PLUS_HOME,
+        help=f"isolated CODEX_HOME used by the Plus-only CLI wrapper (default: {DEFAULT_CLI_PLUS_HOME})",
+    )
+    parser.add_argument(
         "--codex-state-db",
         type=Path,
         default=DEFAULT_CODEX_STATE_DB,
@@ -9125,6 +9296,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="selection policy: app prefers Pro then Plus; cli allows Plus only; default: app",
     )
     apply_best_parser.set_defaults(func=cmd_apply_best)
+
+    cli_prepare_parser = subparsers.add_parser(
+        "cli-prepare",
+        help="prepare an isolated CODEX_HOME that uses the best available Plus account",
+    )
+    cli_prepare_parser.add_argument(
+        "--usage-max-age-minutes",
+        type=int,
+        default=DEFAULT_USAGE_MAX_AGE_MINUTES,
+        help="avoid retrying failed initial usage observations newer than this many minutes",
+    )
+    cli_prepare_parser.add_argument(
+        "--source-codex-home",
+        type=Path,
+        default=DEFAULT_CODEX_HOME,
+        help=f"Codex home whose sessions/config/plugins are shared into CLI home (default: {DEFAULT_CODEX_HOME})",
+    )
+    cli_prepare_parser.set_defaults(func=cmd_cli_prepare)
+
+    cli_run_parser = subparsers.add_parser(
+        "cli-run",
+        help="run codex with an isolated Plus-only CODEX_HOME; use through codex-plus",
+    )
+    cli_run_parser.add_argument(
+        "--usage-max-age-minutes",
+        type=int,
+        default=DEFAULT_USAGE_MAX_AGE_MINUTES,
+        help="avoid retrying failed initial usage observations newer than this many minutes",
+    )
+    cli_run_parser.add_argument(
+        "--source-codex-home",
+        type=Path,
+        default=DEFAULT_CODEX_HOME,
+        help=f"Codex home whose sessions/config/plugins are shared into CLI home (default: {DEFAULT_CODEX_HOME})",
+    )
+    cli_run_parser.add_argument("codex_args", nargs=argparse.REMAINDER, help="arguments forwarded to codex")
+    cli_run_parser.set_defaults(func=cmd_cli_run)
+
+    install_cli_wrapper_parser = subparsers.add_parser(
+        "install-cli-wrapper",
+        help="install codex-plus, a Plus-only Codex CLI wrapper",
+    )
+    install_cli_wrapper_parser.add_argument(
+        "--bin-path",
+        type=Path,
+        default=DEFAULT_CLI_PLUS_BIN,
+        help=f"wrapper path (default: {DEFAULT_CLI_PLUS_BIN})",
+    )
+    install_cli_wrapper_parser.set_defaults(func=cmd_install_cli_wrapper)
 
     cooldown_parser = subparsers.add_parser(
         "cooldown",

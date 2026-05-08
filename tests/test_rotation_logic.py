@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import sys
 import tempfile
 import unittest
@@ -42,6 +43,7 @@ class RotationLogicTests(unittest.TestCase):
                 "account_id": account_id,
                 "observed_plan_type": plan_type,
                 "disabled": disabled,
+                "usage_checked_at": pool.now_local().isoformat(),
             },
         )
         return path
@@ -354,6 +356,64 @@ class RotationLogicTests(unittest.TestCase):
             self.assertFalse(allowed)
             self.assertEqual(tier, "pro")
             self.assertEqual(reason, "cli_goal_resume_requires_plus")
+
+    def test_cli_plus_home_is_isolated_and_selects_plus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = root / "managed"
+            managed.mkdir()
+            self.write_profile(managed, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
+            self.write_profile(managed, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+
+            global_home = root / "global-codex"
+            (global_home / "cache").mkdir(parents=True)
+            (global_home / "sessions").mkdir()
+            (global_home / "config.toml").write_text("model = \"gpt-5.5\"\n")
+            global_auth = {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": None,
+                "tokens": {
+                    "access_token": "global-a",
+                    "refresh_token": "global-r",
+                    "id_token": "global-i",
+                    "account_id": "pro-acct",
+                },
+            }
+            pool.write_json(global_home / "cache" / "auth.json", global_auth)
+
+            args = argparse.Namespace(
+                source_dir=root / "missing-source",
+                managed_dir=managed,
+                events_path=root / "events.jsonl",
+                state_path=root / "state.json",
+                target=str(global_home / "cache" / "auth.json"),
+                usage_max_age_minutes=pool.DEFAULT_USAGE_MAX_AGE_MINUTES,
+                skip_usage_validation=True,
+                cli_plus_home=root / "cli-plus-home",
+                source_codex_home=global_home,
+            )
+
+            _, summary, cli_home, auth_paths, linked = pool.prepare_cli_plus_home(args)
+
+            self.assertEqual(summary.email, "plus@example.com")
+            self.assertEqual(pool.read_json(global_home / "cache" / "auth.json"), global_auth)
+            self.assertTrue((cli_home / "config.toml").is_symlink())
+            self.assertTrue((cli_home / "sessions").is_symlink())
+            self.assertIn("config.toml", linked)
+            self.assertIn("sessions", linked)
+            for auth_path in auth_paths:
+                payload = pool.read_json(auth_path)
+                self.assertEqual(payload["tokens"]["account_id"], "plus-acct")
+                self.assertEqual(payload["auth_mode"], "chatgpt")
+
+    def test_install_cli_wrapper_writes_codex_plus_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "bin" / "codex-plus"
+            result = pool.cmd_install_cli_wrapper(argparse.Namespace(bin_path=bin_path))
+            self.assertEqual(result, 0)
+            self.assertTrue(bin_path.exists())
+            self.assertTrue(bin_path.stat().st_mode & 0o111)
+            self.assertIn("codex-auth-pool", bin_path.read_text())
 
 
 if __name__ == "__main__":

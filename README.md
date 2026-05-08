@@ -56,6 +56,8 @@ when you need an emergency manual switch.
 - Auto-cool down exhausted accounts and switch to the next available one.
 - App/Desktop automatic rotation uses an app policy: available Pro accounts rank before Plus accounts; if every Pro account is blocked or exhausted, it falls back to Plus.
 - CLI goal recovery is Plus-only: automatic `codex resume <thread_id>` is skipped while the active auth is Pro, so long-running CLI goal recovery does not consume Pro quota.
+- Provide `codex-plus`: manual CLI work can run under an isolated Plus-only `CODEX_HOME` without overwriting the auth currently used by Codex Desktop.
+- `codex-plus` shares `~/.codex` sessions, plugins, skills, and config, so `codex resume` and installed plugins do not need a second setup.
 - Treat an expired current auth token (`HTTP 401 token_expired`) as an unusable account and rotate away instead of trusting stale quota snapshots.
 - Treat runtime limit signals from Codex session logs (`usage_limit_exceeded`, `rate_limit_reached_type`, or repeated `rate_limits=null`) as real exhaustion even when the displayed percentage is not exactly 100%.
 - Restart Codex Desktop automatically after switching on macOS.
@@ -123,6 +125,24 @@ This will:
 - import `cliproxyapi` accounts if found
 - install the background rotator if requested
 
+### 2.1 Run CLI work on Plus only
+
+The installer also provides `codex-plus`:
+
+```bash
+codex-plus
+codex-plus resume <thread_id>
+codex-plus --version
+```
+
+Before launching official `codex`, it selects the best currently available Plus account and writes auth only into `~/.codex-auth-pool/cli-plus-home` via `CODEX_HOME`. It does not overwrite the Desktop auth files at `~/.codex/auth.json` or `~/.codex/cache/auth.json`.
+
+To prepare the isolated home without launching CLI:
+
+```bash
+codex-auth-pool cli-prepare
+```
+
 ### 3. Open the dashboard
 
 ```bash
@@ -174,7 +194,7 @@ codex-auth-pool events --limit 10
 python -m unittest discover -s tests
 ```
 
-The test suite covers the core rotation threshold rules, runtime quota signals, Browser Use active-session protection, temporary candidate cooldown after usage-refresh failures, and CLI goal blocker classification.
+The test suite covers the core rotation threshold rules, runtime quota signals, Browser Use active-session protection, temporary candidate cooldown after usage-refresh failures, CLI goal blocker classification, and `codex-plus` isolated-home behavior.
 
 ## Token Usage And Cost Estimate
 
@@ -287,12 +307,12 @@ The rotator prefers accounts that are:
 4. not currently blocked by an observed remote limit window
 5. allowed by the current policy
 6. for App/Desktop automatic rotation: Pro before Plus before unknown
-7. for CLI goal recovery: Plus only
+7. for CLI goal recovery and `codex-plus`: Plus only
 8. earliest observed weekly reset time
 9. otherwise earliest profile `weekly_reset_at`
 10. then most recent usable auth metadata
 
-This policy does not proactively restart Codex just because a Pro account appears. It only changes which account is selected when an existing quota/auth trigger already requires a switch, preserving the existing no-surprise restart behavior. Manual `apply-best` uses the App/Desktop policy by default; use `codex-auth-pool apply-best --account-policy cli` if you explicitly want to pick the best Plus-only candidate.
+This policy does not proactively restart Codex just because a Pro account appears. It only changes which account is selected when an existing quota/auth trigger already requires a switch, preserving the existing no-surprise restart behavior. Manual `apply-best` uses the App/Desktop policy by default; use `codex-auth-pool apply-best --account-policy cli` if you explicitly want to pick the best Plus-only candidate. For ordinary long-running CLI work, prefer `codex-plus`; it does not change the active Desktop auth.
 
 `refresh-usage` writes direct observations into profile metadata sidecars.
 For managed vault profiles, the sidecar lives next to the profile as `.meta.json`.

@@ -71,6 +71,16 @@ PY
 
 chmod +x "${PROJECT_LAUNCHER}"
 
+install_cli_wrapper() {
+  mkdir -p "${LOCAL_BIN_DIR}"
+  cat > "${LOCAL_BIN_DIR}/codex-plus" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${CODEX_AUTH_POOL_BIN:-codex-auth-pool}" cli-run -- "$@"
+EOF
+  chmod +x "${LOCAL_BIN_DIR}/codex-plus"
+}
+
 if ! PYTHON_BIN="$(find_python)"; then
   echo "[codex-auth-pool] Python 3.10+ is required."
   echo "Install Python 3.10 or newer, then rerun ./install.sh"
@@ -82,9 +92,11 @@ if command -v pipx >/dev/null 2>&1; then
   pipx install "${PROJECT_DIR}" --force
   mkdir -p "${LOCAL_BIN_DIR}"
   ln -sf "${PROJECT_LAUNCHER}" "${LOCAL_BIN_DIR}/codex-auth-pool-local"
+  install_cli_wrapper
   restart_background_service_if_present
   echo
   echo "Installed command: codex-auth-pool"
+  echo "Plus-only CLI command: codex-plus"
   echo "Runtime state lives under: ~/.codex-auth-pool and ~/.codex"
   echo "Next:"
   echo "  $(next_command)"
@@ -102,6 +114,7 @@ pip install --upgrade pip
 pip install -e "${PROJECT_DIR}"
 mkdir -p "${LOCAL_BIN_DIR}"
 ln -sf "${PROJECT_LAUNCHER}" "${LOCAL_BIN_DIR}/codex-auth-pool"
+install_cli_wrapper
 restart_background_service_if_present
 
 cat <<EOF
@@ -115,6 +128,7 @@ Runtime state still lives under:
 
 Use from anywhere:
   $(next_command)
+  codex-plus
 
 Use inside this project directory:
   ./codex-auth-pool status

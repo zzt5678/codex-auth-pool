@@ -56,6 +56,8 @@
 - 账号额度触顶后自动冷却，并切换到下一个可用账号。
 - App/Desktop 自动轮换使用 app 策略：可用 Pro 账号排在 Plus 前面；所有 Pro 都不可用或额度耗尽后，才回退到 Plus。
 - CLI goal 自动恢复只允许 Plus：当前 auth 是 Pro 时不会自动执行 `codex resume <thread_id>`，避免 CLI 长任务消耗 Pro 额度。
+- 提供 `codex-plus` 命令：普通 CLI 手动任务也可以走独立的 Plus-only `CODEX_HOME`，不会覆盖 Codex Desktop 当前使用的 Pro/Plus auth。
+- `codex-plus` 会复用 `~/.codex` 的 sessions、plugins、skills、config 等状态，所以 `codex resume` 和已安装插件不需要另建一套。
 - 当前账号 auth token 过期时（`HTTP 401 token_expired`），会视为账号不可用并自动切走，不再继续相信旧额度快照。
 - 如果 Codex 会话日志已经出现运行时限额信号（`usage_limit_exceeded`、`rate_limit_reached_type`，或连续 `rate_limits=null`），即使界面百分比没有精确显示 100%，也会按真实耗尽处理。
 - macOS 上切换后可自动重启 Codex Desktop。
@@ -123,6 +125,24 @@ codex-auth-pool init --install-systemd
 - 导入 `cliproxyapi` 账号
 - 按需安装后台自动轮换
 
+### 2.1 如果你要让 CLI 只用 Plus
+
+安装后会同时提供 `codex-plus`：
+
+```bash
+codex-plus
+codex-plus resume <thread_id>
+codex-plus --version
+```
+
+它会在运行前自动选择当前可用的 Plus 账号，写入隔离目录 `~/.codex-auth-pool/cli-plus-home`，并通过 `CODEX_HOME` 启动官方 `codex`。这不会改写 Codex Desktop 使用的 `~/.codex/auth.json` 或 `~/.codex/cache/auth.json`。
+
+如果只想准备隔离 home、不启动 CLI：
+
+```bash
+codex-auth-pool cli-prepare
+```
+
 ### 3. 打开看板
 
 ```bash
@@ -174,7 +194,7 @@ codex-auth-pool events --limit 10
 python -m unittest discover -s tests
 ```
 
-测试覆盖核心轮换规则、运行时限额信号、Browser Use 活跃保护、候选账号短期失败冷却和 CLI goal 恢复判断。
+测试覆盖核心轮换规则、运行时限额信号、Browser Use 活跃保护、候选账号短期失败冷却、CLI goal 恢复判断，以及 `codex-plus` 隔离 home 不覆盖全局 auth。
 
 ## Token 使用量和成本估算
 
@@ -287,12 +307,12 @@ codex-auth-pool systemd-status
 4. 没有被真实远程限额窗口阻塞
 5. 符合当前使用策略
 6. App/Desktop 自动轮换：Pro 优先，然后 Plus，最后才是未知套餐
-7. CLI goal 自动恢复：只允许 Plus
+7. CLI goal 自动恢复和 `codex-plus`：只允许 Plus
 8. 真实观测到的周重置时间更早
 9. 如果没有真实观测值，再看本地 `weekly_reset_at`
 10. 最后再参考 auth 元数据的新鲜度
 
-这个策略不会因为池子里出现 Pro 账号就主动重启 Codex。它只会在已经出现真实额度/认证触发、必须切号时改变候选账号排序，因此不会破坏之前“非必要不重启”的体验。手动 `apply-best` 默认使用 App/Desktop 策略；如果你明确想选 Plus-only 候选，可以运行 `codex-auth-pool apply-best --account-policy cli`。
+这个策略不会因为池子里出现 Pro 账号就主动重启 Codex。它只会在已经出现真实额度/认证触发、必须切号时改变候选账号排序，因此不会破坏之前“非必要不重启”的体验。手动 `apply-best` 默认使用 App/Desktop 策略；如果你明确想选 Plus-only 候选，可以运行 `codex-auth-pool apply-best --account-policy cli`。如果你要启动普通 CLI 长任务，优先用 `codex-plus`，它不会改变 App 当前 auth。
 
 `refresh-usage` 会把真实查询结果写入账号对应的元数据 sidecar。
 对于 managed vault 里的账号，sidecar 会保存在账号文件旁边的 `.meta.json`。
