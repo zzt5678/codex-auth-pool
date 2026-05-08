@@ -4938,6 +4938,29 @@ def runtime_limit_cooldown_until(
     )
 
 
+def runtime_signal_is_overridden_by_fresh_usage(
+    signal: RuntimeLimitSignal,
+    usage: RemoteUsageSnapshot | None,
+    *,
+    primary_threshold: float,
+    secondary_threshold: float,
+) -> bool:
+    if signal.source != "session_rate_limits_null" or usage is None:
+        return False
+    if usage.allowed is False or usage.limit_reached:
+        return False
+    reason, _ = determine_rotation_trigger(
+        usage,
+        primary_used_percent=usage.primary_used_percent,
+        primary_reset_at=usage.primary_reset_at,
+        secondary_used_percent=usage.secondary_used_percent,
+        secondary_reset_at=usage.secondary_reset_at,
+        primary_threshold=primary_threshold,
+        secondary_threshold=secondary_threshold,
+    )
+    return reason is None
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         if value is None:
@@ -8440,6 +8463,31 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         )
     else:
         no_safe_signal_note = usage_note or "no current-account usage snapshot available"
+
+    if (
+        forced_trigger_reason is None
+        and runtime_limit_signal is not None
+        and runtime_signal_is_overridden_by_fresh_usage(
+            runtime_limit_signal,
+            current_usage,
+            primary_threshold=args.primary_threshold,
+            secondary_threshold=args.secondary_threshold,
+        )
+    ):
+        append_event(
+            args.events_path,
+            "runtime_limit_signal_ignored",
+            account_id=current_account,
+            signal_source=runtime_limit_signal.source,
+            signal_detail=runtime_limit_signal.detail,
+            usage_source=current_usage.source if current_usage is not None else None,
+            observed_allowed=current_usage.allowed if current_usage is not None else None,
+            observed_limit_reached=current_usage.limit_reached if current_usage is not None else None,
+            primary_used_percent=current_usage.primary_used_percent if current_usage is not None else None,
+            secondary_used_percent=current_usage.secondary_used_percent if current_usage is not None else None,
+            reason="fresh_usage_not_limited",
+        )
+        runtime_limit_signal = None
 
     if forced_trigger_reason is None and runtime_limit_signal is not None:
         forced_trigger_reason = runtime_limit_signal.reason

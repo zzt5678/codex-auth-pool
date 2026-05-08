@@ -103,6 +103,80 @@ class RotationLogicTests(unittest.TestCase):
         self.assertEqual(reason, "primary_5h_limit")
         self.assertEqual(until, usage.primary_reset_at)
 
+    def test_rate_limits_null_signal_is_ignored_when_fresh_usage_is_allowed(self) -> None:
+        now = pool.now_local()
+        usage = pool.RemoteUsageSnapshot(
+            account_id="acct",
+            email="user@example.com",
+            plan_type="prolite",
+            allowed=True,
+            limit_reached=False,
+            primary_used_percent=11.0,
+            primary_reset_at=now + timedelta(hours=4),
+            primary_window_seconds=5 * 60 * 60,
+            secondary_used_percent=2.0,
+            secondary_reset_at=now + timedelta(days=7),
+            secondary_window_seconds=7 * 24 * 60 * 60,
+            fetched_at=now,
+            source="wham_usage",
+        )
+        signal = pool.RuntimeLimitSignal(
+            reason="primary_5h_limit",
+            cooldown_until=None,
+            primary_used_percent=None,
+            secondary_used_percent=None,
+            source_file=Path("rollout.jsonl"),
+            event_timestamp=now.isoformat(),
+            source="session_rate_limits_null",
+            detail="consecutive token_count events had rate_limits=null",
+        )
+
+        self.assertTrue(
+            pool.runtime_signal_is_overridden_by_fresh_usage(
+                signal,
+                usage,
+                primary_threshold=pool.DEFAULT_PRIMARY_THRESHOLD,
+                secondary_threshold=pool.DEFAULT_SECONDARY_THRESHOLD,
+            )
+        )
+
+    def test_usage_limit_error_signal_is_not_ignored_by_fresh_usage(self) -> None:
+        now = pool.now_local()
+        usage = pool.RemoteUsageSnapshot(
+            account_id="acct",
+            email="user@example.com",
+            plan_type="prolite",
+            allowed=True,
+            limit_reached=False,
+            primary_used_percent=11.0,
+            primary_reset_at=now + timedelta(hours=4),
+            primary_window_seconds=5 * 60 * 60,
+            secondary_used_percent=2.0,
+            secondary_reset_at=now + timedelta(days=7),
+            secondary_window_seconds=7 * 24 * 60 * 60,
+            fetched_at=now,
+            source="wham_usage",
+        )
+        signal = pool.RuntimeLimitSignal(
+            reason="primary_5h_limit",
+            cooldown_until=None,
+            primary_used_percent=None,
+            secondary_used_percent=None,
+            source_file=Path("rollout.jsonl"),
+            event_timestamp=now.isoformat(),
+            source="session_error",
+            detail="usage_limit_exceeded",
+        )
+
+        self.assertFalse(
+            pool.runtime_signal_is_overridden_by_fresh_usage(
+                signal,
+                usage,
+                primary_threshold=pool.DEFAULT_PRIMARY_THRESHOLD,
+                secondary_threshold=pool.DEFAULT_SECONDARY_THRESHOLD,
+            )
+        )
+
     def test_recent_usage_refresh_failure_blocks_candidate_temporarily(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "profile.json"
