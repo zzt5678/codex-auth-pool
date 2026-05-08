@@ -8043,6 +8043,129 @@ def apply_auto_rotation_from_trigger(
     return 0
 
 
+def app_pro_promotion_candidate(
+    source_dir: Path,
+    managed_dir: Path,
+    state: dict[str, Any],
+    target_path: Path,
+) -> dict[str, Any] | None:
+    current_account = active_auth_account_id(target_path)
+    if current_account:
+        current_path = profile_path_for_account_usage(source_dir, managed_dir, current_account)
+        if current_path is not None and plan_tier(summarize_profile(current_path).plan_type) == "pro":
+            return None
+    for candidate in rank_profiles(
+        source_dir,
+        managed_dir,
+        state,
+        target_path,
+        account_policy=ACCOUNT_POLICY_APP,
+    ):
+        summary = candidate["summary"]
+        if candidate["available"] and summary.account_id != current_account and plan_tier(summary.plan_type) == "pro":
+            return candidate
+    return None
+
+
+def maybe_apply_app_pro_promotion(args: argparse.Namespace, current_account: str) -> int | None:
+    if getattr(args, "no_apply_best", False):
+        return None
+    state = load_state(args.state_path)
+    candidate = app_pro_promotion_candidate(
+        args.source_dir,
+        args.managed_dir,
+        state,
+        Path(args.target),
+    )
+    if candidate is None:
+        return None
+
+    summary: ProfileSummary = candidate["summary"]
+    if getattr(args, "dry_run", False):
+        print(f"dry run: would promote App/Desktop auth to Pro account {summary.email or summary.account_id}")
+        return 0
+
+    active_snapshot = active_desktop_sessions_before_switch(args)
+    if active_snapshot is not None:
+        session_ids = pending_rotation_session_ids(active_snapshot)
+        spawned_session_ids = pending_rotation_spawned_session_ids(active_snapshot)
+        blocker_ids = pending_rotation_blocker_ids(active_snapshot)
+        if session_ids or spawned_session_ids:
+            append_event(
+                args.events_path,
+                "pro_promotion_waiting_active_sessions",
+                current_account_id=current_account,
+                candidate_account_id=summary.account_id,
+                candidate_email=summary.email,
+                snapshot_path=active_snapshot.get("path"),
+                session_count=len(session_ids),
+                active_spawned_session_count=len(spawned_session_ids),
+                blocker_count=len(blocker_ids),
+                session_ids=session_ids,
+                active_spawned_session_ids=spawned_session_ids,
+                blocker_ids=blocker_ids,
+            )
+            print("Pro promotion pending: active Codex Desktop session(s) are still running")
+            return 0
+
+    recent_rotation, retry_after_seconds = auto_rotation_recently_blocked(state, now=now_local())
+    if recent_rotation:
+        append_event(
+            args.events_path,
+            "pro_promotion_skipped_recent_rotation",
+            current_account_id=current_account,
+            candidate_account_id=summary.account_id,
+            candidate_email=summary.email,
+            retry_after_seconds=retry_after_seconds,
+        )
+        print(f"Pro promotion skipped: recent automatic switch, retry after {retry_after_seconds}s")
+        return 0
+
+    validation_ok, validation_error = validate_profile_before_apply(
+        args,
+        candidate["path"],
+        apply_source="pro_promotion",
+    )
+    if not validation_ok:
+        append_event(
+            args.events_path,
+            "pro_promotion_candidate_rejected",
+            current_account_id=current_account,
+            candidate_account_id=summary.account_id,
+            candidate_email=summary.email,
+            error=validation_error,
+        )
+        print(f"Pro promotion skipped: {summary.email or summary.account_id}: {validation_error}")
+        return 0
+
+    previous_profile = getattr(args, "profile", None)
+    previous_apply_source = getattr(args, "apply_source", None)
+    previous_rotation_reason = getattr(args, "rotation_reason", None)
+    previous_rotation_trigger_source = getattr(args, "rotation_trigger_source", None)
+    previous_skip_usage_validation = getattr(args, "skip_usage_validation", False)
+    try:
+        args.profile = str(candidate["path"])
+        args.apply_source = "pro_promotion"
+        args.rotation_reason = "prefer_pro"
+        args.rotation_trigger_source = "app_policy"
+        args.skip_usage_validation = True
+        append_event(
+            args.events_path,
+            "pro_promotion_apply",
+            current_account_id=current_account,
+            candidate_account_id=summary.account_id,
+            candidate_email=summary.email,
+            candidate_profile=str(candidate["path"]),
+        )
+        return cmd_apply(args)
+    finally:
+        args.profile = previous_profile
+        args.apply_source = previous_apply_source
+        args.rotation_reason = previous_rotation_reason
+        args.rotation_trigger_source = previous_rotation_trigger_source
+        args.skip_usage_validation = previous_skip_usage_validation
+
+
 def cmd_tick(args: argparse.Namespace) -> int:
     with exclusive_lock(DEFAULT_TICK_LOCK_PATH, blocking=False) as acquired:
         if not acquired:
@@ -8291,6 +8414,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
     trigger_source = None
     forced_trigger_reason = None
     forced_trigger_until = None
+    no_safe_signal_note = None
 
     if usage_error_blocks_current_account(current_usage_refresh_error):
         forced_trigger_reason = "auth_token_expired"
@@ -8317,9 +8441,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             f"{runtime_limit_signal.source}:{runtime_limit_signal.source_file.name}"
         )
     else:
-        note = usage_note or "no current-account usage snapshot available"
-        print(f"no safe rotation signal; skipping auto-rotation ({note})")
-        return 0
+        no_safe_signal_note = usage_note or "no current-account usage snapshot available"
 
     if forced_trigger_reason is None and runtime_limit_signal is not None:
         forced_trigger_reason = runtime_limit_signal.reason
@@ -8435,6 +8557,14 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             trigger_primary_used=trigger_primary_used,
             trigger_secondary_used=trigger_secondary_used,
         )
+
+    promotion_result = maybe_apply_app_pro_promotion(args, current_account)
+    if promotion_result is not None:
+        return promotion_result
+
+    if no_safe_signal_note:
+        print(f"no safe rotation signal; skipping auto-rotation ({no_safe_signal_note})")
+        return 0
 
     print(f"no rotation trigger; current account remains active (source={trigger_source})")
     return 0

@@ -333,6 +333,59 @@ class RotationLogicTests(unittest.TestCase):
             next_item = next(item for item in ranked if item["available"])
             self.assertEqual(next_item["summary"].email, "plus@example.com")
 
+    def test_app_pro_promotion_candidate_when_current_is_plus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_profile(root, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
+            self.write_profile(root, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+            active_auth = root / "cache" / "auth.json"
+            pool.write_json(
+                active_auth,
+                {
+                    "tokens": {
+                        "access_token": "a-plus",
+                        "refresh_token": "r-plus",
+                        "id_token": "i-plus",
+                        "account_id": "plus-acct",
+                    }
+                },
+            )
+
+            candidate = pool.app_pro_promotion_candidate(
+                root / "missing-source",
+                root,
+                {},
+                active_auth,
+            )
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate["summary"].email, "pro@example.com")
+
+    def test_app_pro_promotion_skips_when_current_is_pro(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_profile(root, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
+            self.write_profile(root, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+            active_auth = root / "cache" / "auth.json"
+            pool.write_json(
+                active_auth,
+                {
+                    "tokens": {
+                        "access_token": "a-pro",
+                        "refresh_token": "r-pro",
+                        "id_token": "i-pro",
+                        "account_id": "pro-acct",
+                    }
+                },
+            )
+
+            candidate = pool.app_pro_promotion_candidate(
+                root / "missing-source",
+                root,
+                {},
+                active_auth,
+            )
+            self.assertIsNone(candidate)
+
     def test_cli_policy_allows_plus_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
