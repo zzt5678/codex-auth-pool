@@ -3186,7 +3186,7 @@ def discover_goal_threads_for_resume(
     max_count: int,
 ) -> list[dict[str, Any]]:
     goals: dict[str, dict[str, Any]] = {}
-    for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=max_count, statuses=("active", "paused")):
+    for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=max_count, statuses=("active",)):
         thread_id = str(goal.get("thread_id") or "")
         if thread_id:
             goals[thread_id] = goal
@@ -3470,7 +3470,7 @@ def process_pending_goal_resumes(
 
     active_goals = {
         str(goal.get("thread_id") or ""): goal
-        for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=20, statuses=("active", "paused"))
+        for goal in read_active_goal_threads(codex_state_db=codex_state_db, max_count=20, statuses=("active",))
     }
     now = now_local()
     results: list[dict[str, Any]] = []

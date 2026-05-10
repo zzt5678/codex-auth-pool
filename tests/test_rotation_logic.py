@@ -802,6 +802,31 @@ class RotationLogicTests(unittest.TestCase):
                 "codex-plus",
             )
 
+    def test_goal_discovery_for_resume_does_not_include_paused_goals(self) -> None:
+        calls: list[tuple[str, ...] | None] = []
+        original_read_active = pool.read_active_goal_threads
+        original_read_by_ids = pool.read_goal_threads_by_ids
+        original_running_ids = pool._running_codex_resume_thread_ids
+        try:
+            def fake_read_active_goal_threads(**kwargs):
+                calls.append(kwargs.get("statuses"))
+                return []
+
+            pool.read_active_goal_threads = fake_read_active_goal_threads  # type: ignore[assignment]
+            pool.read_goal_threads_by_ids = lambda **kwargs: {}  # type: ignore[assignment]
+            pool._running_codex_resume_thread_ids = lambda: set()  # type: ignore[assignment]
+            pool.discover_goal_threads_for_resume(
+                codex_state_db=Path("state.sqlite3"),
+                state={},
+                max_count=5,
+            )
+        finally:
+            pool.read_active_goal_threads = original_read_active  # type: ignore[assignment]
+            pool.read_goal_threads_by_ids = original_read_by_ids  # type: ignore[assignment]
+            pool._running_codex_resume_thread_ids = original_running_ids  # type: ignore[assignment]
+
+        self.assertEqual(calls, [("active",)])
+
 
 if __name__ == "__main__":
     unittest.main()
