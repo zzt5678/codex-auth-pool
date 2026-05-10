@@ -904,11 +904,22 @@ def current_account_summary(target_path: Path, source_dir: Path, managed_dir: Pa
 def account_summary_by_id(source_dir: Path, managed_dir: Path, account_id: str | None) -> ProfileSummary | None:
     if not account_id:
         return None
+    matches: list[ProfileSummary] = []
     for path in discover_all_profiles(source_dir, managed_dir):
         summary = summarize_profile(path)
         if summary.account_id == account_id:
-            return summary
-    return None
+            matches.append(summary)
+    if not matches:
+        return None
+    matches.sort(
+        key=lambda summary: (
+            1 if plan_tier(summary.plan_type) == "unknown" else 0,
+            source_rank(summary.source_kind),
+            -(parse_dt(summary.last_refresh) or datetime(1970, 1, 1, tzinfo=timezone.utc)).timestamp(),
+            str(summary.path),
+        )
+    )
+    return matches[0]
 
 
 def account_allows_cli_goal_resume(source_dir: Path, managed_dir: Path, account_id: str | None) -> tuple[bool, str, str]:
@@ -2768,31 +2779,56 @@ def _event_search_text(event: dict[str, Any]) -> str:
 
 
 def _event_has_quota_blocker(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("type") or "")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    payload_type = str(payload.get("type") or "")
     text = _event_search_text(event)
-    markers = (
+
+    hard_markers = (
         "primary_5h_limit",
         "weekly_limit",
+        "usage_limit_exceeded",
+        "error running remote compact task",
+        "you've hit your usage limit",
+        "you have hit your usage limit",
         "usage limit",
         "rate limit",
-        "limit reached",
-        "quota",
-        "exhausted",
         "token_expired",
         "authentication token is expired",
+        "provided authentication token is expired",
         "access token could not be refreshed",
         "temporarily unavailable for this runtime request",
         "http 429",
+        "unexpected status 429",
         "status 429",
         "status=429",
         "http 401",
+        "unexpected status 401",
         "status 401",
         "status=401",
         "http 403",
+        "unexpected status 403",
         "status 403",
         "status=403",
         "503 service unavailable",
     )
-    return any(marker in text for marker in markers)
+    if any(marker in text for marker in hard_markers):
+        return True
+
+    # Only trusted runtime error events may use broad wording. Function/tool
+    # outputs often contain research text such as "quota", "blocker", or
+    # "exhausted" that is unrelated to the local Codex account.
+    if event_type == "event_msg" and payload_type == "error":
+        broad_error_markers = (
+            "limit reached",
+            "quota exceeded",
+            "quota exhausted",
+            "credits exhausted",
+            "weekly limit",
+            "5h limit",
+        )
+        return any(marker in text for marker in broad_error_markers)
+    return False
 
 
 def _event_is_goal_progress(event: dict[str, Any]) -> bool:
@@ -2825,10 +2861,27 @@ def classify_active_goal_runtime(goal: dict[str, Any], *, now: datetime | None =
     last_event_at = None
     last_progress_at = None
     last_quota_blocker_at = None
+    last_task_started_at = None
+    last_task_finished_at = None
     for event in events:
         event_at = parse_dt(str(event.get("timestamp") or ""))
         if event_at is not None:
             last_event_at = event_at if last_event_at is None or event_at > last_event_at else last_event_at
+        event_type = event.get("type")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        payload_type = payload.get("type")
+        if event_type == "event_msg" and payload_type == "task_started" and event_at is not None:
+            last_task_started_at = (
+                event_at
+                if last_task_started_at is None or event_at > last_task_started_at
+                else last_task_started_at
+            )
+        if event_type == "event_msg" and payload_type in {"task_complete", "turn_aborted"} and event_at is not None:
+            last_task_finished_at = (
+                event_at
+                if last_task_finished_at is None or event_at > last_task_finished_at
+                else last_task_finished_at
+            )
         if _event_has_quota_blocker(event) and event_at is not None:
             last_quota_blocker_at = (
                 event_at
@@ -2850,6 +2903,14 @@ def classify_active_goal_runtime(goal: dict[str, Any], *, now: datetime | None =
     elif idle_seconds is None:
         state = "stale"
         reason = "no_rollout_events"
+    elif (
+        idle_seconds >= ACTIVE_GOAL_STALE_SECONDS
+        and last_task_started_at is not None
+        and (last_task_finished_at is None or last_task_started_at > last_task_finished_at)
+        and last_event_at == last_task_started_at
+    ):
+        state = "interrupted"
+        reason = "task_started_without_followup"
     elif idle_seconds <= ACTIVE_GOAL_BUSY_GRACE_SECONDS:
         state = "busy"
         reason = "recent_rollout_progress"
@@ -2865,6 +2926,8 @@ def classify_active_goal_runtime(goal: dict[str, Any], *, now: datetime | None =
         "last_event_at": last_event_at.isoformat() if last_event_at is not None else None,
         "last_progress_at": last_progress_at.isoformat() if last_progress_at is not None else None,
         "last_quota_blocker_at": last_quota_blocker_at.isoformat() if last_quota_blocker_at is not None else None,
+        "last_task_started_at": last_task_started_at.isoformat() if last_task_started_at is not None else None,
+        "last_task_finished_at": last_task_finished_at.isoformat() if last_task_finished_at is not None else None,
         "idle_seconds": idle_seconds,
         "quota_blocked": quota_blocked,
         "rollout_path": str(rollout_path) if str(rollout_path) else None,
@@ -2872,13 +2935,17 @@ def classify_active_goal_runtime(goal: dict[str, Any], *, now: datetime | None =
 
 
 def _runtime_state_requires_goal_resume(runtime_state: dict[str, Any]) -> bool:
-    """Only confirmed quota/auth blockers are safe enough to auto-resume.
+    """Resume only when the prior goal turn is confirmed blocked or cut off.
 
     Lack of rollout activity can mean a long-running shell command, remote job,
     or sub-agent is still doing work. Treat that as a watch state, not as proof
-    that the original goal session is dead.
+    that the original goal session is dead. A lone stale task_started event is
+    different: Codex began a turn and then produced no follow-up event.
     """
-    return runtime_state.get("state") == "blocked" and bool(runtime_state.get("quota_blocked"))
+    return (
+        runtime_state.get("state") == "blocked"
+        and bool(runtime_state.get("quota_blocked"))
+    ) or runtime_state.get("state") == "interrupted"
 
 
 def _goal_resume_key(goal: dict[str, Any], account_id: str | None) -> str:
@@ -6551,11 +6618,68 @@ def cmd_cli_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resume_thread_id_from_codex_args(codex_args: list[str]) -> str | None:
+    for index, value in enumerate(codex_args):
+        if value != "resume":
+            continue
+        if index + 1 >= len(codex_args):
+            return None
+        candidate = codex_args[index + 1]
+        if re.fullmatch(r"[0-9a-fA-F-]{20,}", candidate):
+            return candidate
+    return None
+
+
+def _record_cli_plus_resume_invocation(args: argparse.Namespace, summary: ProfileSummary, codex_args: list[str]) -> None:
+    thread_id = _resume_thread_id_from_codex_args(codex_args)
+    if not thread_id:
+        return
+    state_path = getattr(args, "state_path", None)
+    if state_path is None:
+        return
+    state = load_state(state_path)
+    goal = {
+        "thread_id": thread_id,
+        "goal_id": None,
+        "title": "",
+        "cwd": str(Path.cwd()),
+        "rollout_path": "",
+    }
+    pending = state.get("pending_goal_resumes")
+    if isinstance(pending, dict) and isinstance(pending.get(thread_id), dict):
+        record = pending[thread_id]
+        goal["goal_id"] = record.get("goal_id")
+        goal["title"] = record.get("title") or ""
+        goal["cwd"] = record.get("cwd") or goal["cwd"]
+        goal["rollout_path"] = record.get("rollout_path") or ""
+        record["resume_command"] = "codex-plus"
+        record["account_id"] = summary.account_id
+    _record_goal_resume_started(
+        state,
+        goal,
+        account_id=summary.account_id,
+        started_at=now_local(),
+        pid=None,
+        mode="cli_plus_wrapper",
+        resume_command="codex-plus",
+    )
+    save_state(state_path, state)
+    append_event(
+        getattr(args, "events_path", None),
+        "cli_plus_resume_recorded",
+        thread_id=thread_id,
+        account_id=summary.account_id,
+        email=summary.email,
+        cwd=goal["cwd"],
+    )
+
+
 def cmd_cli_run(args: argparse.Namespace) -> int:
     _, summary, cli_home, _, _ = prepare_cli_plus_home(args)
     codex_args = list(getattr(args, "codex_args", []) or [])
     if codex_args and codex_args[0] == "--":
         codex_args = codex_args[1:]
+    _record_cli_plus_resume_invocation(args, summary, codex_args)
     codex_bin = shutil.which("codex")
     if codex_bin is None:
         raise SystemExit("codex command not found in PATH")

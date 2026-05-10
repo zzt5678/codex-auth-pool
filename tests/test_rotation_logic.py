@@ -281,6 +281,93 @@ class RotationLogicTests(unittest.TestCase):
             self.assertFalse(state["quota_blocked"])
             self.assertNotEqual(state["state"], "blocked")
 
+    def test_goal_runtime_does_not_treat_research_text_as_quota_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            now = pool.now_local()
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": now.isoformat(),
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "Blockers: automatic work has exhausted the selected route in the research plan.",
+                        },
+                    }
+                )
+            )
+            state = pool.classify_active_goal_runtime({"rollout_path": str(rollout)}, now=now)
+            self.assertFalse(state["quota_blocked"])
+
+    def test_goal_runtime_detects_real_usage_limit_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            now = pool.now_local()
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": now.isoformat(),
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": "Error running remote compact task: You've hit your usage limit.",
+                        },
+                    }
+                )
+            )
+            state = pool.classify_active_goal_runtime({"rollout_path": str(rollout)}, now=now)
+            self.assertTrue(state["quota_blocked"])
+            self.assertEqual(state["state"], "blocked")
+
+    def test_goal_runtime_detects_stale_task_started_without_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            now = pool.now_local()
+            started_at = now - timedelta(seconds=pool.ACTIVE_GOAL_STALE_SECONDS + 10)
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": started_at.isoformat(),
+                        "type": "event_msg",
+                        "payload": {"type": "task_started"},
+                    }
+                )
+            )
+            state = pool.classify_active_goal_runtime({"rollout_path": str(rollout)}, now=now)
+            self.assertEqual(state["state"], "interrupted")
+            self.assertTrue(pool._runtime_state_requires_goal_resume(state))
+
+    def test_goal_runtime_does_not_resume_after_completed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            now = pool.now_local()
+            started_at = now - timedelta(seconds=pool.ACTIVE_GOAL_STALE_SECONDS + 20)
+            completed_at = now - timedelta(seconds=pool.ACTIVE_GOAL_STALE_SECONDS + 10)
+            rollout.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": started_at.isoformat(),
+                                "type": "event_msg",
+                                "payload": {"type": "task_started"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": completed_at.isoformat(),
+                                "type": "event_msg",
+                                "payload": {"type": "task_complete"},
+                            }
+                        ),
+                    ]
+                )
+            )
+            state = pool.classify_active_goal_runtime({"rollout_path": str(rollout)}, now=now)
+            self.assertEqual(state["state"], "stale")
+            self.assertFalse(pool._runtime_state_requires_goal_resume(state))
+
     def test_runtime_limit_signal_can_exclude_active_goal_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sessions = Path(tmp)
@@ -515,6 +602,24 @@ class RotationLogicTests(unittest.TestCase):
             self.assertEqual(tier, "pro")
             self.assertEqual(reason, "cli_goal_resume_requires_plus")
 
+    def test_account_summary_prefers_managed_plan_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "cliproxy"
+            managed = root / "managed"
+            source.mkdir()
+            managed.mkdir()
+            self.write_profile(source, name="codex-plus", account_id="acct", email="plus@example.com", plan_type="")
+            self.write_profile(managed, name="codex-plus", account_id="acct", email="plus@example.com", plan_type="plus")
+
+            summary = pool.account_summary_by_id(source, managed, "acct")
+            self.assertIsNotNone(summary)
+            self.assertEqual(summary.plan_type, "plus")
+            allowed, tier, reason = pool.account_allows_cli_goal_resume(source, managed, "acct")
+            self.assertTrue(allowed)
+            self.assertEqual(tier, "plus")
+            self.assertEqual(reason, "plus")
+
     def test_cli_plus_home_is_isolated_and_selects_plus(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -588,6 +693,48 @@ class RotationLogicTests(unittest.TestCase):
 
     def test_goal_resume_command_defaults_to_codex(self) -> None:
         self.assertEqual(pool.goal_resume_command({"thread_id": "thread-1"}, {}, default="codex"), "codex")
+
+    def test_cli_plus_resume_invocation_records_original_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            thread_id = "019fffffffffffffffffffffffffffffffff"
+            state_path = root / "state.json"
+            events_path = root / "events.jsonl"
+            pool.write_json(
+                state_path,
+                {
+                    "pending_goal_resumes": {
+                        thread_id: {
+                            "thread_id": thread_id,
+                            "goal_id": "goal-1",
+                            "title": "Goal title",
+                            "cwd": str(root),
+                            "resume_command": "codex",
+                        }
+                    }
+                },
+            )
+            args = argparse.Namespace(state_path=state_path, events_path=events_path)
+            summary = pool.ProfileSummary(
+                path=root / "plus.json",
+                source_kind="managed",
+                email="plus@example.com",
+                account_id="plus-acct",
+                plan_type="plus",
+                weekly_reset_at=None,
+                last_refresh=None,
+                expired=None,
+                disabled=False,
+            )
+
+            pool._record_cli_plus_resume_invocation(args, summary, ["resume", thread_id, "继续"])
+
+            state = pool.read_json(state_path)
+            self.assertEqual(state["pending_goal_resumes"][thread_id]["resume_command"], "codex-plus")
+            self.assertEqual(
+                pool.goal_resume_command({"thread_id": thread_id}, state, default="codex"),
+                "codex-plus",
+            )
 
 
 if __name__ == "__main__":
