@@ -670,6 +670,72 @@ class RotationLogicTests(unittest.TestCase):
                 self.assertEqual(payload["auth_mode"], "chatgpt")
             self.assertEqual(pool.cli_plus_active_account_id(cli_home), "plus-acct")
 
+    def test_cli_plus_home_rotates_when_active_plus_is_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = root / "managed"
+            managed.mkdir()
+            exhausted = self.write_profile(
+                managed,
+                name="old-plus",
+                account_id="old-plus",
+                email="old@example.com",
+                plan_type="plus",
+            )
+            available = self.write_profile(
+                managed,
+                name="new-plus",
+                account_id="new-plus",
+                email="new@example.com",
+                plan_type="plus",
+            )
+            old_meta = pool.read_profile_metadata(exhausted)
+            old_meta.update(
+                {
+                    "observed_allowed": False,
+                    "observed_limit_reached": True,
+                    "observed_primary_used_percent": 100.0,
+                    "observed_primary_reset_at": (pool.now_local() + timedelta(hours=2)).isoformat(),
+                }
+            )
+            pool.write_json(pool.meta_path_for_profile(exhausted), old_meta)
+            new_meta = pool.read_profile_metadata(available)
+            new_meta.update(
+                {
+                    "observed_allowed": True,
+                    "observed_limit_reached": False,
+                    "observed_primary_used_percent": 10.0,
+                    "observed_primary_reset_at": (pool.now_local() + timedelta(hours=2)).isoformat(),
+                }
+            )
+            pool.write_json(pool.meta_path_for_profile(available), new_meta)
+
+            cli_home = root / "cli-plus-home"
+            auth_payload = pool.convert_profile(pool.normalize_source_payload(exhausted, pool.read_json(exhausted)))
+            for auth_path in pool.cli_plus_auth_paths(cli_home):
+                pool.write_json(auth_path, auth_payload)
+
+            args = argparse.Namespace(
+                source_dir=root / "missing-source",
+                managed_dir=managed,
+                events_path=root / "events.jsonl",
+                state_path=root / "state.json",
+                target=str(root / "global" / "cache" / "auth.json"),
+                usage_max_age_minutes=pool.DEFAULT_USAGE_MAX_AGE_MINUTES,
+                skip_usage_validation=True,
+                refresh_usage=False,
+                cli_plus_home=cli_home,
+                source_codex_home=root / "global",
+                daemon_quiet=True,
+            )
+
+            result = pool.rotate_cli_plus_home_if_needed(args)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["old_account_id"], "old-plus")
+            self.assertEqual(result["new_account_id"], "new-plus")
+            self.assertEqual(pool.cli_plus_active_account_id(cli_home), "new-plus")
+
     def test_install_cli_wrapper_writes_codex_plus_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bin_path = Path(tmp) / "bin" / "codex-plus"

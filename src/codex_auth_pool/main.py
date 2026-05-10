@@ -6604,6 +6604,53 @@ def prepare_cli_plus_home(args: argparse.Namespace) -> tuple[Path, ProfileSummar
     return profile_path, summary, cli_home, auth_paths, linked
 
 
+def rotate_cli_plus_home_if_needed(args: argparse.Namespace) -> dict[str, Any] | None:
+    cli_home = Path(getattr(args, "cli_plus_home", DEFAULT_CLI_PLUS_HOME)).expanduser()
+    old_account_id = cli_plus_active_account_id(cli_home)
+    old_summary = account_summary_by_id(args.source_dir, args.managed_dir, old_account_id)
+    reason = "missing_cli_plus_auth"
+    block_until = None
+    old_profile = old_summary.path if old_summary is not None else None
+
+    if old_summary is not None:
+        if getattr(args, "refresh_usage", False):
+            try:
+                refresh_profile_usage(old_summary.path)
+            except SystemExit as exc:
+                update_profile_metadata(
+                    old_summary.path,
+                    usage_error_checked_at=now_local().isoformat(),
+                    usage_error=str(exc)[:300],
+                )
+        block_until, block_reason = observed_block_until_for_profile(old_summary.path)
+        if block_until is None or block_until <= now_local():
+            return None
+        reason = block_reason or "cli_plus_account_blocked"
+        set_cooldown_by_account_id(args.state_path, old_summary.account_id, block_until, reason)
+
+    profile_path, new_summary, _, auth_paths, linked = prepare_cli_plus_home(args)
+    result = {
+        "old_account_id": old_account_id,
+        "old_email": old_summary.email if old_summary is not None else None,
+        "old_profile": str(old_profile) if old_profile is not None else None,
+        "new_account_id": new_summary.account_id,
+        "new_email": new_summary.email,
+        "new_profile": str(profile_path),
+        "reason": reason,
+        "block_until": block_until.isoformat() if block_until is not None else None,
+        "auth_paths": [str(path) for path in auth_paths],
+        "linked": linked,
+    }
+    append_event(args.events_path, "cli_plus_home_rotated", **result)
+    if not getattr(args, "daemon_quiet", False):
+        print(
+            "rotated Plus-only CLI account: "
+            f"{old_summary.email if old_summary is not None else old_account_id or '-'} -> "
+            f"{new_summary.email or new_summary.account_id} (reason={reason})"
+        )
+    return result
+
+
 def cmd_cli_prepare(args: argparse.Namespace) -> int:
     profile_path, summary, cli_home, auth_paths, linked = prepare_cli_plus_home(args)
     print("prepared Plus-only Codex CLI home")
@@ -8507,6 +8554,8 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         )
         cmd_refresh_usage(refresh_args)
 
+    cli_plus_rotation = rotate_cli_plus_home_if_needed(args)
+
     if not getattr(args, "no_resume_active_goals", False):
         goal_resume_state = load_state(args.state_path)
         pending_goal_resumes = goal_resume_state.get("pending_goal_resumes")
@@ -8535,6 +8584,17 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 account_id=cli_plus_account or current_account,
                 prompt=active_goal_resume_prompt_from_args(args),
                 resume_command="codex-plus" if cli_plus_account else "codex",
+            )
+        elif cli_allowed and cli_plus_rotation is not None:
+            resume_active_goal_threads_after_switch(
+                codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+                events_path=getattr(args, "events_path", None),
+                state_path=getattr(args, "state_path", None),
+                account_id=cli_plus_account,
+                source_dir=args.source_dir,
+                managed_dir=args.managed_dir,
+                prompt=active_goal_resume_prompt_from_args(args),
+                resume_command="codex-plus",
             )
 
     state = load_state(args.state_path)
