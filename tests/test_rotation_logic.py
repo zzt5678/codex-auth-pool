@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import argparse
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -826,6 +827,67 @@ class RotationLogicTests(unittest.TestCase):
             pool._running_codex_resume_thread_ids = original_running_ids  # type: ignore[assignment]
 
         self.assertEqual(calls, [("active",)])
+
+    def test_active_desktop_goals_are_paused_when_app_auth_is_pro(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "state.sqlite"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                """
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE thread_goals (
+                    thread_id TEXT PRIMARY KEY NOT NULL,
+                    goal_id TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    token_budget INTEGER,
+                    tokens_used INTEGER NOT NULL DEFAULT 0,
+                    time_used_seconds INTEGER NOT NULL DEFAULT 0,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO threads(id, rollout_path, archived, title, cwd)
+                VALUES ('thread-active', '/tmp/active.jsonl', 0, 'Active goal', '/tmp'),
+                       ('thread-paused', '/tmp/paused.jsonl', 0, 'Paused goal', '/tmp');
+                INSERT INTO thread_goals(thread_id, goal_id, objective, status, created_at_ms, updated_at_ms)
+                VALUES ('thread-active', 'goal-active', 'objective', 'active', 1, 1),
+                       ('thread-paused', 'goal-paused', 'objective', 'paused', 1, 1);
+                """
+            )
+            conn.commit()
+            conn.close()
+            summary = pool.ProfileSummary(
+                path=root / "pro.json",
+                source_kind="managed",
+                email="pro@example.com",
+                account_id="pro-acct",
+                plan_type="prolite",
+                weekly_reset_at=None,
+                last_refresh=None,
+                expired=None,
+                disabled=False,
+            )
+
+            paused = pool.pause_active_goals_to_protect_pro_quota(
+                codex_state_db=db,
+                current_summary=summary,
+                cli_plus_account_id="plus-acct",
+                events_path=root / "events.jsonl",
+            )
+
+            self.assertEqual([item["thread_id"] for item in paused], ["thread-active"])
+            conn = sqlite3.connect(db)
+            statuses = dict(conn.execute("SELECT thread_id, status FROM thread_goals").fetchall())
+            conn.close()
+            self.assertEqual(statuses["thread-active"], "paused")
+            self.assertEqual(statuses["thread-paused"], "paused")
 
 
 if __name__ == "__main__":

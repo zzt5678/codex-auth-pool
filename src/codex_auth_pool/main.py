@@ -2667,6 +2667,92 @@ def read_goal_threads_by_ids(*, codex_state_db: Path, thread_ids: set[str]) -> d
     return goals
 
 
+def pause_active_goals_to_protect_pro_quota(
+    *,
+    codex_state_db: Path,
+    current_summary: ProfileSummary | None,
+    cli_plus_account_id: str | None,
+    events_path: Path | None,
+) -> list[dict[str, Any]]:
+    """Prevent Desktop's built-in goal scheduler from spending App Pro quota.
+
+    The Plus-only wrapper can control CLI processes, but Desktop goal automation
+    uses the global App auth. When the App auth is Pro, active goals must be
+    paused and resumed through codex-plus instead.
+    """
+    if current_summary is None or plan_tier(current_summary.plan_type) != "pro":
+        return []
+    if not cli_plus_account_id or not codex_state_db.exists():
+        return []
+    now_ms = int(now_local().timestamp() * 1000)
+    try:
+        with sqlite3.connect(codex_state_db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    g.thread_id,
+                    g.goal_id,
+                    g.objective,
+                    t.title,
+                    t.cwd,
+                    t.rollout_path
+                FROM thread_goals g
+                JOIN threads t ON t.id = g.thread_id
+                WHERE g.status = 'active' AND t.archived = 0
+                """
+            ).fetchall()
+            if not rows:
+                return []
+            conn.execute(
+                """
+                UPDATE thread_goals
+                SET status = 'paused', updated_at_ms = ?
+                WHERE status = 'active'
+                  AND thread_id IN (
+                    SELECT g.thread_id
+                    FROM thread_goals g
+                    JOIN threads t ON t.id = g.thread_id
+                    WHERE g.status = 'active' AND t.archived = 0
+                  )
+                """,
+                (now_ms,),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        append_event(
+            events_path,
+            "active_goal_pause_failed",
+            reason="sqlite_error",
+            error=str(exc)[:300],
+            app_account_id=current_summary.account_id,
+            app_email=current_summary.email,
+        )
+        return []
+
+    paused = [
+        {
+            "thread_id": str(row["thread_id"] or ""),
+            "goal_id": str(row["goal_id"] or ""),
+            "title": str(row["title"] or ""),
+            "cwd": str(row["cwd"] or ""),
+            "rollout_path": str(row["rollout_path"] or ""),
+        }
+        for row in rows
+    ]
+    append_event(
+        events_path,
+        "active_goal_paused_to_protect_pro_quota",
+        count=len(paused),
+        app_account_id=current_summary.account_id,
+        app_email=current_summary.email,
+        app_plan_type=current_summary.plan_type,
+        cli_plus_account_id=cli_plus_account_id,
+        goals=paused,
+    )
+    return paused
+
+
 def _path_match_key(path: Path) -> str:
     try:
         return str(path.expanduser().resolve())
@@ -8555,12 +8641,19 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         cmd_refresh_usage(refresh_args)
 
     cli_plus_rotation = rotate_cli_plus_home_if_needed(args)
+    cli_plus_account_for_goals = cli_plus_active_account_id(Path(getattr(args, "cli_plus_home", DEFAULT_CLI_PLUS_HOME)))
+    pause_active_goals_to_protect_pro_quota(
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        current_summary=account_summary_by_id(args.source_dir, args.managed_dir, current_account),
+        cli_plus_account_id=cli_plus_account_for_goals,
+        events_path=getattr(args, "events_path", None),
+    )
 
     if not getattr(args, "no_resume_active_goals", False):
         goal_resume_state = load_state(args.state_path)
         pending_goal_resumes = goal_resume_state.get("pending_goal_resumes")
         has_pending_goal_resumes = isinstance(pending_goal_resumes, dict) and bool(pending_goal_resumes)
-        cli_plus_account = cli_plus_active_account_id(Path(getattr(args, "cli_plus_home", DEFAULT_CLI_PLUS_HOME)))
+        cli_plus_account = cli_plus_account_for_goals
         cli_allowed, current_plan_tier, cli_block_reason = account_allows_cli_goal_resume(
             args.source_dir,
             args.managed_dir,
