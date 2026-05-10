@@ -563,6 +563,7 @@ class RotationLogicTests(unittest.TestCase):
                 payload = pool.read_json(auth_path)
                 self.assertEqual(payload["tokens"]["account_id"], "plus-acct")
                 self.assertEqual(payload["auth_mode"], "chatgpt")
+            self.assertEqual(pool.cli_plus_active_account_id(cli_home), "plus-acct")
 
     def test_install_cli_wrapper_writes_codex_plus_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -572,6 +573,21 @@ class RotationLogicTests(unittest.TestCase):
             self.assertTrue(bin_path.exists())
             self.assertTrue(bin_path.stat().st_mode & 0o111)
             self.assertIn("codex-auth-pool", bin_path.read_text())
+
+    def test_goal_resume_command_prefers_pending_record(self) -> None:
+        goal = {"thread_id": "thread-1"}
+        state = {
+            "pending_goal_resumes": {
+                "thread-1": {
+                    "thread_id": "thread-1",
+                    "resume_command": "codex-plus",
+                }
+            }
+        }
+        self.assertEqual(pool.goal_resume_command(goal, state, default="codex"), "codex-plus")
+
+    def test_goal_resume_command_defaults_to_codex(self) -> None:
+        self.assertEqual(pool.goal_resume_command({"thread_id": "thread-1"}, {}, default="codex"), "codex")
 
 
 if __name__ == "__main__":

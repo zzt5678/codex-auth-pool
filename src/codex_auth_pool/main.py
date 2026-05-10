@@ -2923,6 +2923,7 @@ def _record_goal_resume_started(
     started_at: datetime,
     pid: int | None,
     mode: str,
+    resume_command: str = "codex",
 ) -> None:
     recent = state.setdefault("last_goal_resumes", {})
     if not isinstance(recent, dict):
@@ -2938,6 +2939,7 @@ def _record_goal_resume_started(
         "account_id": account_id,
         "pid": pid,
         "mode": mode,
+        "resume_command": resume_command,
     }
     # Keep the state file bounded.
     if len(recent) > 20:
@@ -2955,6 +2957,7 @@ def _record_pending_goal_resume(
     *,
     account_id: str | None,
     runtime_state: dict[str, Any],
+    resume_command: str = "codex",
 ) -> None:
     pending = state.setdefault("pending_goal_resumes", {})
     if not isinstance(pending, dict):
@@ -2967,6 +2970,7 @@ def _record_pending_goal_resume(
         "title": goal.get("title"),
         "cwd": goal.get("cwd"),
         "account_id": account_id,
+        "resume_command": resume_command,
         "created_at": now.isoformat(),
         "next_check_at": (now + timedelta(seconds=ACTIVE_GOAL_RESUME_RECHECK_SECONDS)).isoformat(),
         "runtime_state": runtime_state,
@@ -3016,9 +3020,32 @@ def _codex_resume_pids_for_thread(thread_id: str) -> set[int]:
     return pids
 
 
+def _resume_command_from_process(command: str) -> str | None:
+    if not command:
+        return None
+    if re.search(r"(^|[/\s])codex-plus(\s|$)", command):
+        return "codex-plus"
+    if re.search(r"(^|[/\s])codex(\s|$)", command):
+        return "codex"
+    return None
+
+
+def _running_resume_command_for_thread(thread_id: str) -> str | None:
+    if not thread_id:
+        return None
+    for row in _process_table():
+        command = str(row.get("command") or "")
+        if thread_id not in command or " resume " not in command:
+            continue
+        resume_command = _resume_command_from_process(command)
+        if resume_command:
+            return resume_command
+    return None
+
+
 def _running_codex_resume_thread_ids() -> set[str]:
     ids: set[str] = set()
-    pattern = re.compile(r"\bcodex(?:\s+\S+)?\s+resume\s+([0-9a-fA-F-]{20,})")
+    pattern = re.compile(r"\b(?:codex|codex-plus)(?:\s+\S+)?\s+resume\s+([0-9a-fA-F-]{20,})")
     for row in _process_table():
         command = str(row.get("command") or "")
         if "codex" not in command or " resume " not in command:
@@ -3027,6 +3054,30 @@ def _running_codex_resume_thread_ids() -> set[str]:
         if match:
             ids.add(match.group(1))
     return ids
+
+
+def goal_resume_command(goal: dict[str, Any], state: dict[str, Any], default: str = "codex") -> str:
+    thread_id = str(goal.get("thread_id") or "")
+    running = _running_resume_command_for_thread(thread_id)
+    if running:
+        return running
+    recent = state.get("last_goal_resumes")
+    if isinstance(recent, dict):
+        for record in recent.values():
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("thread_id") or "") == thread_id:
+                command = str(record.get("resume_command") or "")
+                if command in {"codex", "codex-plus"}:
+                    return command
+    pending = state.get("pending_goal_resumes")
+    if isinstance(pending, dict):
+        record = pending.get(thread_id)
+        if isinstance(record, dict):
+            command = str(record.get("resume_command") or "")
+            if command in {"codex", "codex-plus"}:
+                return command
+    return default
 
 
 def _recent_goal_resume_thread_records(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -3120,7 +3171,13 @@ def terminate_goal_resume_processes(thread_id: str, root_pids: set[int]) -> list
     return terminated
 
 
-def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path | None) -> dict[str, Any]:
+def launch_goal_resume(
+    goal: dict[str, Any],
+    *,
+    prompt: str,
+    events_path: Path | None,
+    resume_command: str = "codex",
+) -> dict[str, Any]:
     thread_id = str(goal.get("thread_id") or "").strip()
     cwd = Path(str(goal.get("cwd") or Path.home())).expanduser()
     if not thread_id:
@@ -3130,7 +3187,7 @@ def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path |
 
     old_resume_pids = _codex_resume_pids_for_thread(thread_id)
     if is_macos():
-        command = f"cd {shlex.quote(str(cwd))} && codex resume {shlex.quote(thread_id)} {shlex.quote(prompt)}"
+        command = f"cd {shlex.quote(str(cwd))} && {shlex.quote(resume_command)} resume {shlex.quote(thread_id)} {shlex.quote(prompt)}"
         script = f'tell application "Terminal" to do script {applescript_string(command)}'
         completed = run_command(["osascript", "-e", script])
         ok = completed.returncode == 0
@@ -3141,6 +3198,7 @@ def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path |
             "goal_id": goal.get("goal_id"),
             "title": goal.get("title"),
             "cwd": str(cwd),
+            "resume_command": resume_command,
             "pid": None,
             "error": None if ok else (completed.stderr or completed.stdout).strip()[:500],
         }
@@ -3151,7 +3209,7 @@ def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path |
         handle = log_path.open("ab")
         try:
             process = subprocess.Popen(
-                ["codex", "resume", thread_id, prompt],
+                [resume_command, "resume", thread_id, prompt],
                 cwd=str(cwd),
                 stdin=subprocess.DEVNULL,
                 stdout=handle,
@@ -3167,6 +3225,7 @@ def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path |
             "goal_id": goal.get("goal_id"),
             "title": goal.get("title"),
             "cwd": str(cwd),
+            "resume_command": resume_command,
             "pid": process.pid,
             "log_path": str(log_path),
             "error": None,
@@ -3189,13 +3248,60 @@ def launch_goal_resume(goal: dict[str, Any], *, prompt: str, events_path: Path |
     return result
 
 
+def mark_cli_goal_account_blocked(
+    *,
+    source_dir: Path,
+    managed_dir: Path,
+    state_path: Path | None,
+    events_path: Path | None,
+    account_id: str | None,
+) -> datetime | None:
+    if state_path is None or not account_id:
+        return None
+    profile_path = profile_path_for_account_usage(source_dir, managed_dir, account_id)
+    cooldown_until = None
+    reason = "cli_goal_quota_blocked"
+    if profile_path is not None:
+        try:
+            refresh_profile_usage(profile_path)
+        except SystemExit as exc:
+            update_profile_metadata(
+                profile_path,
+                usage_error_checked_at=now_local().isoformat(),
+                usage_error=str(exc)[:300],
+            )
+        block_until, block_reason = observed_block_until_for_profile(profile_path)
+        if block_until is not None and block_until > now_local():
+            cooldown_until = block_until
+            reason = block_reason or reason
+        if cooldown_until is None:
+            meta = read_profile_metadata(profile_path)
+            cooldown_until = parse_dt(str(meta.get("observed_primary_reset_at") or ""))
+    if cooldown_until is None or cooldown_until <= now_local():
+        cooldown_until = now_local() + timedelta(hours=5)
+    set_cooldown_by_account_id(state_path, account_id, cooldown_until, reason)
+    if events_path is not None:
+        append_event(
+            events_path,
+            "cli_goal_account_cooldown",
+            account_id=account_id,
+            cooldown_until=cooldown_until.isoformat(),
+            reason=reason,
+            profile=str(profile_path) if profile_path is not None else None,
+        )
+    return cooldown_until
+
+
 def resume_active_goal_threads_after_switch(
     *,
     codex_state_db: Path,
     events_path: Path | None,
     state_path: Path | None,
     account_id: str | None,
+    source_dir: Path = DEFAULT_CLIPROXY_DIR,
+    managed_dir: Path = DEFAULT_MANAGED_DIR,
     prompt: str = DEFAULT_ACTIVE_GOAL_RESUME_PROMPT,
+    resume_command: str = "codex",
     max_count: int = 5,
 ) -> list[dict[str, Any]]:
     state = load_state(state_path) if state_path is not None else {}
@@ -3229,11 +3335,13 @@ def resume_active_goal_threads_after_switch(
             continue
         runtime_state = classify_active_goal_runtime(goal, now=now)
         if not _runtime_state_requires_goal_resume(runtime_state):
+            selected_resume_command = goal_resume_command(goal, state, resume_command)
             _record_pending_goal_resume(
                 state,
                 goal,
                 account_id=account_id,
                 runtime_state=runtime_state,
+                resume_command=selected_resume_command,
             )
             result = {
                 "ok": True,
@@ -3248,7 +3356,16 @@ def resume_active_goal_threads_after_switch(
                 append_event(events_path, "active_goal_resume_deferred", **result)
             results.append(result)
             continue
-        result = launch_goal_resume(goal, prompt=prompt, events_path=events_path)
+        selected_resume_command = goal_resume_command(goal, state, resume_command)
+        if selected_resume_command == "codex-plus":
+            mark_cli_goal_account_blocked(
+                source_dir=source_dir,
+                managed_dir=managed_dir,
+                state_path=state_path,
+                events_path=events_path,
+                account_id=account_id,
+            )
+        result = launch_goal_resume(goal, prompt=prompt, events_path=events_path, resume_command=selected_resume_command)
         result["runtime_state_before_resume"] = runtime_state
         results.append(result)
         if result.get("ok"):
@@ -3259,6 +3376,7 @@ def resume_active_goal_threads_after_switch(
                 started_at=now_local(),
                 pid=result.get("pid") if isinstance(result.get("pid"), int) else None,
                 mode=str(result.get("mode") or ""),
+                resume_command=selected_resume_command,
             )
     if state_path is not None:
         save_state(state_path, state)
@@ -3268,10 +3386,13 @@ def resume_active_goal_threads_after_switch(
 def process_pending_goal_resumes(
     *,
     codex_state_db: Path,
+    source_dir: Path,
+    managed_dir: Path,
     events_path: Path | None,
     state_path: Path | None,
     account_id: str | None,
     prompt: str = DEFAULT_ACTIVE_GOAL_RESUME_PROMPT,
+    resume_command: str = "codex",
 ) -> list[dict[str, Any]]:
     if state_path is None:
         return []
@@ -3304,8 +3425,10 @@ def process_pending_goal_resumes(
             continue
         runtime_state = classify_active_goal_runtime(goal, now=now)
         if not _runtime_state_requires_goal_resume(runtime_state):
+            selected_resume_command = goal_resume_command(goal, state, resume_command)
             record["next_check_at"] = (now + timedelta(seconds=ACTIVE_GOAL_RESUME_RECHECK_SECONDS)).isoformat()
             record["runtime_state"] = runtime_state
+            record["resume_command"] = selected_resume_command
             if events_path is not None:
                 append_event(
                     events_path,
@@ -3313,9 +3436,18 @@ def process_pending_goal_resumes(
                     thread_id=thread_id,
                     goal_id=goal.get("goal_id"),
                     runtime_state=runtime_state,
-                )
+            )
             continue
-        result = launch_goal_resume(goal, prompt=prompt, events_path=events_path)
+        selected_resume_command = goal_resume_command(goal, state, resume_command)
+        if selected_resume_command == "codex-plus":
+            mark_cli_goal_account_blocked(
+                source_dir=source_dir,
+                managed_dir=managed_dir,
+                state_path=state_path,
+                events_path=events_path,
+                account_id=account_id,
+            )
+        result = launch_goal_resume(goal, prompt=prompt, events_path=events_path, resume_command=selected_resume_command)
         results.append(result)
         if result.get("ok"):
             _record_goal_resume_started(
@@ -3325,6 +3457,7 @@ def process_pending_goal_resumes(
                 started_at=now_local(),
                 pid=result.get("pid") if isinstance(result.get("pid"), int) else None,
                 mode=str(result.get("mode") or ""),
+                resume_command=selected_resume_command,
             )
             _remove_pending_goal_resume(state, str(thread_id))
         else:
@@ -6172,10 +6305,12 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
     if apply_source == "auto_rotation" and not getattr(args, "no_resume_active_goals", False):
         expected_account_id = str(normalized.get("account_id") or "")
         active_account_id = active_auth_account_id(target_path)
+        cli_plus_account = cli_plus_active_account_id(Path(getattr(args, "cli_plus_home", DEFAULT_CLI_PLUS_HOME)))
+        cli_resume_account = cli_plus_account or expected_account_id
         cli_allowed, switched_plan_tier, cli_block_reason = account_allows_cli_goal_resume(
             args.source_dir,
             args.managed_dir,
-            expected_account_id,
+            cli_resume_account,
         )
         if not cli_allowed:
             append_event(
@@ -6202,8 +6337,11 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
                 codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
                 events_path=getattr(args, "events_path", None),
                 state_path=getattr(args, "state_path", None),
-                account_id=normalized.get("account_id"),
+                account_id=cli_resume_account,
+                source_dir=args.source_dir,
+                managed_dir=args.managed_dir,
                 prompt=active_goal_resume_prompt_from_args(args),
+                resume_command="codex-plus" if cli_plus_account else "codex",
             )
         launched = [result for result in goal_resume_results if result.get("ok") and not result.get("skipped")]
         skipped = [result for result in goal_resume_results if result.get("skipped")]
@@ -6296,6 +6434,20 @@ CLI_PLUS_SHARED_NAMES = (
 def cli_plus_auth_paths(cli_home: Path) -> list[Path]:
     root = cli_home.expanduser()
     return [root / "auth.json", root / "cache" / "auth.json"]
+
+
+def cli_plus_active_account_id(cli_home: Path = DEFAULT_CLI_PLUS_HOME) -> str | None:
+    for path in cli_plus_auth_paths(cli_home):
+        if not path.exists():
+            continue
+        try:
+            payload = read_json(path)
+        except SystemExit:
+            continue
+        tokens = payload.get("tokens")
+        if isinstance(tokens, dict) and tokens.get("account_id"):
+            return str(tokens["account_id"])
+    return None
 
 
 def _symlink_points_to(path: Path, target: Path) -> bool:
@@ -8235,26 +8387,30 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         goal_resume_state = load_state(args.state_path)
         pending_goal_resumes = goal_resume_state.get("pending_goal_resumes")
         has_pending_goal_resumes = isinstance(pending_goal_resumes, dict) and bool(pending_goal_resumes)
+        cli_plus_account = cli_plus_active_account_id(Path(getattr(args, "cli_plus_home", DEFAULT_CLI_PLUS_HOME)))
         cli_allowed, current_plan_tier, cli_block_reason = account_allows_cli_goal_resume(
             args.source_dir,
             args.managed_dir,
-            current_account,
+            cli_plus_account or current_account,
         )
         if not cli_allowed and has_pending_goal_resumes:
             append_event(
                 args.events_path,
                 "active_goal_resume_skipped",
                 reason=cli_block_reason,
-                account_id=current_account,
+                account_id=cli_plus_account or current_account,
                 plan_tier=current_plan_tier,
             )
-        elif cli_allowed:
+        elif cli_allowed and has_pending_goal_resumes:
             process_pending_goal_resumes(
                 codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+                source_dir=args.source_dir,
+                managed_dir=args.managed_dir,
                 events_path=getattr(args, "events_path", None),
                 state_path=getattr(args, "state_path", None),
-                account_id=current_account,
+                account_id=cli_plus_account or current_account,
                 prompt=active_goal_resume_prompt_from_args(args),
+                resume_command="codex-plus" if cli_plus_account else "codex",
             )
 
     state = load_state(args.state_path)
