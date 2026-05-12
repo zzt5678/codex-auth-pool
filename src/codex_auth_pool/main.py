@@ -29,7 +29,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 import time
 import plistlib
 import select
@@ -2673,6 +2673,8 @@ def pause_active_goals_to_protect_pro_quota(
     current_summary: ProfileSummary | None,
     cli_plus_account_id: str | None,
     events_path: Path | None,
+    state_path: Path | None = None,
+    state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Prevent Desktop's built-in goal scheduler from spending App Pro quota.
 
@@ -2684,6 +2686,7 @@ def pause_active_goals_to_protect_pro_quota(
         return []
     if not cli_plus_account_id or not codex_state_db.exists():
         return []
+    state_payload = state if isinstance(state, dict) else (load_state(state_path) if state_path is not None else {})
     now_ms = int(now_local().timestamp() * 1000)
     try:
         with sqlite3.connect(codex_state_db) as conn:
@@ -2704,19 +2707,32 @@ def pause_active_goals_to_protect_pro_quota(
             ).fetchall()
             if not rows:
                 return []
+            protected_thread_ids = {
+                str(row["thread_id"] or "")
+                for row in rows
+                if _state_resume_command_for_thread(str(row["thread_id"] or ""), state_payload) == "codex-plus"
+            }
+            rows_to_pause = [row for row in rows if str(row["thread_id"] or "") not in protected_thread_ids]
+            if not rows_to_pause:
+                append_event(
+                    events_path,
+                    "active_goal_pause_skipped",
+                    reason="codex_plus_goal_protected",
+                    app_account_id=current_summary.account_id,
+                    app_email=current_summary.email,
+                    app_plan_type=current_summary.plan_type,
+                    cli_plus_account_id=cli_plus_account_id,
+                    protected_thread_ids=sorted(protected_thread_ids),
+                )
+                return []
             conn.execute(
-                """
+                f"""
                 UPDATE thread_goals
                 SET status = 'paused', updated_at_ms = ?
                 WHERE status = 'active'
-                  AND thread_id IN (
-                    SELECT g.thread_id
-                    FROM thread_goals g
-                    JOIN threads t ON t.id = g.thread_id
-                    WHERE g.status = 'active' AND t.archived = 0
-                  )
+                  AND thread_id IN ({",".join("?" for _ in rows_to_pause)})
                 """,
-                (now_ms,),
+                (now_ms, *[str(row["thread_id"] or "") for row in rows_to_pause]),
             )
             conn.commit()
     except sqlite3.Error as exc:
@@ -2738,7 +2754,7 @@ def pause_active_goals_to_protect_pro_quota(
             "cwd": str(row["cwd"] or ""),
             "rollout_path": str(row["rollout_path"] or ""),
         }
-        for row in rows
+        for row in rows_to_pause
     ]
     append_event(
         events_path,
@@ -3068,6 +3084,45 @@ def _goal_resume_recently_started(
     return (now - started_at).total_seconds() < ACTIVE_GOAL_RESUME_THROTTLE_SECONDS
 
 
+def _latest_goal_resume_record(records: Iterable[Any]) -> dict[str, Any] | None:
+    latest_record: dict[str, Any] | None = None
+    latest_at: datetime | None = None
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        started_at = parse_dt(str(record.get("started_at") or ""))
+        if latest_record is None or (
+            started_at is not None and (latest_at is None or started_at > latest_at)
+        ):
+            latest_record = record
+            latest_at = started_at
+    return latest_record
+
+
+def _state_resume_command_for_thread(thread_id: str, state: dict[str, Any]) -> str | None:
+    if not thread_id:
+        return None
+    pending = state.get("pending_goal_resumes")
+    if isinstance(pending, dict):
+        record = pending.get(thread_id)
+        if isinstance(record, dict):
+            command = str(record.get("resume_command") or "")
+            if command in {"codex", "codex-plus"}:
+                return command
+    recent = state.get("last_goal_resumes")
+    if isinstance(recent, dict):
+        latest = _latest_goal_resume_record(
+            record
+            for record in recent.values()
+            if isinstance(record, dict) and str(record.get("thread_id") or "") == thread_id
+        )
+        if latest is not None:
+            command = str(latest.get("resume_command") or "")
+            if command in {"codex", "codex-plus"}:
+                return command
+    return None
+
+
 def _record_goal_resume_started(
     state: dict[str, Any],
     goal: dict[str, Any],
@@ -3176,6 +3231,8 @@ def _codex_resume_pids_for_thread(thread_id: str) -> set[int]:
 def _resume_command_from_process(command: str) -> str | None:
     if not command:
         return None
+    if "codex-auth-pool" in command and " cli-run " in command:
+        return "codex-plus"
     if re.search(r"(^|[/\s])codex-plus(\s|$)", command):
         return "codex-plus"
     if re.search(r"(^|[/\s])codex(\s|$)", command):
@@ -3214,22 +3271,9 @@ def goal_resume_command(goal: dict[str, Any], state: dict[str, Any], default: st
     running = _running_resume_command_for_thread(thread_id)
     if running:
         return running
-    recent = state.get("last_goal_resumes")
-    if isinstance(recent, dict):
-        for record in recent.values():
-            if not isinstance(record, dict):
-                continue
-            if str(record.get("thread_id") or "") == thread_id:
-                command = str(record.get("resume_command") or "")
-                if command in {"codex", "codex-plus"}:
-                    return command
-    pending = state.get("pending_goal_resumes")
-    if isinstance(pending, dict):
-        record = pending.get(thread_id)
-        if isinstance(record, dict):
-            command = str(record.get("resume_command") or "")
-            if command in {"codex", "codex-plus"}:
-                return command
+    command = _state_resume_command_for_thread(thread_id, state)
+    if command:
+        return command
     return default
 
 
@@ -3237,13 +3281,18 @@ def _recent_goal_resume_thread_records(state: dict[str, Any]) -> dict[str, dict[
     recent = state.get("last_goal_resumes")
     if not isinstance(recent, dict):
         return {}
-    records: dict[str, dict[str, Any]] = {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for record in recent.values():
         if not isinstance(record, dict):
             continue
         thread_id = str(record.get("thread_id") or "")
-        if thread_id and thread_id not in records:
-            records[thread_id] = record
+        if thread_id:
+            grouped.setdefault(thread_id, []).append(record)
+    records: dict[str, dict[str, Any]] = {}
+    for thread_id, thread_records in grouped.items():
+        latest = _latest_goal_resume_record(thread_records)
+        if latest is not None:
+            records[thread_id] = latest
     return records
 
 
@@ -3455,6 +3504,7 @@ def resume_active_goal_threads_after_switch(
     managed_dir: Path = DEFAULT_MANAGED_DIR,
     prompt: str = DEFAULT_ACTIVE_GOAL_RESUME_PROMPT,
     resume_command: str = "codex",
+    blocked_account_id: str | None = None,
     max_count: int = 5,
 ) -> list[dict[str, Any]]:
     state = load_state(state_path) if state_path is not None else {}
@@ -3516,7 +3566,7 @@ def resume_active_goal_threads_after_switch(
                 managed_dir=managed_dir,
                 state_path=state_path,
                 events_path=events_path,
-                account_id=account_id,
+                account_id=blocked_account_id or account_id,
             )
         result = launch_goal_resume(goal, prompt=prompt, events_path=events_path, resume_command=selected_resume_command)
         result["runtime_state_before_resume"] = runtime_state
@@ -3546,6 +3596,7 @@ def process_pending_goal_resumes(
     account_id: str | None,
     prompt: str = DEFAULT_ACTIVE_GOAL_RESUME_PROMPT,
     resume_command: str = "codex",
+    blocked_account_id: str | None = None,
 ) -> list[dict[str, Any]]:
     if state_path is None:
         return []
@@ -3598,7 +3649,7 @@ def process_pending_goal_resumes(
                 managed_dir=managed_dir,
                 state_path=state_path,
                 events_path=events_path,
-                account_id=account_id,
+                account_id=blocked_account_id or account_id,
             )
         result = launch_goal_resume(goal, prompt=prompt, events_path=events_path, resume_command=selected_resume_command)
         results.append(result)
@@ -8647,6 +8698,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
         current_summary=account_summary_by_id(args.source_dir, args.managed_dir, current_account),
         cli_plus_account_id=cli_plus_account_for_goals,
         events_path=getattr(args, "events_path", None),
+        state_path=getattr(args, "state_path", None),
     )
 
     if not getattr(args, "no_resume_active_goals", False):
@@ -8688,6 +8740,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 managed_dir=args.managed_dir,
                 prompt=active_goal_resume_prompt_from_args(args),
                 resume_command="codex-plus",
+                blocked_account_id=cli_plus_rotation.get("old_account_id"),
             )
 
     state = load_state(args.state_path)

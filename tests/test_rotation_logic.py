@@ -749,6 +749,13 @@ class RotationLogicTests(unittest.TestCase):
     def test_goal_resume_command_prefers_pending_record(self) -> None:
         goal = {"thread_id": "thread-1"}
         state = {
+            "last_goal_resumes": {
+                "thread-1:old": {
+                    "thread_id": "thread-1",
+                    "started_at": "2026-05-13T01:00:00+08:00",
+                    "resume_command": "codex",
+                }
+            },
             "pending_goal_resumes": {
                 "thread-1": {
                     "thread_id": "thread-1",
@@ -757,6 +764,31 @@ class RotationLogicTests(unittest.TestCase):
             }
         }
         self.assertEqual(pool.goal_resume_command(goal, state, default="codex"), "codex-plus")
+
+    def test_goal_resume_command_uses_latest_recent_record(self) -> None:
+        goal = {"thread_id": "thread-1"}
+        state = {
+            "last_goal_resumes": {
+                "thread-1:old": {
+                    "thread_id": "thread-1",
+                    "started_at": "2026-05-13T01:00:00+08:00",
+                    "resume_command": "codex",
+                },
+                "thread-1:new": {
+                    "thread_id": "thread-1",
+                    "started_at": "2026-05-13T02:00:00+08:00",
+                    "resume_command": "codex-plus",
+                },
+            }
+        }
+        self.assertEqual(pool.goal_resume_command(goal, state, default="codex"), "codex-plus")
+
+    def test_cli_run_process_is_codex_plus_resume_command(self) -> None:
+        command = (
+            "/Users/me/.venv/bin/codex-auth-pool cli-run -- resume "
+            "019da880-95cb-7161-b66f-f38041e570ae 继续"
+        )
+        self.assertEqual(pool._resume_command_from_process(command), "codex-plus")
 
     def test_goal_resume_command_defaults_to_codex(self) -> None:
         self.assertEqual(pool.goal_resume_command({"thread_id": "thread-1"}, {}, default="codex"), "codex")
@@ -888,6 +920,133 @@ class RotationLogicTests(unittest.TestCase):
             conn.close()
             self.assertEqual(statuses["thread-active"], "paused")
             self.assertEqual(statuses["thread-paused"], "paused")
+
+    def test_codex_plus_goal_is_not_paused_when_app_auth_is_pro(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "state.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                """
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    rollout_path TEXT NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    title TEXT NOT NULL DEFAULT '',
+                    cwd TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE thread_goals (
+                    thread_id TEXT PRIMARY KEY NOT NULL,
+                    goal_id TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    token_budget INTEGER,
+                    tokens_used INTEGER NOT NULL DEFAULT 0,
+                    time_used_seconds INTEGER NOT NULL DEFAULT 0,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO threads(id, rollout_path, archived, title, cwd)
+                VALUES ('thread-cli-plus', '/tmp/cli-plus.jsonl', 0, 'CLI Plus goal', '/tmp');
+                INSERT INTO thread_goals(thread_id, goal_id, objective, status, created_at_ms, updated_at_ms)
+                VALUES ('thread-cli-plus', 'goal-cli-plus', 'objective', 'active', 1, 1);
+                """
+            )
+            conn.commit()
+            conn.close()
+            summary = pool.ProfileSummary(
+                path=root / "pro.json",
+                source_kind="managed",
+                email="pro@example.com",
+                account_id="pro-acct",
+                plan_type="prolite",
+                weekly_reset_at=None,
+                last_refresh=None,
+                expired=None,
+                disabled=False,
+            )
+            state_path = root / "state.json"
+            pool.write_json(
+                state_path,
+                {
+                    "last_goal_resumes": {
+                        "thread-cli-plus:plus-acct": {
+                            "thread_id": "thread-cli-plus",
+                            "started_at": "2026-05-13T02:00:00+08:00",
+                            "resume_command": "codex-plus",
+                            "account_id": "plus-acct",
+                        }
+                    }
+                },
+            )
+
+            paused = pool.pause_active_goals_to_protect_pro_quota(
+                codex_state_db=db,
+                current_summary=summary,
+                cli_plus_account_id="plus-acct",
+                events_path=root / "events.jsonl",
+                state_path=state_path,
+            )
+
+            self.assertEqual(paused, [])
+            conn = sqlite3.connect(db)
+            statuses = dict(conn.execute("SELECT thread_id, status FROM thread_goals").fetchall())
+            conn.close()
+            self.assertEqual(statuses["thread-cli-plus"], "active")
+
+    def test_cli_plus_rotation_marks_old_account_blocked_before_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "state.json"
+            pool.write_json(state_path, {})
+            marked: list[str | None] = []
+            goal = {
+                "thread_id": "thread-1",
+                "goal_id": "goal-1",
+                "title": "Goal",
+                "cwd": str(root),
+                "rollout_path": "",
+            }
+            originals = {
+                "discover": pool.discover_goal_threads_for_resume,
+                "recent": pool._goal_resume_recently_started,
+                "runtime": pool.classify_active_goal_runtime,
+                "command": pool.goal_resume_command,
+                "mark": pool.mark_cli_goal_account_blocked,
+                "launch": pool.launch_goal_resume,
+            }
+            try:
+                pool.discover_goal_threads_for_resume = lambda **kwargs: [goal]  # type: ignore[assignment]
+                pool._goal_resume_recently_started = lambda *args, **kwargs: False  # type: ignore[assignment]
+                pool.classify_active_goal_runtime = lambda *args, **kwargs: {"state": "blocked", "quota_blocked": True}  # type: ignore[assignment]
+                pool.goal_resume_command = lambda *args, **kwargs: "codex-plus"  # type: ignore[assignment]
+
+                def fake_mark(**kwargs):
+                    marked.append(kwargs.get("account_id"))
+                    return None
+
+                pool.mark_cli_goal_account_blocked = fake_mark  # type: ignore[assignment]
+                pool.launch_goal_resume = lambda *args, **kwargs: {"ok": True, "mode": "test"}  # type: ignore[assignment]
+
+                pool.resume_active_goal_threads_after_switch(
+                    codex_state_db=root / "state.sqlite3",
+                    events_path=None,
+                    state_path=state_path,
+                    account_id="new-plus",
+                    source_dir=root,
+                    managed_dir=root,
+                    resume_command="codex-plus",
+                    blocked_account_id="old-plus",
+                )
+            finally:
+                pool.discover_goal_threads_for_resume = originals["discover"]  # type: ignore[assignment]
+                pool._goal_resume_recently_started = originals["recent"]  # type: ignore[assignment]
+                pool.classify_active_goal_runtime = originals["runtime"]  # type: ignore[assignment]
+                pool.goal_resume_command = originals["command"]  # type: ignore[assignment]
+                pool.mark_cli_goal_account_blocked = originals["mark"]  # type: ignore[assignment]
+                pool.launch_goal_resume = originals["launch"]  # type: ignore[assignment]
+
+            self.assertEqual(marked, ["old-plus"])
 
 
 if __name__ == "__main__":
