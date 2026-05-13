@@ -3505,6 +3505,7 @@ def resume_active_goal_threads_after_switch(
     prompt: str = DEFAULT_ACTIVE_GOAL_RESUME_PROMPT,
     resume_command: str = "codex",
     blocked_account_id: str | None = None,
+    defer_unblocked: bool = True,
     max_count: int = 5,
 ) -> list[dict[str, Any]]:
     state = load_state(state_path) if state_path is not None else {}
@@ -3539,6 +3540,18 @@ def resume_active_goal_threads_after_switch(
         runtime_state = classify_active_goal_runtime(goal, now=now)
         if not _runtime_state_requires_goal_resume(runtime_state):
             selected_resume_command = goal_resume_command(goal, state, resume_command)
+            if not defer_unblocked:
+                result = {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "goal_not_confirmed_blocked",
+                    "thread_id": goal.get("thread_id"),
+                    "goal_id": goal.get("goal_id"),
+                    "title": goal.get("title"),
+                    "runtime_state": runtime_state,
+                }
+                results.append(result)
+                continue
             _record_pending_goal_resume(
                 state,
                 goal,
@@ -8741,6 +8754,19 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 prompt=active_goal_resume_prompt_from_args(args),
                 resume_command="codex-plus",
                 blocked_account_id=cli_plus_rotation.get("old_account_id"),
+            )
+        elif cli_allowed and cli_plus_account:
+            resume_active_goal_threads_after_switch(
+                codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+                events_path=getattr(args, "events_path", None),
+                state_path=getattr(args, "state_path", None),
+                account_id=cli_plus_account,
+                source_dir=args.source_dir,
+                managed_dir=args.managed_dir,
+                prompt=active_goal_resume_prompt_from_args(args),
+                resume_command="codex-plus",
+                blocked_account_id=cli_plus_account,
+                defer_unblocked=False,
             )
 
     state = load_state(args.state_path)

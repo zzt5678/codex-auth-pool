@@ -1048,6 +1048,59 @@ class RotationLogicTests(unittest.TestCase):
 
             self.assertEqual(marked, ["old-plus"])
 
+    def test_periodic_goal_watch_does_not_pending_unblocked_goal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "state.json"
+            pool.write_json(state_path, {})
+            goal = {
+                "thread_id": "thread-1",
+                "goal_id": "goal-1",
+                "title": "Goal",
+                "cwd": str(root),
+                "rollout_path": "",
+            }
+            launched: list[bool] = []
+            originals = {
+                "discover": pool.discover_goal_threads_for_resume,
+                "recent": pool._goal_resume_recently_started,
+                "runtime": pool.classify_active_goal_runtime,
+                "command": pool.goal_resume_command,
+                "launch": pool.launch_goal_resume,
+            }
+            try:
+                pool.discover_goal_threads_for_resume = lambda **kwargs: [goal]  # type: ignore[assignment]
+                pool._goal_resume_recently_started = lambda *args, **kwargs: False  # type: ignore[assignment]
+                pool.classify_active_goal_runtime = lambda *args, **kwargs: {"state": "busy", "quota_blocked": False}  # type: ignore[assignment]
+                pool.goal_resume_command = lambda *args, **kwargs: "codex-plus"  # type: ignore[assignment]
+
+                def fake_launch(*args, **kwargs):
+                    launched.append(True)
+                    return {"ok": True}
+
+                pool.launch_goal_resume = fake_launch  # type: ignore[assignment]
+
+                results = pool.resume_active_goal_threads_after_switch(
+                    codex_state_db=root / "state.sqlite3",
+                    events_path=None,
+                    state_path=state_path,
+                    account_id="plus-acct",
+                    source_dir=root,
+                    managed_dir=root,
+                    resume_command="codex-plus",
+                    defer_unblocked=False,
+                )
+            finally:
+                pool.discover_goal_threads_for_resume = originals["discover"]  # type: ignore[assignment]
+                pool._goal_resume_recently_started = originals["recent"]  # type: ignore[assignment]
+                pool.classify_active_goal_runtime = originals["runtime"]  # type: ignore[assignment]
+                pool.goal_resume_command = originals["command"]  # type: ignore[assignment]
+                pool.launch_goal_resume = originals["launch"]  # type: ignore[assignment]
+
+            self.assertEqual(launched, [])
+            self.assertEqual(results[0]["reason"], "goal_not_confirmed_blocked")
+            self.assertNotIn("pending_goal_resumes", pool.read_json(state_path))
+
 
 if __name__ == "__main__":
     unittest.main()
