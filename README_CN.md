@@ -55,15 +55,15 @@
 - 把 `~/.codex/auth.json` 和 `~/.codex/cache/auth.json` 视为同一个有效登录态；如果两者漂移，后台守护会先自动对齐，再判断额度。
 - 账号额度触顶后自动冷却，并切换到下一个可用账号。
 - App/Desktop 自动轮换使用 app 策略：可用 Pro 账号排在 Plus 前面；所有 Pro 都不可用或额度耗尽后，才回退到 Plus。
-- CLI goal 自动恢复只允许 Plus：当前 auth 是 Pro 时不会自动执行 `codex resume <thread_id>`，避免 CLI 长任务消耗 Pro 额度。
-- 提供 `codex-plus` 命令：普通 CLI 手动任务也可以走独立的 Plus-only `CODEX_HOME`，不会覆盖 Codex Desktop 当前使用的 Pro/Plus auth。
+- CLI goal 自动恢复使用独立 CLI 策略：Plus 优先，其次 Free，最后 Pro，避免 Plus 全部耗尽时长任务停滞。
+- 提供 `codex-plus` 命令：普通 CLI 手动任务也可以走独立 `CODEX_HOME`，不会覆盖 Codex Desktop 当前使用的 Pro/Plus auth。
 - `codex-plus` 会复用 `~/.codex` 的 sessions、plugins、skills、config 等状态，所以 `codex resume` 和已安装插件不需要另建一套。
 - 当前账号 auth token 过期时（`HTTP 401 token_expired`），会视为账号不可用并自动切走，不再继续相信旧额度快照。
 - 如果 Codex 会话日志已经出现运行时限额信号（`usage_limit_exceeded`、`rate_limit_reached_type`，或连续 `rate_limits=null`），即使界面百分比没有精确显示 100%，也会按真实耗尽处理。
 - macOS 上切换后可自动重启 Codex Desktop。
 - 自动重启前会记录最近活跃的 Codex Desktop 会话，重启后通过 Codex app-server 协议对这些原 `threadId` 发送 `继续`。
 - 恢复会话使用 `thread/resume` + `turn/start`，不再另起一个 `codex exec resume` 后台代理会话。
-- 自动轮换切到 Plus 账号后会检测 active goal 线程，并在 macOS Terminal 中执行 `codex resume <thread_id>`，让 CLI 长任务继续跑在 Plus auth 上。
+- CLI auth 自动轮换后会检测 active goal 线程，并在 macOS Terminal 中执行 `codex resume <thread_id>`，让 CLI 长任务继续跑在选中的 CLI auth 上。
 - 后台守护只有在真实额度触发阈值时才会切换和重启；普通轮询不会打断当前工作。
 - 内置防重入锁和短时间自动轮换节流，避免重复 tick 导致连续切号/重启。
 - 支持快照和恢复本地插件、配置、连接器缓存状态。
@@ -135,7 +135,7 @@ codex-plus resume <thread_id>
 codex-plus --version
 ```
 
-它会在运行前自动选择当前可用的 Plus 账号，写入隔离目录 `~/.codex-auth-pool/cli-plus-home`，并通过 `CODEX_HOME` 启动官方 `codex`。这不会改写 Codex Desktop 使用的 `~/.codex/auth.json` 或 `~/.codex/cache/auth.json`。
+它会在运行前按 `Plus -> Free -> Pro` 自动选择当前可用的 CLI 账号，写入隔离目录 `~/.codex-auth-pool/cli-plus-home`，并通过 `CODEX_HOME` 启动官方 `codex`。这不会改写 Codex Desktop 使用的 `~/.codex/auth.json` 或 `~/.codex/cache/auth.json`。
 
 如果只想准备隔离 home、不启动 CLI：
 
@@ -218,7 +218,7 @@ codex-auth-pool token-usage --json
 - 如果检测到正在运行的子 agent / spawned thread，会继续等待子 agent 结束后再切换
 - 重启 Codex Desktop 前，从 `~/.codex/state_5.sqlite` 和 `~/.codex/logs_2.sqlite` 捕获最近活跃的 Desktop 会话
 - active goal 线程不会被当成 Desktop 会话阻塞切号；它只会在 goal 自己遇到额度/认证阻塞后，走独立的 `codex resume <thread_id>` 恢复流程
-- active goal 恢复有意限制为 Plus-only；当前 auth 是 Pro 时，后台只记录跳过，不会启动 `codex resume`
+- active goal 恢复使用独立 CLI 策略：Plus 优先，其次 Free，最后 Pro；不会因为 Plus 全部不可用而停滞
 - goal 恢复前会先看 rollout 是否仍在产生事件；最近仍有进展会延迟恢复，只有在最新进展之后出现明确额度/认证错误才执行 `codex resume`，单纯长时间无日志不会误开第二个长任务
 - goal 自动恢复成功后，只会终止同一个 `thread_id` 的旧 `codex resume` 进程树，避免旧终端任务继续卡在限额错误；不会关闭其他普通终端或 Desktop 会话
 - Codex Desktop 重新启动后，后台启动轻量恢复 helper，对每个捕获到的 `threadId` 执行 `thread/resume` 和 `turn/start`
@@ -306,13 +306,13 @@ codex-auth-pool systemd-status
 3. 不在冷却中
 4. 没有被真实远程限额窗口阻塞
 5. 符合当前使用策略
-6. App/Desktop 自动轮换：Pro 优先，然后 Plus，最后才是未知套餐
-7. CLI goal 自动恢复和 `codex-plus`：只允许 Plus
+6. App/Desktop 自动轮换：Pro 优先，然后 Plus，最后才是 Free/未知套餐
+7. CLI goal 自动恢复和 `codex-plus`：Plus 优先，其次 Free，最后 Pro
 8. 真实观测到的周重置时间更早
 9. 如果没有真实观测值，再看本地 `weekly_reset_at`
 10. 最后再参考 auth 元数据的新鲜度
 
-这个策略不会因为池子里出现 Pro 账号就主动重启 Codex。它只会在已经出现真实额度/认证触发、必须切号时改变候选账号排序，因此不会破坏之前“非必要不重启”的体验。手动 `apply-best` 默认使用 App/Desktop 策略；如果你明确想选 Plus-only 候选，可以运行 `codex-auth-pool apply-best --account-policy cli`。如果你要启动普通 CLI 长任务，优先用 `codex-plus`，它不会改变 App 当前 auth。
+这个策略不会因为池子里出现 Pro 账号就主动重启 Codex。它只会在已经出现真实额度/认证触发、必须切号时改变候选账号排序，因此不会破坏之前“非必要不重启”的体验。手动 `apply-best` 默认使用 App/Desktop 策略；如果你明确想按 CLI 顺序选择候选，可以运行 `codex-auth-pool apply-best --account-policy cli`，其顺序是 `Plus -> Free -> Pro`。如果你要启动普通 CLI 长任务，优先用 `codex-plus`，它不会改变 App 当前 auth。
 
 `refresh-usage` 会把真实查询结果写入账号对应的元数据 sidecar。
 对于 managed vault 里的账号，sidecar 会保存在账号文件旁边的 `.meta.json`。

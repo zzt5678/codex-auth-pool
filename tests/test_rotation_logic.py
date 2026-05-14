@@ -579,10 +579,11 @@ class RotationLogicTests(unittest.TestCase):
             )
             self.assertIsNone(candidate)
 
-    def test_cli_policy_allows_plus_only(self) -> None:
+    def test_cli_policy_prefers_plus_then_free_then_pro(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.write_profile(root, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
+            self.write_profile(root, name="free", account_id="free-acct", email="free@example.com", plan_type="free")
             self.write_profile(root, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
 
             ranked = pool.rank_profiles(
@@ -593,15 +594,18 @@ class RotationLogicTests(unittest.TestCase):
                 account_policy=pool.ACCOUNT_POLICY_CLI,
             )
             plus = next(item for item in ranked if item["summary"].account_id == "plus-acct")
+            free = next(item for item in ranked if item["summary"].account_id == "free-acct")
             pro = next(item for item in ranked if item["summary"].account_id == "pro-acct")
             self.assertTrue(plus["available"])
-            self.assertFalse(pro["available"])
-            self.assertEqual(pool.profile_health(pro), "policy-excluded-pro")
+            self.assertTrue(free["available"])
+            self.assertTrue(pro["available"])
+            self.assertLess(ranked.index(plus), ranked.index(free))
+            self.assertLess(ranked.index(free), ranked.index(pro))
 
             allowed, tier, reason = pool.account_allows_cli_goal_resume(root / "missing-source", root, "pro-acct")
-            self.assertFalse(allowed)
+            self.assertTrue(allowed)
             self.assertEqual(tier, "pro")
-            self.assertEqual(reason, "cli_goal_resume_requires_plus")
+            self.assertEqual(reason, "pro")
 
     def test_account_summary_prefers_managed_plan_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -670,6 +674,58 @@ class RotationLogicTests(unittest.TestCase):
                 self.assertEqual(payload["tokens"]["account_id"], "plus-acct")
                 self.assertEqual(payload["auth_mode"], "chatgpt")
             self.assertEqual(pool.cli_plus_active_account_id(cli_home), "plus-acct")
+
+    def test_cli_plus_home_falls_back_to_free_before_pro(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = root / "managed"
+            managed.mkdir()
+            self.write_profile(managed, name="free", account_id="free-acct", email="free@example.com", plan_type="free")
+            self.write_profile(managed, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+
+            args = argparse.Namespace(
+                source_dir=root / "missing-source",
+                managed_dir=managed,
+                events_path=root / "events.jsonl",
+                state_path=root / "state.json",
+                target=str(root / "global" / "cache" / "auth.json"),
+                usage_max_age_minutes=pool.DEFAULT_USAGE_MAX_AGE_MINUTES,
+                skip_usage_validation=True,
+                cli_plus_home=root / "cli-plus-home",
+                source_codex_home=root / "global",
+            )
+
+            _, summary, cli_home, auth_paths, _ = pool.prepare_cli_plus_home(args)
+
+            self.assertEqual(summary.account_id, "free-acct")
+            self.assertEqual(pool.cli_plus_active_account_id(cli_home), "free-acct")
+            for auth_path in auth_paths:
+                payload = pool.read_json(auth_path)
+                self.assertEqual(payload["tokens"]["account_id"], "free-acct")
+
+    def test_cli_plus_home_falls_back_to_pro_when_no_plus_or_free(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = root / "managed"
+            managed.mkdir()
+            self.write_profile(managed, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+
+            args = argparse.Namespace(
+                source_dir=root / "missing-source",
+                managed_dir=managed,
+                events_path=root / "events.jsonl",
+                state_path=root / "state.json",
+                target=str(root / "global" / "cache" / "auth.json"),
+                usage_max_age_minutes=pool.DEFAULT_USAGE_MAX_AGE_MINUTES,
+                skip_usage_validation=True,
+                cli_plus_home=root / "cli-plus-home",
+                source_codex_home=root / "global",
+            )
+
+            _, summary, cli_home, _, _ = pool.prepare_cli_plus_home(args)
+
+            self.assertEqual(summary.account_id, "pro-acct")
+            self.assertEqual(pool.cli_plus_active_account_id(cli_home), "pro-acct")
 
     def test_cli_plus_home_rotates_when_active_plus_is_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

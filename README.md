@@ -55,15 +55,15 @@ when you need an emergency manual switch.
 - Treat `~/.codex/auth.json` and `~/.codex/cache/auth.json` as one active login state; if they drift, the daemon reconciles them before quota checks.
 - Auto-cool down exhausted accounts and switch to the next available one.
 - App/Desktop automatic rotation uses an app policy: available Pro accounts rank before Plus accounts; if every Pro account is blocked or exhausted, it falls back to Plus.
-- CLI goal recovery is Plus-only: automatic `codex resume <thread_id>` is skipped while the active auth is Pro, so long-running CLI goal recovery does not consume Pro quota.
-- Provide `codex-plus`: manual CLI work can run under an isolated Plus-only `CODEX_HOME` without overwriting the auth currently used by Codex Desktop.
+- CLI goal recovery uses a separate CLI policy: Plus first, then Free, then Pro, so long-running work keeps moving when Plus accounts are exhausted.
+- Provide `codex-plus`: manual CLI work can run under an isolated `CODEX_HOME` without overwriting the auth currently used by Codex Desktop.
 - `codex-plus` shares `~/.codex` sessions, plugins, skills, and config, so `codex resume` and installed plugins do not need a second setup.
 - Treat an expired current auth token (`HTTP 401 token_expired`) as an unusable account and rotate away instead of trusting stale quota snapshots.
 - Treat runtime limit signals from Codex session logs (`usage_limit_exceeded`, `rate_limit_reached_type`, or repeated `rate_limits=null`) as real exhaustion even when the displayed percentage is not exactly 100%.
 - Restart Codex Desktop automatically after switching on macOS.
 - Before an automatic restart, capture recently active Codex Desktop sessions; after restart, resume those interrupted thread IDs through the Codex app-server protocol with `继续`.
 - Recovery targets the original `threadId` with `thread/resume` + `turn/start` instead of creating a separate `codex exec resume` worker session.
-- After automatic rotation to a Plus account, detect active goal threads and open macOS Terminal with `codex resume <thread_id>` so long-running CLI goal work can continue under Plus auth.
+- After automatic CLI auth rotation, detect active goal threads and open macOS Terminal with `codex resume <thread_id>` so long-running CLI goal work can continue under the selected CLI auth.
 - Background rotation switches and restarts only after a real quota threshold trigger; normal polling does not interrupt your work.
 - Built-in locks and a short automatic-rotation throttle prevent repeated ticks from causing restart loops.
 - Snapshot and restore local Codex plugin, config, and connector cache state.
@@ -125,7 +125,7 @@ This will:
 - import `cliproxyapi` accounts if found
 - install the background rotator if requested
 
-### 2.1 Run CLI work on Plus only
+### 2.1 Run CLI Work With Isolated Auth
 
 The installer also provides `codex-plus`:
 
@@ -135,7 +135,7 @@ codex-plus resume <thread_id>
 codex-plus --version
 ```
 
-Before launching official `codex`, it selects the best currently available Plus account and writes auth only into `~/.codex-auth-pool/cli-plus-home` via `CODEX_HOME`. It does not overwrite the Desktop auth files at `~/.codex/auth.json` or `~/.codex/cache/auth.json`.
+Before launching official `codex`, it selects the best currently available CLI account using `Plus -> Free -> Pro` and writes auth only into `~/.codex-auth-pool/cli-plus-home` via `CODEX_HOME`. It does not overwrite the Desktop auth files at `~/.codex/auth.json` or `~/.codex/cache/auth.json`.
 
 To prepare the isolated home without launching CLI:
 
@@ -218,7 +218,7 @@ Background services installed with `launchd-install`, `systemd-install`, `setup 
 - if a running child agent / spawned thread is detected, rotation keeps waiting for that child agent to finish before switching
 - before quitting Codex Desktop, it captures recently active Desktop sessions from `~/.codex/state_5.sqlite` and `~/.codex/logs_2.sqlite`
 - active goal threads do not block Desktop-session rotation; they use the separate `codex resume <thread_id>` recovery path only after the goal itself hits a quota/auth blocker
-- active goal recovery is intentionally Plus-only; when the active auth is Pro, the daemon records a skip instead of launching `codex resume`
+- active goal recovery uses the isolated CLI policy: Plus first, then Free, then Pro; it avoids stopping just because every Plus account is blocked
 - goal recovery checks rollout progress first; recent progress defers recovery, and only explicit quota/auth errors that occur after the latest progress trigger `codex resume`; stale rollout silence alone will not start a duplicate long-running goal
 - after a goal resume starts successfully, it terminates only older `codex resume` process trees for the same `thread_id`, so the old quota-blocked terminal task stops without touching unrelated terminals or Desktop sessions
 - after Codex Desktop comes back up, it starts a lightweight recovery helper that calls `thread/resume` and `turn/start` for each captured `threadId`
@@ -306,13 +306,13 @@ The rotator prefers accounts that are:
 3. not in cooldown
 4. not currently blocked by an observed remote limit window
 5. allowed by the current policy
-6. for App/Desktop automatic rotation: Pro before Plus before unknown
-7. for CLI goal recovery and `codex-plus`: Plus only
+6. for App/Desktop automatic rotation: Pro before Plus before Free/unknown
+7. for CLI goal recovery and `codex-plus`: Plus before Free before Pro
 8. earliest observed weekly reset time
 9. otherwise earliest profile `weekly_reset_at`
 10. then most recent usable auth metadata
 
-This policy does not proactively restart Codex just because a Pro account appears. It only changes which account is selected when an existing quota/auth trigger already requires a switch, preserving the existing no-surprise restart behavior. Manual `apply-best` uses the App/Desktop policy by default; use `codex-auth-pool apply-best --account-policy cli` if you explicitly want to pick the best Plus-only candidate. For ordinary long-running CLI work, prefer `codex-plus`; it does not change the active Desktop auth.
+This policy does not proactively restart Codex just because a Pro account appears. It only changes which account is selected when an existing quota/auth trigger already requires a switch, preserving the existing no-surprise restart behavior. Manual `apply-best` uses the App/Desktop policy by default; use `codex-auth-pool apply-best --account-policy cli` if you explicitly want the CLI order `Plus -> Free -> Pro`. For ordinary long-running CLI work, prefer `codex-plus`; it does not change the active Desktop auth.
 
 `refresh-usage` writes direct observations into profile metadata sidecars.
 For managed vault profiles, the sidecar lives next to the profile as `.meta.json`.

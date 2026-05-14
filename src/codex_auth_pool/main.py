@@ -927,9 +927,9 @@ def account_allows_cli_goal_resume(source_dir: Path, managed_dir: Path, account_
     if summary is None:
         return False, "unknown", "account_not_found"
     tier = plan_tier(summary.plan_type)
-    if tier != "plus":
-        return False, tier, "cli_goal_resume_requires_plus"
-    return True, tier, "plus"
+    if tier not in {"plus", "free", "pro"}:
+        return False, tier, "cli_goal_resume_requires_plus_free_or_pro"
+    return True, tier, tier
 
 
 def list_env_snapshots(env_snapshots_dir: Path) -> list[Path]:
@@ -1214,21 +1214,23 @@ def plan_tier(plan_type: str | None) -> str:
         return "pro"
     if "plus" in lowered:
         return "plus"
+    if "free" in lowered:
+        return "free"
     return "unknown"
 
 
 def account_policy_rank(summary: ProfileSummary, account_policy: str) -> int:
     tier = plan_tier(summary.plan_type)
     if account_policy == ACCOUNT_POLICY_APP:
-        return {"pro": 0, "plus": 1, "unknown": 2}.get(tier, 9)
+        return {"pro": 0, "plus": 1, "free": 2, "unknown": 3}.get(tier, 9)
     if account_policy == ACCOUNT_POLICY_CLI:
-        return 0 if tier == "plus" else 9
+        return {"plus": 0, "free": 1, "pro": 2}.get(tier, 9)
     return 0
 
 
 def account_policy_allows(summary: ProfileSummary, account_policy: str) -> bool:
     if account_policy == ACCOUNT_POLICY_CLI:
-        return plan_tier(summary.plan_type) == "plus"
+        return plan_tier(summary.plan_type) in {"plus", "free", "pro"}
     return True
 
 
@@ -2678,7 +2680,7 @@ def pause_active_goals_to_protect_pro_quota(
 ) -> list[dict[str, Any]]:
     """Prevent Desktop's built-in goal scheduler from spending App Pro quota.
 
-    The Plus-only wrapper can control CLI processes, but Desktop goal automation
+    The isolated CLI wrapper can control CLI processes, but Desktop goal automation
     uses the global App auth. When the App auth is Pro, active goals must be
     paused and resumed through codex-plus instead.
     """
@@ -5692,7 +5694,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if limits.get("note"):
             print(f"  note: {limits['note']}")
     print("")
-    print(f"Next ({ACCOUNT_POLICY_APP}: Pro > Plus fallback)")
+    print(f"Next ({ACCOUNT_POLICY_APP}: Pro > Plus > Free fallback)")
     if next_item is None:
         print("  next account: no alternate available account right now")
         hint = next_unblock_hint(ranked)
@@ -6538,7 +6540,10 @@ def cmd_apply_locked(args: argparse.Namespace) -> int:
                 plan_tier=switched_plan_tier,
             )
             goal_resume_results = []
-            print(f"skipped active goal resume: CLI goal recovery only runs on Plus accounts (current plan={switched_plan_tier})")
+            print(
+                "skipped active goal resume: CLI goal recovery only runs on Plus/Free/Pro "
+                f"accounts (current plan={switched_plan_tier})"
+            )
         elif expected_account_id and active_account_id != expected_account_id:
             append_event(
                 args.events_path,
@@ -6725,7 +6730,7 @@ def select_cli_plus_profile(args: argparse.Namespace) -> tuple[Path, ProfileSumm
         if validation_ok:
             return candidate["path"], candidate["summary"]
         print(f"skipped CLI candidate {candidate['summary'].email or candidate['summary'].account_id}: {validation_error}")
-    raise SystemExit("no currently available Plus profile for CLI")
+    raise SystemExit("no currently available Plus, Free, or Pro profile for CLI")
 
 
 def prepare_cli_plus_home(args: argparse.Namespace) -> tuple[Path, ProfileSummary, Path, list[Path], list[str]]:
@@ -6794,7 +6799,7 @@ def rotate_cli_plus_home_if_needed(args: argparse.Namespace) -> dict[str, Any] |
     append_event(args.events_path, "cli_plus_home_rotated", **result)
     if not getattr(args, "daemon_quiet", False):
         print(
-            "rotated Plus-only CLI account: "
+            "rotated isolated CLI account: "
             f"{old_summary.email if old_summary is not None else old_account_id or '-'} -> "
             f"{new_summary.email or new_summary.account_id} (reason={reason})"
         )
@@ -6803,7 +6808,7 @@ def rotate_cli_plus_home_if_needed(args: argparse.Namespace) -> dict[str, Any] |
 
 def cmd_cli_prepare(args: argparse.Namespace) -> int:
     profile_path, summary, cli_home, auth_paths, linked = prepare_cli_plus_home(args)
-    print("prepared Plus-only Codex CLI home")
+    print("prepared isolated Codex CLI home")
     print(f"  profile: {profile_path.name}")
     print(f"  account: {summary.email or summary.account_id}")
     print(f"  plan: {summary.plan_type or 'unknown'}")
@@ -6895,7 +6900,7 @@ def cmd_install_cli_wrapper(args: argparse.Namespace) -> int:
         'exec "${CODEX_AUTH_POOL_BIN:-codex-auth-pool}" cli-run -- "$@"\n'
     )
     bin_path.chmod(0o755)
-    print(f"installed Plus-only CLI wrapper: {bin_path}")
+    print(f"installed isolated CLI wrapper: {bin_path}")
     print("use it with: codex-plus")
     return 0
 
@@ -9454,7 +9459,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--cli-plus-home",
         type=Path,
         default=DEFAULT_CLI_PLUS_HOME,
-        help=f"isolated CODEX_HOME used by the Plus-only CLI wrapper (default: {DEFAULT_CLI_PLUS_HOME})",
+        help=f"isolated CODEX_HOME used by the CLI wrapper (default: {DEFAULT_CLI_PLUS_HOME})",
     )
     parser.add_argument(
         "--codex-state-db",
@@ -9981,13 +9986,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--account-policy",
         choices=ACCOUNT_POLICIES,
         default=ACCOUNT_POLICY_APP,
-        help="selection policy: app prefers Pro then Plus; cli allows Plus only; default: app",
+        help="selection policy: app prefers Pro then Plus; cli prefers Plus, then Free, then Pro; default: app",
     )
     apply_best_parser.set_defaults(func=cmd_apply_best)
 
     cli_prepare_parser = subparsers.add_parser(
         "cli-prepare",
-        help="prepare an isolated CODEX_HOME that uses the best available Plus account",
+        help="prepare an isolated CODEX_HOME that uses the best CLI account (Plus, then Free, then Pro)",
     )
     cli_prepare_parser.add_argument(
         "--usage-max-age-minutes",
@@ -10005,7 +10010,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cli_run_parser = subparsers.add_parser(
         "cli-run",
-        help="run codex with an isolated Plus-only CODEX_HOME; use through codex-plus",
+        help="run codex with an isolated CLI CODEX_HOME; use through codex-plus",
     )
     cli_run_parser.add_argument(
         "--usage-max-age-minutes",
@@ -10024,7 +10029,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     install_cli_wrapper_parser = subparsers.add_parser(
         "install-cli-wrapper",
-        help="install codex-plus, a Plus-only Codex CLI wrapper",
+        help="install codex-plus, an isolated Codex CLI wrapper",
     )
     install_cli_wrapper_parser.add_argument(
         "--bin-path",
