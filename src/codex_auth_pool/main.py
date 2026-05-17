@@ -6766,6 +6766,7 @@ def rotate_cli_plus_home_if_needed(args: argparse.Namespace) -> dict[str, Any] |
     reason = "missing_cli_plus_auth"
     block_until = None
     old_profile = old_summary.path if old_summary is not None else None
+    should_rotate = old_summary is None
 
     if old_summary is not None:
         if getattr(args, "refresh_usage", False):
@@ -6778,12 +6779,53 @@ def rotate_cli_plus_home_if_needed(args: argparse.Namespace) -> dict[str, Any] |
                     usage_error=str(exc)[:300],
                 )
         block_until, block_reason = observed_block_until_for_profile(old_summary.path)
-        if block_until is None or block_until <= now_local():
-            return None
-        reason = block_reason or "cli_plus_account_blocked"
-        set_cooldown_by_account_id(args.state_path, old_summary.account_id, block_until, reason)
+        if block_until is not None and block_until > now_local():
+            reason = block_reason or "cli_plus_account_blocked"
+            set_cooldown_by_account_id(args.state_path, old_summary.account_id, block_until, reason)
+            should_rotate = True
+        else:
+            state = load_state(args.state_path)
+            ranked = rank_profiles(
+                args.source_dir,
+                args.managed_dir,
+                state,
+                Path(args.target),
+                account_policy=ACCOUNT_POLICY_CLI,
+            )
+            best_available = next((item for item in ranked if item["available"]), None)
+            if best_available is None:
+                append_event(
+                    args.events_path,
+                    "cli_plus_home_rotation_skipped",
+                    reason="no_available_cli_accounts",
+                    old_account_id=old_account_id,
+                    old_email=old_summary.email,
+                )
+                return None
+            best_summary: ProfileSummary = best_available["summary"]
+            old_rank = account_policy_rank(old_summary, ACCOUNT_POLICY_CLI)
+            best_rank = account_policy_rank(best_summary, ACCOUNT_POLICY_CLI)
+            if best_summary.account_id != old_account_id and best_rank < old_rank:
+                reason = "better_cli_candidate_available"
+                should_rotate = True
 
-    profile_path, new_summary, _, auth_paths, linked = prepare_cli_plus_home(args)
+    if not should_rotate:
+        return None
+
+    try:
+        profile_path, new_summary, _, auth_paths, linked = prepare_cli_plus_home(args)
+    except SystemExit as exc:
+        append_event(
+            args.events_path,
+            "cli_plus_home_rotation_skipped",
+            reason="no_available_cli_accounts",
+            old_account_id=old_account_id,
+            old_email=old_summary.email if old_summary is not None else None,
+            error=str(exc),
+        )
+        if not getattr(args, "daemon_quiet", False):
+            print(f"skipped isolated CLI rotation: {exc}")
+        return None
     result = {
         "old_account_id": old_account_id,
         "old_email": old_summary.email if old_summary is not None else None,

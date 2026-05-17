@@ -793,6 +793,76 @@ class RotationLogicTests(unittest.TestCase):
             self.assertEqual(result["new_account_id"], "new-plus")
             self.assertEqual(pool.cli_plus_active_account_id(cli_home), "new-plus")
 
+    def test_cli_plus_home_promotes_from_pro_to_available_plus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = root / "managed"
+            managed.mkdir()
+            plus = self.write_profile(
+                managed,
+                name="plus",
+                account_id="plus-acct",
+                email="plus@example.com",
+                plan_type="plus",
+            )
+            pro = self.write_profile(
+                managed,
+                name="pro",
+                account_id="pro-acct",
+                email="pro@example.com",
+                plan_type="pro",
+            )
+            cli_home = root / "cli-plus-home"
+            auth_payload = pool.convert_profile(pool.normalize_source_payload(pro, pool.read_json(pro)))
+            for auth_path in pool.cli_plus_auth_paths(cli_home):
+                pool.write_json(auth_path, auth_payload)
+
+            args = argparse.Namespace(
+                source_dir=root / "missing-source",
+                managed_dir=managed,
+                events_path=root / "events.jsonl",
+                state_path=root / "state.json",
+                target=str(root / "global" / "cache" / "auth.json"),
+                usage_max_age_minutes=pool.DEFAULT_USAGE_MAX_AGE_MINUTES,
+                skip_usage_validation=True,
+                refresh_usage=False,
+                cli_plus_home=cli_home,
+                source_codex_home=root / "global",
+                daemon_quiet=True,
+            )
+
+            result = pool.rotate_cli_plus_home_if_needed(args)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["reason"], "better_cli_candidate_available")
+            self.assertEqual(result["old_account_id"], "pro-acct")
+            self.assertEqual(result["new_account_id"], "plus-acct")
+            self.assertEqual(pool.cli_plus_active_account_id(cli_home), "plus-acct")
+
+    def test_cli_plus_rotation_skips_cleanly_when_no_cli_account_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli_home = root / "cli-plus-home"
+            args = argparse.Namespace(
+                source_dir=root / "missing-source",
+                managed_dir=root / "missing-managed",
+                events_path=root / "events.jsonl",
+                state_path=root / "state.json",
+                target=str(root / "global" / "cache" / "auth.json"),
+                usage_max_age_minutes=pool.DEFAULT_USAGE_MAX_AGE_MINUTES,
+                skip_usage_validation=True,
+                refresh_usage=False,
+                cli_plus_home=cli_home,
+                source_codex_home=root / "global",
+                daemon_quiet=True,
+            )
+
+            result = pool.rotate_cli_plus_home_if_needed(args)
+
+            self.assertIsNone(result)
+            events = (root / "events.jsonl").read_text()
+            self.assertIn("cli_plus_home_rotation_skipped", events)
+
     def test_install_cli_wrapper_writes_codex_plus_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bin_path = Path(tmp) / "bin" / "codex-plus"
