@@ -3159,6 +3159,56 @@ def _state_resume_command_for_thread(thread_id: str, state: dict[str, Any]) -> s
     return None
 
 
+def _latest_goal_resume_record_for_thread(thread_id: str, state: dict[str, Any]) -> dict[str, Any] | None:
+    if not thread_id:
+        return None
+    recent = state.get("last_goal_resumes")
+    if not isinstance(recent, dict):
+        return None
+    return _latest_goal_resume_record(
+        record
+        for record in recent.values()
+        if isinstance(record, dict) and str(record.get("thread_id") or "") == thread_id
+    )
+
+
+def goal_should_force_resume_to_current_cli_account(
+    goal: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    current_cli_account_id: str | None,
+    source_dir: Path,
+    managed_dir: Path,
+) -> bool:
+    """Move active goals off Pro once the isolated CLI account is Plus/Free.
+
+    A goal may have been resumed earlier while codex-plus pointed at Pro. If the
+    wrapper later moves back to Plus/Free, the old running/resumable goal should
+    be restarted under the current wrapper even if it has not hit a fresh quota
+    error yet.
+    """
+    try:
+        current_summary = account_summary_by_id(source_dir, managed_dir, current_cli_account_id)
+    except SystemExit:
+        current_summary = None
+    if current_summary is None or plan_tier(current_summary.plan_type) not in {"plus", "free"}:
+        return False
+    thread_id = str(goal.get("thread_id") or "")
+    latest = _latest_goal_resume_record_for_thread(thread_id, state)
+    if latest is None:
+        return False
+    if str(latest.get("resume_command") or "") != "codex-plus":
+        return False
+    previous_account_id = str(latest.get("account_id") or "")
+    if not previous_account_id or previous_account_id == current_cli_account_id:
+        return False
+    try:
+        previous_summary = account_summary_by_id(source_dir, managed_dir, previous_account_id)
+    except SystemExit:
+        previous_summary = None
+    return previous_summary is not None and plan_tier(previous_summary.plan_type) == "pro"
+
+
 def _record_goal_resume_started(
     state: dict[str, Any],
     goal: dict[str, Any],
@@ -3561,7 +3611,14 @@ def resume_active_goal_threads_after_switch(
     now = now_local()
     results: list[dict[str, Any]] = []
     for goal in goals:
-        if _goal_resume_recently_started(state, goal, account_id=account_id, now=now):
+        force_this_goal = force_unblocked or goal_should_force_resume_to_current_cli_account(
+            goal,
+            state,
+            current_cli_account_id=account_id,
+            source_dir=source_dir,
+            managed_dir=managed_dir,
+        )
+        if not force_this_goal and _goal_resume_recently_started(state, goal, account_id=account_id, now=now):
             result = {
                 "ok": True,
                 "skipped": True,
@@ -3575,7 +3632,7 @@ def resume_active_goal_threads_after_switch(
             results.append(result)
             continue
         runtime_state = classify_active_goal_runtime(goal, now=now)
-        if not force_unblocked and not _runtime_state_requires_goal_resume(runtime_state):
+        if not force_this_goal and not _runtime_state_requires_goal_resume(runtime_state):
             selected_resume_command = goal_resume_command(goal, state, resume_command)
             if not defer_unblocked:
                 result = {
@@ -3610,9 +3667,9 @@ def resume_active_goal_threads_after_switch(
             results.append(result)
             continue
         selected_resume_command = goal_resume_command(goal, state, resume_command)
-        if force_unblocked and selected_resume_command != resume_command:
+        if force_this_goal and selected_resume_command != resume_command:
             selected_resume_command = resume_command
-        if selected_resume_command == "codex-plus" and not force_unblocked:
+        if selected_resume_command == "codex-plus" and not force_this_goal:
             mark_cli_goal_account_blocked(
                 source_dir=source_dir,
                 managed_dir=managed_dir,

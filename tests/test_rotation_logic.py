@@ -989,6 +989,71 @@ class RotationLogicTests(unittest.TestCase):
             self.assertTrue(pool.cli_rotation_should_force_goal_resume(result))
             self.assertEqual(pool.cli_plus_active_account_id(cli_home), "plus-acct")
 
+    def test_goal_forces_resume_when_latest_codex_plus_record_used_pro(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = root / "managed"
+            managed.mkdir()
+            self.write_profile(managed, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
+            self.write_profile(
+                managed,
+                name="pro",
+                account_id="pro-acct",
+                email="pro@example.com",
+                plan_type="pro",
+                metadata={"observed_secondary_reset_at": (pool.now_local() + timedelta(days=4)).isoformat()},
+            )
+            goal = {"thread_id": "thread-1"}
+            state = {"last_goal_resumes": {}}
+            pool._record_goal_resume_started(
+                state,
+                goal,
+                account_id="pro-acct",
+                started_at=pool.now_local(),
+                pid=None,
+                mode="terminal_osascript",
+                resume_command="codex-plus",
+            )
+
+            self.assertTrue(
+                pool.goal_should_force_resume_to_current_cli_account(
+                    goal,
+                    state,
+                    current_cli_account_id="plus-acct",
+                    source_dir=root / "missing-source",
+                    managed_dir=managed,
+                )
+            )
+
+    def test_goal_does_not_force_resume_for_manual_codex_pro_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = root / "managed"
+            managed.mkdir()
+            self.write_profile(managed, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
+            self.write_profile(managed, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+            goal = {"thread_id": "thread-1"}
+            state = {"last_goal_resumes": {}}
+            pool._record_goal_resume_started(
+                state,
+                goal,
+                account_id="pro-acct",
+                started_at=pool.now_local(),
+                pid=None,
+                mode="terminal_osascript",
+                resume_command="codex",
+            )
+
+            self.assertFalse(
+                pool.goal_should_force_resume_to_current_cli_account(
+                    goal,
+                    state,
+                    current_cli_account_id="plus-acct",
+                    source_dir=root / "missing-source",
+                    managed_dir=managed,
+                )
+            )
+
     def test_cli_plus_rotation_skips_cleanly_when_no_cli_account_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
