@@ -6813,6 +6813,28 @@ def cli_plus_active_account_id(cli_home: Path = DEFAULT_CLI_PLUS_HOME) -> str | 
     return None
 
 
+def active_codex_plus_goal_is_still_running(args: argparse.Namespace, state: dict[str, Any] | None = None) -> bool:
+    """Keep a Plus/Free CLI auth while a goal is still making progress.
+
+    A Plus account can often finish an in-flight turn after quota reaches zero.
+    Do not rewrite the isolated CLI auth until the goal is actually blocked or
+    interrupted; this lets long-running work consume the remaining grace instead
+    of moving to the next account too early.
+    """
+    state = state if isinstance(state, dict) else load_state(getattr(args, "state_path", None))
+    for goal in discover_goal_threads_for_resume(
+        codex_state_db=getattr(args, "codex_state_db", DEFAULT_CODEX_STATE_DB),
+        state=state,
+        max_count=5,
+    ):
+        if goal_resume_command(goal, state, "codex-plus") != "codex-plus":
+            continue
+        runtime_state = classify_active_goal_runtime(goal)
+        if not _runtime_state_requires_goal_resume(runtime_state):
+            return True
+    return False
+
+
 def _symlink_points_to(path: Path, target: Path) -> bool:
     if not path.is_symlink():
         return False
@@ -6925,6 +6947,23 @@ def rotate_cli_plus_home_if_needed(args: argparse.Namespace) -> dict[str, Any] |
         block_until, block_reason = observed_block_until_for_profile(old_summary.path)
         if block_until is not None and block_until > now_local():
             reason = block_reason or "cli_plus_account_blocked"
+            if plan_tier(old_summary.plan_type) in {"plus", "free"} and active_codex_plus_goal_is_still_running(args):
+                append_event(
+                    args.events_path,
+                    "cli_plus_home_rotation_deferred",
+                    reason="active_goal_still_running_on_blocked_cli_account",
+                    old_account_id=old_account_id,
+                    old_email=old_summary.email,
+                    old_plan_tier=plan_tier(old_summary.plan_type),
+                    block_until=block_until.isoformat(),
+                    block_reason=reason,
+                )
+                if not getattr(args, "daemon_quiet", False):
+                    print(
+                        "deferred isolated CLI rotation: active codex-plus goal is still running "
+                        f"on {old_summary.email or old_summary.account_id}"
+                    )
+                return None
             set_cooldown_by_account_id(args.state_path, old_summary.account_id, block_until, reason)
             should_rotate = True
         else:
