@@ -24,6 +24,7 @@ class RotationLogicTests(unittest.TestCase):
         email: str,
         plan_type: str,
         disabled: bool = False,
+        metadata: dict | None = None,
     ) -> Path:
         path = root / f"{name}.json"
         pool.write_json(
@@ -37,16 +38,16 @@ class RotationLogicTests(unittest.TestCase):
                 }
             },
         )
-        pool.write_json(
-            pool.meta_path_for_profile(path),
-            {
-                "email": email,
-                "account_id": account_id,
-                "observed_plan_type": plan_type,
-                "disabled": disabled,
-                "usage_checked_at": pool.now_local().isoformat(),
-            },
-        )
+        meta = {
+            "email": email,
+            "account_id": account_id,
+            "observed_plan_type": plan_type,
+            "disabled": disabled,
+            "usage_checked_at": pool.now_local().isoformat(),
+        }
+        if metadata:
+            meta.update(metadata)
+        pool.write_json(pool.meta_path_for_profile(path), meta)
         return path
 
     def test_default_thresholds_are_exhaustion_only(self) -> None:
@@ -652,12 +653,19 @@ class RotationLogicTests(unittest.TestCase):
 
             self.assertIsNone(pool.current_blocked_rotation_trigger(ranked, "current-acct"))
 
-    def test_cli_policy_prefers_plus_then_free_then_pro(self) -> None:
+    def test_cli_policy_prefers_plus_then_free_then_near_reset_pro(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.write_profile(root, name="plus", account_id="plus-acct", email="plus@example.com", plan_type="plus")
             self.write_profile(root, name="free", account_id="free-acct", email="free@example.com", plan_type="free")
-            self.write_profile(root, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+            self.write_profile(
+                root,
+                name="pro",
+                account_id="pro-acct",
+                email="pro@example.com",
+                plan_type="pro",
+                metadata={"observed_secondary_reset_at": (pool.now_local() + timedelta(hours=6)).isoformat()},
+            )
 
             ranked = pool.rank_profiles(
                 root / "missing-source",
@@ -678,7 +686,35 @@ class RotationLogicTests(unittest.TestCase):
             allowed, tier, reason = pool.account_allows_cli_goal_resume(root / "missing-source", root, "pro-acct")
             self.assertTrue(allowed)
             self.assertEqual(tier, "pro")
-            self.assertEqual(reason, "pro")
+            self.assertEqual(reason, "pro_weekly_reset_within_12h")
+
+    def test_cli_policy_blocks_pro_when_weekly_reset_is_not_imminent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_profile(
+                root,
+                name="pro",
+                account_id="pro-acct",
+                email="pro@example.com",
+                plan_type="pro",
+                metadata={"observed_secondary_reset_at": (pool.now_local() + timedelta(days=4)).isoformat()},
+            )
+
+            ranked = pool.rank_profiles(
+                root / "missing-source",
+                root,
+                {},
+                root / "auth.json",
+                account_policy=pool.ACCOUNT_POLICY_CLI,
+            )
+            pro = next(item for item in ranked if item["summary"].account_id == "pro-acct")
+            self.assertFalse(pro["available"])
+            self.assertFalse(pro["policy_allowed"])
+
+            allowed, tier, reason = pool.account_allows_cli_goal_resume(root / "missing-source", root, "pro-acct")
+            self.assertFalse(allowed)
+            self.assertEqual(tier, "pro")
+            self.assertEqual(reason, "pro_weekly_reset_not_within_12h")
 
     def test_account_summary_prefers_managed_plan_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -781,7 +817,14 @@ class RotationLogicTests(unittest.TestCase):
             root = Path(tmp)
             managed = root / "managed"
             managed.mkdir()
-            self.write_profile(managed, name="pro", account_id="pro-acct", email="pro@example.com", plan_type="pro")
+            self.write_profile(
+                managed,
+                name="pro",
+                account_id="pro-acct",
+                email="pro@example.com",
+                plan_type="pro",
+                metadata={"observed_secondary_reset_at": (pool.now_local() + timedelta(hours=6)).isoformat()},
+            )
 
             args = argparse.Namespace(
                 source_dir=root / "missing-source",
@@ -799,6 +842,37 @@ class RotationLogicTests(unittest.TestCase):
 
             self.assertEqual(summary.account_id, "pro-acct")
             self.assertEqual(pool.cli_plus_active_account_id(cli_home), "pro-acct")
+
+    def test_cli_plus_home_does_not_fallback_to_pro_far_from_weekly_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = root / "managed"
+            managed.mkdir()
+            self.write_profile(
+                managed,
+                name="pro",
+                account_id="pro-acct",
+                email="pro@example.com",
+                plan_type="pro",
+                metadata={"observed_secondary_reset_at": (pool.now_local() + timedelta(days=4)).isoformat()},
+            )
+
+            args = argparse.Namespace(
+                source_dir=root / "missing-source",
+                managed_dir=managed,
+                events_path=root / "events.jsonl",
+                state_path=root / "state.json",
+                target=str(root / "global" / "cache" / "auth.json"),
+                usage_max_age_minutes=pool.DEFAULT_USAGE_MAX_AGE_MINUTES,
+                skip_usage_validation=True,
+                cli_plus_home=root / "cli-plus-home",
+                source_codex_home=root / "global",
+            )
+
+            with self.assertRaises(SystemExit) as ctx:
+                pool.prepare_cli_plus_home(args)
+
+            self.assertIn("Pro auto-fallback requires weekly reset within 12h", str(ctx.exception))
 
     def test_cli_plus_home_rotates_when_active_plus_is_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -910,6 +984,9 @@ class RotationLogicTests(unittest.TestCase):
             self.assertEqual(result["reason"], "better_cli_candidate_available")
             self.assertEqual(result["old_account_id"], "pro-acct")
             self.assertEqual(result["new_account_id"], "plus-acct")
+            self.assertEqual(result["old_plan_tier"], "pro")
+            self.assertEqual(result["new_plan_tier"], "plus")
+            self.assertTrue(pool.cli_rotation_should_force_goal_resume(result))
             self.assertEqual(pool.cli_plus_active_account_id(cli_home), "plus-acct")
 
     def test_cli_plus_rotation_skips_cleanly_when_no_cli_account_available(self) -> None:

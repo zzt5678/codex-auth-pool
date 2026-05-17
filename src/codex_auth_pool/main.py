@@ -155,6 +155,7 @@ ACTIVE_GOAL_STALE_SECONDS = 5 * 60
 ACTIVE_GOAL_RESUME_RECHECK_SECONDS = 2 * 60
 RESUME_VERIFY_DELAY_SECONDS = 60.0
 DEFAULT_HARD_ACTIVE_GRACE_SECONDS = 0
+CLI_PRO_WEEKLY_RESET_GRACE_HOURS = 12
 ACCOUNT_POLICY_DEFAULT = "default"
 ACCOUNT_POLICY_APP = "app"
 ACCOUNT_POLICY_CLI = "cli"
@@ -928,8 +929,14 @@ def account_allows_cli_goal_resume(source_dir: Path, managed_dir: Path, account_
     if summary is None:
         return False, "unknown", "account_not_found"
     tier = plan_tier(summary.plan_type)
+    if tier in {"plus", "free"}:
+        return True, tier, tier
+    if tier == "pro":
+        if cli_pro_weekly_reset_within_grace(summary.path, summary):
+            return True, tier, f"pro_weekly_reset_within_{CLI_PRO_WEEKLY_RESET_GRACE_HOURS}h"
+        return False, tier, f"pro_weekly_reset_not_within_{CLI_PRO_WEEKLY_RESET_GRACE_HOURS}h"
     if tier not in {"plus", "free", "pro"}:
-        return False, tier, "cli_goal_resume_requires_plus_free_or_pro"
+        return False, tier, "cli_goal_resume_requires_plus_free_or_near_reset_pro"
     return True, tier, tier
 
 
@@ -1229,9 +1236,35 @@ def account_policy_rank(summary: ProfileSummary, account_policy: str) -> int:
     return 0
 
 
-def account_policy_allows(summary: ProfileSummary, account_policy: str) -> bool:
+def cli_pro_weekly_reset_within_grace(
+    path: Path,
+    summary: ProfileSummary,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Allow automatic CLI Pro fallback only when the weekly reset is imminent."""
+    if plan_tier(summary.plan_type) != "pro":
+        return False
+    now = now or now_local()
+    reset_at = effective_reset_at_for_profile(path, summary)
+    seconds_until_reset = (reset_at - now).total_seconds()
+    return 0 <= seconds_until_reset <= CLI_PRO_WEEKLY_RESET_GRACE_HOURS * 60 * 60
+
+
+def account_policy_allows(
+    summary: ProfileSummary,
+    account_policy: str,
+    *,
+    path: Path | None = None,
+    now: datetime | None = None,
+) -> bool:
     if account_policy == ACCOUNT_POLICY_CLI:
-        return plan_tier(summary.plan_type) in {"plus", "free", "pro"}
+        tier = plan_tier(summary.plan_type)
+        if tier in {"plus", "free"}:
+            return True
+        if tier == "pro" and path is not None:
+            return cli_pro_weekly_reset_within_grace(path, summary, now=now)
+        return False
     return True
 
 
@@ -3509,6 +3542,7 @@ def resume_active_goal_threads_after_switch(
     resume_command: str = "codex",
     blocked_account_id: str | None = None,
     defer_unblocked: bool = True,
+    force_unblocked: bool = False,
     max_count: int = 5,
 ) -> list[dict[str, Any]]:
     state = load_state(state_path) if state_path is not None else {}
@@ -3541,7 +3575,7 @@ def resume_active_goal_threads_after_switch(
             results.append(result)
             continue
         runtime_state = classify_active_goal_runtime(goal, now=now)
-        if not _runtime_state_requires_goal_resume(runtime_state):
+        if not force_unblocked and not _runtime_state_requires_goal_resume(runtime_state):
             selected_resume_command = goal_resume_command(goal, state, resume_command)
             if not defer_unblocked:
                 result = {
@@ -3576,7 +3610,9 @@ def resume_active_goal_threads_after_switch(
             results.append(result)
             continue
         selected_resume_command = goal_resume_command(goal, state, resume_command)
-        if selected_resume_command == "codex-plus":
+        if force_unblocked and selected_resume_command != resume_command:
+            selected_resume_command = resume_command
+        if selected_resume_command == "codex-plus" and not force_unblocked:
             mark_cli_goal_account_blocked(
                 source_dir=source_dir,
                 managed_dir=managed_dir,
@@ -5354,7 +5390,7 @@ def rank_profiles(
         permanent_auth_failure = usage_error_is_permanent_auth_failure(
             str(read_profile_metadata(path).get("usage_error") or "")
         )
-        policy_allowed = account_policy_allows(summary, account_policy)
+        policy_allowed = account_policy_allows(summary, account_policy, path=path, now=now)
         available = (
             not summary.disabled
             and not permanent_auth_failure
@@ -6778,7 +6814,10 @@ def select_cli_plus_profile(args: argparse.Namespace) -> tuple[Path, ProfileSumm
         if validation_ok:
             return candidate["path"], candidate["summary"]
         print(f"skipped CLI candidate {candidate['summary'].email or candidate['summary'].account_id}: {validation_error}")
-    raise SystemExit("no currently available Plus, Free, or Pro profile for CLI")
+    raise SystemExit(
+        "no currently available Plus/Free profile for CLI "
+        f"(Pro auto-fallback requires weekly reset within {CLI_PRO_WEEKLY_RESET_GRACE_HOURS}h)"
+    )
 
 
 def prepare_cli_plus_home(args: argparse.Namespace) -> tuple[Path, ProfileSummary, Path, list[Path], list[str]]:
@@ -6853,7 +6892,15 @@ def rotate_cli_plus_home_if_needed(args: argparse.Namespace) -> dict[str, Any] |
             best_summary: ProfileSummary = best_available["summary"]
             old_rank = account_policy_rank(old_summary, ACCOUNT_POLICY_CLI)
             best_rank = account_policy_rank(best_summary, ACCOUNT_POLICY_CLI)
-            if best_summary.account_id != old_account_id and best_rank < old_rank:
+            old_policy_allowed = account_policy_allows(
+                old_summary,
+                ACCOUNT_POLICY_CLI,
+                path=old_summary.path,
+                now=now_local(),
+            )
+            if best_summary.account_id != old_account_id and (
+                best_rank < old_rank or not old_policy_allowed
+            ):
                 reason = "better_cli_candidate_available"
                 should_rotate = True
 
@@ -6878,9 +6925,11 @@ def rotate_cli_plus_home_if_needed(args: argparse.Namespace) -> dict[str, Any] |
         "old_account_id": old_account_id,
         "old_email": old_summary.email if old_summary is not None else None,
         "old_profile": str(old_profile) if old_profile is not None else None,
+        "old_plan_tier": plan_tier(old_summary.plan_type) if old_summary is not None else None,
         "new_account_id": new_summary.account_id,
         "new_email": new_summary.email,
         "new_profile": str(profile_path),
+        "new_plan_tier": plan_tier(new_summary.plan_type),
         "reason": reason,
         "block_until": block_until.isoformat() if block_until is not None else None,
         "auth_paths": [str(path) for path in auth_paths],
@@ -6894,6 +6943,16 @@ def rotate_cli_plus_home_if_needed(args: argparse.Namespace) -> dict[str, Any] |
             f"{new_summary.email or new_summary.account_id} (reason={reason})"
         )
     return result
+
+
+def cli_rotation_should_force_goal_resume(rotation: dict[str, Any] | None) -> bool:
+    if not isinstance(rotation, dict):
+        return False
+    return (
+        rotation.get("reason") == "better_cli_candidate_available"
+        and rotation.get("old_plan_tier") == "pro"
+        and rotation.get("new_plan_tier") in {"plus", "free"}
+    )
 
 
 def cmd_cli_prepare(args: argparse.Namespace) -> int:
@@ -8849,6 +8908,7 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
                 prompt=active_goal_resume_prompt_from_args(args),
                 resume_command="codex-plus",
                 blocked_account_id=cli_plus_rotation.get("old_account_id"),
+                force_unblocked=cli_rotation_should_force_goal_resume(cli_plus_rotation),
             )
         elif cli_allowed and cli_plus_account:
             resume_active_goal_threads_after_switch(
