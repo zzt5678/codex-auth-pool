@@ -579,6 +579,79 @@ class RotationLogicTests(unittest.TestCase):
             )
             self.assertIsNone(candidate)
 
+    def test_current_blocked_rotation_trigger_when_alternate_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiles = root / "profiles"
+            profiles.mkdir()
+            self.write_profile(profiles, name="current", account_id="current-acct", email="current@example.com", plan_type="plus")
+            self.write_profile(profiles, name="alternate", account_id="alternate-acct", email="alternate@example.com", plan_type="pro")
+            active_auth = root / "cache" / "auth.json"
+            pool.write_json(
+                active_auth,
+                {
+                    "tokens": {
+                        "access_token": "a-current",
+                        "refresh_token": "r-current",
+                        "id_token": "i-current",
+                        "account_id": "current-acct",
+                    }
+                },
+            )
+            state_path = root / "state.json"
+            cooldown = pool.now_local() + timedelta(hours=2)
+            pool.set_cooldown_by_account_id(state_path, "current-acct", cooldown, "primary_5h_limit")
+
+            ranked = pool.rank_profiles(
+                root / "missing-source",
+                profiles,
+                pool.read_json(state_path),
+                active_auth,
+                account_policy=pool.ACCOUNT_POLICY_APP,
+            )
+            trigger = pool.current_blocked_rotation_trigger(ranked, "current-acct")
+
+            self.assertIsNotNone(trigger)
+            self.assertEqual(trigger[0], "primary_5h_limit")
+            self.assertEqual(trigger[1], cooldown)
+            self.assertEqual(trigger[2], "current_account_cooldown")
+
+    def test_current_blocked_rotation_trigger_waits_without_alternate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiles = root / "profiles"
+            profiles.mkdir()
+            self.write_profile(profiles, name="current", account_id="current-acct", email="current@example.com", plan_type="plus")
+            active_auth = root / "cache" / "auth.json"
+            pool.write_json(
+                active_auth,
+                {
+                    "tokens": {
+                        "access_token": "a-current",
+                        "refresh_token": "r-current",
+                        "id_token": "i-current",
+                        "account_id": "current-acct",
+                    }
+                },
+            )
+            state_path = root / "state.json"
+            pool.set_cooldown_by_account_id(
+                state_path,
+                "current-acct",
+                pool.now_local() + timedelta(hours=2),
+                "primary_5h_limit",
+            )
+
+            ranked = pool.rank_profiles(
+                root / "missing-source",
+                profiles,
+                pool.read_json(state_path),
+                active_auth,
+                account_policy=pool.ACCOUNT_POLICY_APP,
+            )
+
+            self.assertIsNone(pool.current_blocked_rotation_trigger(ranked, "current-acct"))
+
     def test_cli_policy_prefers_plus_then_free_then_pro(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

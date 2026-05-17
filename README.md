@@ -345,9 +345,9 @@ codex-auth-pool tick --dry-run
 codex-auth-pool events --limit 10
 codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool tick
-codex-auth-pool launchd-install --interval-seconds 60
+codex-auth-pool launchd-install --interval-seconds 600
 codex-auth-pool launchd-status
-codex-auth-pool systemd-install --interval-seconds 60
+codex-auth-pool systemd-install --interval-seconds 600
 codex-auth-pool systemd-status
 codex-auth-pool snapshot-env --name baseline
 codex-auth-pool restore-env baseline --restart-codex
@@ -411,7 +411,7 @@ codex-auth-pool dashboard
 If `systemctl --user` is not available in your Ubuntu environment, run the daemon manually:
 
 ```bash
-codex-auth-pool daemon --interval-seconds 60
+codex-auth-pool daemon --interval-seconds 600
 ```
 
 ## Upgrading

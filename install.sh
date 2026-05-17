@@ -45,7 +45,7 @@ restart_background_service_if_present() {
         echo "[codex-auth-pool] Reloaded existing systemd user service: codex-auth-pool.service"
       else
         echo "[codex-auth-pool] Warning: failed to reload existing systemd user service automatically."
-        echo "[codex-auth-pool] Run: codex-auth-pool systemd-install --interval-seconds 60"
+        echo "[codex-auth-pool] Run: codex-auth-pool systemd-install --interval-seconds 600"
       fi
     fi
   fi

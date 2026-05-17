@@ -69,6 +69,7 @@ DEFAULT_SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
 DEFAULT_SYSTEMD_SERVICE = "codex-auth-pool.service"
 DEFAULT_SYSTEMD_STDOUT = Path.home() / ".codex-auth-pool" / "logs" / "systemd.stdout.log"
 DEFAULT_SYSTEMD_STDERR = Path.home() / ".codex-auth-pool" / "logs" / "systemd.stderr.log"
+DEFAULT_DAEMON_INTERVAL_SECONDS = 600
 BACKUP_TIMESTAMP_FMT = "%Y%m%d-%H%M%S"
 ENV_VAR_MAP = {
     "source_dir": "CODEX_AUTH_POOL_SOURCE_DIR",
@@ -5484,6 +5485,53 @@ def next_unblock_hint(ranked: list[dict[str, Any]], *, exclude_current: bool = T
     return f"{label} may become available at {fmt_dt(when)}"
 
 
+def current_blocked_rotation_trigger(
+    ranked: list[dict[str, Any]],
+    current_account: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, datetime, str] | None:
+    """Return a durable trigger when the current account is still blocked.
+
+    This covers the case where a previous tick found no alternate account and
+    later ticks should switch as soon as another account becomes available,
+    even if no new session snapshot is produced.
+    """
+    now = now or now_local()
+    current_item = next(
+        (
+            item
+            for item in ranked
+            if item["summary"].account_id == current_account or item.get("is_current")
+        ),
+        None,
+    )
+    if current_item is None or current_item.get("available"):
+        return None
+    has_available_alternate = any(
+        item.get("available") and item["summary"].account_id != current_account
+        for item in ranked
+    )
+    if not has_available_alternate:
+        return None
+
+    candidates: list[tuple[str, datetime, str]] = []
+    cooldown = current_item.get("cooldown_until")
+    if isinstance(cooldown, datetime) and cooldown > now:
+        candidates.append((str(current_item.get("cooldown_reason") or "cooldown"), cooldown, "current_account_cooldown"))
+    limit_reset = current_item.get("limit_reset_at")
+    if isinstance(limit_reset, datetime) and limit_reset > now:
+        candidates.append((str(current_item.get("limit_reason") or "local_limit"), limit_reset, "current_account_local_limit"))
+    remote_block = current_item.get("remote_block_until")
+    if isinstance(remote_block, datetime) and remote_block > now:
+        candidates.append((str(current_item.get("remote_block_reason") or "remote_limit"), remote_block, "current_account_remote_limit"))
+    if candidates:
+        return min(candidates, key=lambda entry: entry[1])
+    if current_item.get("permanent_auth_failure"):
+        return ("auth_token_expired", now + timedelta(hours=24), "current_account_auth_failure")
+    return None
+
+
 def profile_health(item: dict[str, Any]) -> str:
     summary: ProfileSummary = item["summary"]
     now = now_local()
@@ -8970,6 +9018,69 @@ def cmd_tick_locked(args: argparse.Namespace) -> int:
             pending=True,
         )
 
+    ranked_for_current_block = rank_profiles(
+        args.source_dir,
+        args.managed_dir,
+        load_state(args.state_path),
+        Path(args.target),
+        account_policy=ACCOUNT_POLICY_APP,
+    )
+    current_blocked_trigger = current_blocked_rotation_trigger(
+        ranked_for_current_block,
+        current_account,
+    )
+    if current_blocked_trigger is not None:
+        blocked_reason, blocked_until, blocked_source = current_blocked_trigger
+        append_event(
+            args.events_path,
+            "rotation_retry_current_blocked",
+            account_id=current_account,
+            reason=blocked_reason,
+            cooldown_until=blocked_until.isoformat(),
+            trigger_source=blocked_source,
+        )
+        if getattr(args, "dry_run", False):
+            print(
+                f"dry run: would retry rotation for blocked current account {current_account} "
+                f"until {blocked_until.isoformat()} ({blocked_reason})"
+            )
+            return 0
+        active_snapshot = active_desktop_sessions_before_switch(args)
+        if active_snapshot is not None:
+            pending_record = pending_rotation_record(
+                account_id=current_account,
+                reason=blocked_reason,
+                cooldown_until=blocked_until,
+                trigger_source=blocked_source,
+                hard=True,
+                active_snapshot=active_snapshot,
+                hard_active_grace_seconds=max(0, int(getattr(args, "hard_active_grace_seconds", DEFAULT_HARD_ACTIVE_GRACE_SECONDS))),
+                primary_used_percent=None,
+                secondary_used_percent=None,
+            )
+            set_pending_rotation(args.state_path, pending_record, args.events_path)
+            append_event(
+                args.events_path,
+                "rotation_deferred_current_blocked",
+                account_id=current_account,
+                reason=blocked_reason,
+                trigger_source=blocked_source,
+                cooldown_until=blocked_until.isoformat(),
+                snapshot_path=active_snapshot.get("path"),
+                blocker_ids=pending_rotation_blocker_ids(active_snapshot),
+            )
+            print("rotation pending: current account is blocked but active Codex Desktop session(s) are still running")
+            return 0
+        return apply_auto_rotation_from_trigger(
+            args,
+            current_account=current_account,
+            triggered_reason=blocked_reason,
+            triggered_until=blocked_until,
+            trigger_source=blocked_source,
+            trigger_primary_used=None,
+            trigger_secondary_used=None,
+        )
+
     snapshot = latest_rate_limit_snapshot(
         args.sessions_dir,
         exclude_rollout_paths=excluded_goal_rollouts,
@@ -9649,7 +9760,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also install the background systemd user service on Linux",
     )
-    init_parser.add_argument("--interval-seconds", type=int, default=60)
+    init_parser.add_argument("--interval-seconds", type=int, default=DEFAULT_DAEMON_INTERVAL_SECONDS)
     init_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     init_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     init_parser.add_argument(
@@ -9796,7 +9907,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup_parser.add_argument("--install-launchd", action="store_true", help="also install the launchd background agent")
     setup_parser.add_argument("--install-systemd", action="store_true", help="also install the systemd user service on Linux")
-    setup_parser.add_argument("--interval-seconds", type=int, default=60)
+    setup_parser.add_argument("--interval-seconds", type=int, default=DEFAULT_DAEMON_INTERVAL_SECONDS)
     setup_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     setup_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     setup_parser.add_argument(
@@ -10185,7 +10296,7 @@ def build_parser() -> argparse.ArgumentParser:
         "daemon",
         help="run tick repeatedly to keep the Codex auth pool rotating automatically",
     )
-    daemon_parser.add_argument("--interval-seconds", type=int, default=60, help="tick interval in seconds")
+    daemon_parser.add_argument("--interval-seconds", type=int, default=DEFAULT_DAEMON_INTERVAL_SECONDS, help="tick interval in seconds")
     daemon_parser.add_argument(
         "--primary-threshold",
         type=float,
@@ -10307,7 +10418,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="install a user-level launchd agent for automatic auth-pool rotation",
     )
     launchd_install_parser.add_argument("--label", default=DEFAULT_LAUNCHD_LABEL)
-    launchd_install_parser.add_argument("--interval-seconds", type=int, default=60)
+    launchd_install_parser.add_argument("--interval-seconds", type=int, default=DEFAULT_DAEMON_INTERVAL_SECONDS)
     launchd_install_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     launchd_install_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     launchd_install_parser.add_argument(
@@ -10398,7 +10509,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="install a Linux systemd user service for automatic auth-pool rotation",
     )
     systemd_install_parser.add_argument("--service-name", default=DEFAULT_SYSTEMD_SERVICE)
-    systemd_install_parser.add_argument("--interval-seconds", type=int, default=60)
+    systemd_install_parser.add_argument("--interval-seconds", type=int, default=DEFAULT_DAEMON_INTERVAL_SECONDS)
     systemd_install_parser.add_argument("--primary-threshold", type=float, default=DEFAULT_PRIMARY_THRESHOLD)
     systemd_install_parser.add_argument("--secondary-threshold", type=float, default=DEFAULT_SECONDARY_THRESHOLD)
     systemd_install_parser.add_argument(

@@ -345,9 +345,9 @@ codex-auth-pool tick --dry-run
 codex-auth-pool events --limit 10
 codex-auth-pool apply-best --restart-after-switch
 codex-auth-pool tick
-codex-auth-pool launchd-install --interval-seconds 60
+codex-auth-pool launchd-install --interval-seconds 600
 codex-auth-pool launchd-status
-codex-auth-pool systemd-install --interval-seconds 60
+codex-auth-pool systemd-install --interval-seconds 600
 codex-auth-pool systemd-status
 codex-auth-pool snapshot-env --name baseline
 codex-auth-pool restore-env baseline --restart-codex
@@ -414,7 +414,7 @@ codex-auth-pool dashboard
 如果你的 Ubuntu 环境没有 `systemctl --user`，可以手动跑守护：
 
 ```bash
-codex-auth-pool daemon --interval-seconds 60
+codex-auth-pool daemon --interval-seconds 600
 ```
 
 ## 升级
